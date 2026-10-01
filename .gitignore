@@ -1,2 +1,10 @@
 node_modules
-.gitignote
+dist
+coverage
+uploads
+.env
+.env.*
+!.env.example
+!.env.development.example
+*.tsbuildinfo
+.DS_Store
