@@ -4,7 +4,7 @@ import { Model, QueryFilter, Types, UpdateQuery } from 'mongoose';
 import { Errors } from '../../common/api/app-error';
 import type { AuthUser } from '../../common/auth/principal';
 import { EventBus } from '../../common/events/event-bus';
-import type { EscrowPhase, OrderStatus, Settlement } from '../../common/domain';
+import type { EscrowPhase, OrderKind, OrderStatus, Settlement } from '../../common/domain';
 import { addDays, addHours, DAY } from '../../common/util/dates';
 import { escrowReference } from '../../common/util/ids';
 import type { Lean } from '../../common/util/mongo';
@@ -19,6 +19,7 @@ import { ACCOUNT_EVENTS, type AccountClosing } from '../users/account.events';
 import { User } from '../users/schemas/user.schema';
 import { UsersService } from '../users/users.service';
 import { WalletService } from '../wallet/wallet.service';
+import type { EscrowState } from './dto/orders.dto';
 import { HELD_PHASES, phasesLeadingTo } from './order-state';
 import { toBuyerOrderView, toSellerOrderView, type BuyerOrderView, type SellerOrderView } from './order.presenter';
 import { Order, type TimelineEntry } from './schemas/order.schema';
@@ -54,6 +55,15 @@ const ACTIVE_FOR_CLOSURE: OrderStatus[] = ['pending', 'confirmed', 'shipped'];
 function entry(code: string, label: string, description: string, at = new Date()): TimelineEntry {
   return { code, label, description, at };
 }
+
+type OrderListQuery = { status?: OrderStatus; q?: string; kind?: OrderKind; escrow?: EscrowState };
+
+/** Escrow phases behind each money state on the seller's Escrow Payments tab. */
+const ESCROW_STATE_PHASES: Record<EscrowState, EscrowPhase[]> = {
+  held: ['funded', 'shipped', 'inspection', 'disputed'],
+  released: ['released'],
+  refunded: ['refunded'],
+};
 
 @Injectable()
 export class OrdersService implements OnModuleInit {
@@ -126,9 +136,11 @@ export class OrdersService implements OnModuleInit {
 
   /* --- Reads ----------------------------------------------------------------------- */
 
-  private listFilter(owner: 'buyerId' | 'sellerId', userId: string, query: { status?: OrderStatus; q?: string }): QueryFilter<Order> {
+  private listFilter(owner: 'buyerId' | 'sellerId', userId: string, query: OrderListQuery): QueryFilter<Order> {
     const filter: Record<string, unknown> = { [owner]: new Types.ObjectId(userId) };
     filter.status = query.status ?? { $ne: 'awaiting-payment' };
+    if (query.kind) filter.kind = query.kind;
+    if (query.escrow) filter['escrow.phase'] = { $in: ESCROW_STATE_PHASES[query.escrow] };
     if (query.q?.trim()) {
       const pattern = containsRegex(query.q.replace(/^#/, ''));
       filter.$or = [{ reference: pattern }, { 'items.title': pattern }];
@@ -136,7 +148,7 @@ export class OrdersService implements OnModuleInit {
     return filter as QueryFilter<Order>;
   }
 
-  async list(user: AuthUser, query: { status?: OrderStatus; q?: string; page?: number; limit?: number }): Promise<Page<BuyerOrderView>> {
+  async list(user: AuthUser, query: OrderListQuery & { page?: number; limit?: number }): Promise<Page<BuyerOrderView>> {
     const filter = this.listFilter('buyerId', user.id, query);
     const total = await this.orders.countDocuments(filter);
     const window = pageWindow(total, query.page, query.limit ?? 10);
@@ -161,7 +173,7 @@ export class OrdersService implements OnModuleInit {
     return this.orders.countDocuments({ buyerId: new Types.ObjectId(userId), status: { $ne: 'awaiting-payment' } });
   }
 
-  async sellerList(user: AuthUser, query: { status?: OrderStatus; q?: string; page?: number; limit?: number }): Promise<Page<SellerOrderView>> {
+  async sellerList(user: AuthUser, query: OrderListQuery & { page?: number; limit?: number }): Promise<Page<SellerOrderView>> {
     const filter = this.listFilter('sellerId', user.id, query);
     const total = await this.orders.countDocuments(filter);
     const window = pageWindow(total, query.page, query.limit ?? 10);
@@ -180,6 +192,20 @@ export class OrdersService implements OnModuleInit {
 
   async sellerGet(user: AuthUser, idOrReference: string): Promise<SellerOrderView> {
     return (await this.sellerViews([await this.forSeller(user, idOrReference)]))[0];
+  }
+
+  /**
+   * The Escrow Payments tiles: what buyers have paid that is still held, what
+   * was released to the seller and what went back to buyers, over every sale.
+   */
+  async sellerEscrowSummary(user: AuthUser): Promise<{ held: number; released: number; refunded: number; orders: number }> {
+    const rows = await this.orders.aggregate<{ _id: EscrowPhase; total: number; count: number }>([
+      { $match: { sellerId: new Types.ObjectId(user.id), 'escrow.phase': { $exists: true, $ne: null } } },
+      { $group: { _id: '$escrow.phase', total: { $sum: '$total' }, count: { $sum: 1 } } },
+    ]);
+    const sum = (state: EscrowState) =>
+      Math.round(rows.filter((row) => ESCROW_STATE_PHASES[state].includes(row._id)).reduce((total, row) => total + row.total, 0) * 100) / 100;
+    return { held: sum('held'), released: sum('released'), refunded: sum('refunded'), orders: rows.reduce((count, row) => count + row.count, 0) };
   }
 
   /* --- The atomic step every transition goes through --------------------------------- */

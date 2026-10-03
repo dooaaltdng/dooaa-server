@@ -90,6 +90,8 @@ export function catalogSort(query: CatalogQuery, textMode: 'text' | 'regex' | 'n
       return { price: -1, _id: 1 };
     case 'newest':
       return { publishedAt: -1, createdAt: -1, _id: -1 };
+    case 'oldest':
+      return { publishedAt: 1, createdAt: 1, _id: 1 };
     default:
       break;
   }

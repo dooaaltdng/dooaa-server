@@ -15,7 +15,7 @@ import { MediaService } from '../media/media.service';
 import { SettingsService } from '../settings/settings.service';
 import { User } from '../users/schemas/user.schema';
 import { WishlistItem } from '../wishlist/wishlist.schema';
-import type { CreateProductDto, UpdateProductDto } from './dto/product.dto';
+import type { CreateProductDto, SellerStatusFilter, UpdateProductDto } from './dto/product.dto';
 import { PUBLIC_PRODUCT_FILTER, buildCatalogFilter, catalogSort, type CatalogQuery } from './product.filters';
 import {
   toAdminListing,
@@ -355,7 +355,10 @@ export class ProductsService {
     return product;
   }
 
-  async sellerList(seller: AuthUser, query: { tab?: 'all' | 'active' | 'inactive' | 'draft'; q?: string; page?: number; limit?: number }): Promise<Page<SellerProductView> & { counts: SellerTabCounts }> {
+  async sellerList(
+    seller: AuthUser,
+    query: { tab?: 'all' | 'active' | 'inactive' | 'draft'; q?: string; status?: SellerStatusFilter; page?: number; limit?: number },
+  ): Promise<Page<SellerProductView> & { counts: SellerTabCounts }> {
     const base: Record<string, unknown> = { sellerId: new Types.ObjectId(seller.id), deletedAt: null };
     if (query.q?.trim()) base.title = containsRegex(query.q);
     const tabs: Record<string, Record<string, unknown>> = {
@@ -365,7 +368,18 @@ export class ProductsService {
       inactive: { $or: [{ status: { $in: ['pending', 'inactive', 'suspicious', 'rejected'] } }, { status: 'active', stock: { $lte: 0 } }] },
       draft: { status: 'draft' },
     };
-    const filter = { ...base, ...tabs[query.tab ?? 'all'] };
+    // The pill a listing shows: flagged listings wait on review like new ones.
+    const statuses: Record<SellerStatusFilter, Record<string, unknown>> = {
+      active: { status: 'active', stock: { $gt: 0 } },
+      'out-of-stock': { status: 'active', stock: { $lte: 0 } },
+      pending: { status: { $in: ['pending', 'suspicious'] } },
+      draft: { status: 'draft' },
+      inactive: { status: 'inactive' },
+      rejected: { status: 'rejected' },
+    };
+    const filter = query.status
+      ? { ...base, $and: [tabs[query.tab ?? 'all'], statuses[query.status]] }
+      : { ...base, ...tabs[query.tab ?? 'all'] };
     const [total, all, active, inactive, draft] = await Promise.all([
       this.products.countDocuments(filter),
       this.products.countDocuments({ ...base }),

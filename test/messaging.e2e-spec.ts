@@ -1,6 +1,7 @@
 import { io, type Socket } from 'socket.io-client';
 import { createTestApp, type TestApp } from './utils/app';
 import { Http, data, failure } from './utils/http';
+import { eventually } from './utils/eventually';
 import { createProduct, model, registerSeller, registerUser, staffToken, uploadImage, type TestUser } from './utils/factories';
 import { DELIVERY, payAndVerify, settle } from './utils/commerce';
 import { Product } from '../src/modules/products/schemas/product.schema';
@@ -171,9 +172,10 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
       const product = await createProduct(t, seller.id, { pricing: 'negotiable', title: 'Notify Me Phone' });
       const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
       data(await http.post(`/conversations/${thread.id}/offers`, { amount: 120_000 }, buyer.token));
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      const bell = data(await http.get('/notifications', seller.token));
-      expect(bell.rows.some((row: any) => row.type === 'offer.made' && row.body.includes('Notify Me Phone'))).toBe(true);
+      await eventually(async () => {
+        const bell = data(await http.get('/notifications', seller.token));
+        expect(bell.rows.some((row: any) => row.type === 'offer.made' && row.body.includes('Notify Me Phone'))).toBe(true);
+      });
     });
   });
 
@@ -305,9 +307,11 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
       const thread = data(await http.post('/conversations', { productId: String(product._id) }, reader.token));
       data(await http.post(`/conversations/${thread.id}/messages`, { body: 'One' }, seller.token));
       data(await http.post(`/conversations/${thread.id}/messages`, { body: 'Two' }, seller.token));
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      const bell = data(await http.get('/notifications', reader.token));
-      expect(bell.unread).toBe(2);
+      const bell = await eventually(async () => {
+        const page = data(await http.get('/notifications', reader.token));
+        expect(page.unread).toBe(2);
+        return page;
+      });
       expect(bell.rows[0]).toMatchObject({ type: 'message.new', title: 'New message from Sola', read: false });
       data(await http.post(`/notifications/${bell.rows[0].id}/read`, {}, reader.token));
       expect(data(await http.get('/notifications/unread-count', reader.token))).toEqual({ unread: 1 });
@@ -324,8 +328,8 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
       data(await http.post(`/conversations/${thread.id}/messages`, { body: 'Hello quiet' }, seller.token));
       await settle(t);
       expect(t.mail.outbox.slice(before).some((mail) => mail.to === quiet.email)).toBe(false);
-      // The bell still records it.
-      expect(data(await http.get('/notifications', quiet.token)).total).toBeGreaterThan(0);
+      // The bell still records it (written just after the message is answered).
+      await eventually(async () => expect(data(await http.get('/notifications', quiet.token)).total).toBeGreaterThan(0));
     });
 
     it('alerts the console when a listing is flagged suspicious', async () => {
@@ -339,9 +343,10 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
           seller.token,
         ),
       );
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      const bell = data(await http.get('/admin/notifications', admin.token));
-      expect(bell.rows.some((row: any) => row.type === 'listing.flagged' && row.body.includes('Treadmill X'))).toBe(true);
+      await eventually(async () => {
+        const bell = data(await http.get('/admin/notifications', admin.token));
+        expect(bell.rows.some((row: any) => row.type === 'listing.flagged' && row.body.includes('Treadmill X'))).toBe(true);
+      });
     });
   });
 });

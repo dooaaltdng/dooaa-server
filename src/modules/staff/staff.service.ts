@@ -84,10 +84,14 @@ export class StaffService {
     return this.session(member);
   }
 
+  /** The whole team: active and invited members by seniority, then anyone removed (so they can be restored). */
   async list(): Promise<StaffSession[]> {
-    const members = await this.staff.find({ status: { $ne: 'disabled' } }).sort({ role: 1, createdAt: 1 }).lean<Lean<Staff>[]>();
+    const members = await this.staff.find().sort({ role: 1, createdAt: 1 }).lean<Lean<Staff>[]>();
     const rank: Record<StaffRole, number> = { superadmin: 0, admin: 1, moderator: 2 };
-    return members.sort((a, b) => rank[a.role] - rank[b.role]).map((member) => this.session(member));
+    const removed = (member: Lean<Staff>) => (member.status === 'disabled' ? 1 : 0);
+    return members
+      .sort((a, b) => removed(a) - removed(b) || rank[a.role] - rank[b.role])
+      .map((member) => this.session(member));
   }
 
   async findById(id: string): Promise<Lean<Staff> | null> {
@@ -153,28 +157,111 @@ export class StaffService {
     return { ...this.session(member!), inviteExpiresAt: inviteExpiresAt.toISOString() };
   }
 
-  async inviteInfo(token: string): Promise<{ email: string; firstName: string; lastName: string; role: StaffRole }> {
+  /**
+   * What the set-password page shows for a link: an invitation (status
+   * invited) or a password reset the platform team sent an active member.
+   */
+  async inviteInfo(token: string): Promise<{ email: string; firstName: string; lastName: string; role: StaffRole; purpose: 'invite' | 'reset' }> {
     const member = await this.staff
-      .findOne({ inviteTokenHash: hashInvite(token), status: 'invited', inviteExpiresAt: { $gt: new Date() } })
+      .findOne({ inviteTokenHash: hashInvite(token), status: { $in: ['invited', 'active'] }, inviteExpiresAt: { $gt: new Date() } })
       .lean<Lean<Staff>>();
-    if (!member) throw Errors.notFound('This invitation is no longer valid.', 'INVITE_INVALID');
-    return { email: member.email, firstName: member.firstName, lastName: member.lastName, role: member.role };
+    if (!member) throw Errors.notFound('This link is no longer valid. Ask a superadmin for a new one.', 'INVITE_INVALID');
+    return {
+      email: member.email,
+      firstName: member.firstName,
+      lastName: member.lastName,
+      role: member.role,
+      purpose: member.status === 'invited' ? 'invite' : 'reset',
+    };
   }
 
+  /**
+   * Sets the password from an invitation or a reset link, and signs the member
+   * in. A reset also ends every other session, since the old password may be
+   * the reason for it.
+   */
   async acceptInvite(token: string, password: string, meta: SessionMeta): Promise<{ session: StaffSession; tokens: TokenPair }> {
+    const current = await this.staff
+      .findOne({ inviteTokenHash: hashInvite(token), status: { $in: ['invited', 'active'] }, inviteExpiresAt: { $gt: new Date() } })
+      .lean<Lean<Staff>>();
+    if (!current) throw Errors.notFound('This link is no longer valid. Ask a superadmin for a new one.', 'INVITE_INVALID');
+    const reset = current.status === 'active';
     const member = await this.staff
       .findOneAndUpdate(
-        { inviteTokenHash: hashInvite(token), status: 'invited', inviteExpiresAt: { $gt: new Date() } },
+        { _id: current._id, inviteTokenHash: hashInvite(token) },
         {
-          $set: { status: 'active', passwordHash: await this.passwords.hash(password), lastLoginAt: new Date() },
-          $unset: { inviteTokenHash: 1, inviteExpiresAt: 1 },
+          $set: { status: 'active', passwordHash: await this.passwords.hash(password), lastLoginAt: new Date(), failedSignIns: 0 },
+          $unset: { inviteTokenHash: 1, inviteExpiresAt: 1, lockedUntil: 1 },
+          ...(reset ? { $inc: { tokenVersion: 1 } } : {}),
         },
         { returnDocument: 'after' },
       )
       .lean<Lean<Staff>>();
-    if (!member) throw Errors.notFound('This invitation is no longer valid.', 'INVITE_INVALID');
+    if (!member) throw Errors.notFound('This link is no longer valid. Ask a superadmin for a new one.', 'INVITE_INVALID');
+    if (reset) {
+      this.principals.invalidateStaff(String(member._id));
+      await this.tokens.revokeAll('staff', String(member._id));
+      await this.audit.record(
+        { kind: 'system', name: `${member.firstName} ${member.lastName}` },
+        { action: 'Set a new console password from a reset link', target: member.email, targetType: 'staff', targetId: String(member._id) },
+      );
+    }
     const tokens = await this.tokens.issue('staff', String(member._id), member.tokenVersion ?? 0, meta);
     return { session: this.session(member), tokens };
+  }
+
+  /**
+   * "Send password reset": the console has no self-service reset, so the
+   * platform team sends a one-time link (valid for a day) to set a new one.
+   */
+  async sendPasswordReset(actor: AuthStaff, id: string): Promise<{ id: string; resetExpiresAt: string }> {
+    const member = await this.staff.findById(id).lean<Lean<Staff>>();
+    if (!member || member.status === 'disabled') throw Errors.notFound('That team member is not on the console.', 'STAFF_NOT_FOUND');
+    if (member.status === 'invited') throw Errors.conflict('This member has not accepted their invitation yet. Send the invitation again instead.', 'STAFF_INVITED');
+    if (member.role === 'superadmin' && actor.role !== 'superadmin') {
+      throw Errors.forbidden('Only a superadmin can reset a superadmin\'s password.', 'SUPERADMIN_REQUIRED');
+    }
+    const token = randomBytes(32).toString('base64url');
+    const resetExpiresAt = new Date(Date.now() + 86_400_000);
+    await this.staff.updateOne({ _id: member._id }, { $set: { inviteTokenHash: hashInvite(token), inviteExpiresAt: resetExpiresAt } });
+    const link = `${this.config.adminUrl}/accept-invite?token=${encodeURIComponent(token)}`;
+    void this.mail.send(member.email, {
+      subject: 'Reset your DOOAA console password',
+      heading: 'Set a new console password',
+      paragraphs: [
+        `Hi ${member.firstName}, ${actor.firstName} ${actor.lastName} sent you a link to set a new password for the DOOAA console.`,
+        'The link works once and expires in 24 hours. Setting a new password signs you out everywhere else.',
+        'If you did not ask for this, tell your team lead.',
+      ],
+      cta: { label: 'Set a new password', url: link },
+    });
+    await this.audit.record(actor, {
+      action: 'Sent a password reset to a team member',
+      target: `${member.firstName} ${member.lastName}`,
+      targetType: 'staff',
+      targetId: id,
+    });
+    return { id, resetExpiresAt: resetExpiresAt.toISOString() };
+  }
+
+  /** Changing your own password from the account menu. Other sessions end; this one carries on with fresh tokens. */
+  async changePassword(actor: AuthStaff, currentPassword: string, newPassword: string, meta: SessionMeta): Promise<{ session: StaffSession; tokens: TokenPair }> {
+    const member = await this.staff.findById(actor.id).select('+passwordHash').lean<Lean<Staff>>();
+    if (!member) throw Errors.unauthorized();
+    if (!(await this.passwords.verify(currentPassword, member.passwordHash))) {
+      throw Errors.badRequest('Your current password is not correct.', 'WRONG_PASSWORD');
+    }
+    if (await this.passwords.verify(newPassword, member.passwordHash)) {
+      throw Errors.badRequest('Choose a password you have not used here before.', 'PASSWORD_REUSED');
+    }
+    const updated = await this.staff
+      .findByIdAndUpdate(actor.id, { $set: { passwordHash: await this.passwords.hash(newPassword) }, $inc: { tokenVersion: 1 } }, { returnDocument: 'after' })
+      .lean<Lean<Staff>>();
+    this.principals.invalidateStaff(actor.id);
+    await this.tokens.revokeAll('staff', actor.id);
+    await this.audit.record(actor, { action: 'Changed their console password', target: member.email, targetType: 'staff', targetId: actor.id });
+    const tokens = await this.tokens.issue('staff', actor.id, updated!.tokenVersion ?? 0, meta);
+    return { session: this.session(updated!), tokens };
   }
 
   /**

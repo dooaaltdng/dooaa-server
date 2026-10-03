@@ -28,3 +28,8 @@ export class AcceptInviteDto {
 export class UpdateStaffRoleDto {
   @IsIn(STAFF_ROLES) role: StaffRole;
 }
+
+export class ChangeStaffPasswordDto {
+  @IsString() @MinLength(1, { message: 'Enter your current password.' }) @MaxLength(128) currentPassword: string;
+  @IsStrongPassword() newPassword: string;
+}

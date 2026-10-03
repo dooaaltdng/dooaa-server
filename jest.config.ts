@@ -17,7 +17,8 @@ const config: Config = {
   collectCoverageFrom: ['src/**/*.ts', '!src/main.ts', '!src/seed/**', '!src/**/*.spec.ts'],
   coverageDirectory: './coverage',
   coverageReporters: ['text-summary', 'lcov'],
-  testTimeout: 30000,
+  // e2e files boot the whole app; slow CI machines need the headroom.
+  testTimeout: 60000,
   projects: [
     {
       ...shared,

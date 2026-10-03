@@ -97,7 +97,12 @@ export class SellerProductStatusDto {
   @IsIn(['active', 'draft', 'inactive'], { message: 'Choose active, draft or inactive.' }) status: 'active' | 'draft' | 'inactive';
 }
 
+export const SELLER_STATUS_FILTERS = ['active', 'draft', 'out-of-stock', 'pending', 'inactive', 'rejected'] as const;
+export type SellerStatusFilter = (typeof SELLER_STATUS_FILTERS)[number];
+
 export class SellerProductsQueryDto extends PageQueryDto {
   @IsOptional() @IsIn(['all', 'active', 'inactive', 'draft']) tab?: 'all' | 'active' | 'inactive' | 'draft';
   @IsOptional() @Trim() @IsString() @MaxLength(80) q?: string;
+  /** The "All Status" dropdown: the status pill a listing shows. */
+  @IsOptional() @IsIn(SELLER_STATUS_FILTERS) status?: SellerStatusFilter;
 }

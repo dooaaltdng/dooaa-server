@@ -1,5 +1,6 @@
 import { createTestApp, type TestApp } from './utils/app';
 import { Http, data, failure } from './utils/http';
+import { eventually } from './utils/eventually';
 import { createProduct, model, registerSeller, registerUser, setSettings, staffToken, uploadImage } from './utils/factories';
 import { WishlistItem } from '../src/modules/wishlist/wishlist.schema';
 import { Product } from '../src/modules/products/schemas/product.schema';
@@ -159,9 +160,13 @@ describe('Catalog (e2e)', () => {
       data(await http.get(`/products/${product._id}`, buyer.token));
       data(await http.get(`/products/${product._id}`));
       data(await http.get(`/products/${product._id}`, seller.token));
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      const stored = await model<Product>(t, Product.name).findById(product._id).lean();
-      expect(stored?.stats.views).toBe(2);
+      await eventually(async () => {
+        const stored = await model<Product>(t, Product.name).findById(product._id).lean();
+        expect(stored?.stats.views).toBe(2);
+      });
+      // …and the seller's own visit never lands later.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect((await model<Product>(t, Product.name).findById(product._id).lean())?.stats.views).toBe(2);
     });
 
     it('hides listings that are not live', async () => {
@@ -301,6 +306,32 @@ describe('Catalog (e2e)', () => {
       expect(result.counts.all).toBe(result.counts.active + result.counts.inactive + result.counts.draft);
       const inactive = data(await http.get('/seller/products?tab=inactive', seller.token));
       expect(inactive.rows.every((row: any) => row.displayStatus !== 'active' && row.displayStatus !== 'draft')).toBe(true);
+    });
+
+    it('filters the seller’s listings by the status pill they show', async () => {
+      await setSettings(t, 'moderation', { autoPublishListings: true, requireKycAboveAmount: 1_000_000_000 });
+      const image = await uploadImage(t, seller.token);
+      const body = listing([image]);
+      delete (body as Record<string, unknown>).additional;
+      const live = data(await http.post('/seller/products', { ...body, title: 'Filter Live Speaker', publish: true }, seller.token));
+      const soldOut = data(await http.post('/seller/products', { ...body, title: 'Filter Sold Out Speaker', images: [await uploadImage(t, seller.token)], publish: true }, seller.token));
+      data(await http.patch(`/seller/products/${soldOut.id}`, { stock: 0 }, seller.token));
+
+      const ids = (page: { rows: { id: string }[] }) => page.rows.map((row) => row.id);
+      const active = data(await http.get('/seller/products?status=active&limit=100', seller.token));
+      expect(ids(active)).toContain(live.id);
+      expect(ids(active)).not.toContain(soldOut.id);
+      expect(active.rows.every((row: any) => row.displayStatus === 'active')).toBe(true);
+
+      const out = data(await http.get('/seller/products?status=out-of-stock&limit=100', seller.token));
+      expect(ids(out)).toEqual(expect.arrayContaining([soldOut.id]));
+      expect(out.rows.every((row: any) => row.displayStatus === 'out-of-stock')).toBe(true);
+
+      // Combined with a tab: a sold-out listing is never in the Active tab.
+      expect(ids(data(await http.get('/seller/products?tab=active&status=out-of-stock', seller.token)))).toEqual([]);
+      const pending = data(await http.get('/seller/products?status=pending&limit=100', seller.token));
+      expect(pending.rows.every((row: any) => ['pending', 'suspicious'].includes(row.status))).toBe(true);
+      failure(await http.get('/seller/products?status=vanished', seller.token), 400, 'VALIDATION_FAILED');
     });
 
     it('unpublishes and deletes; other sellers cannot touch the listing', async () => {

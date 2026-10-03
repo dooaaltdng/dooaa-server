@@ -21,6 +21,10 @@ class UsersQueryDto extends PageQueryDto {
   @IsOptional() @ToArray() @IsArray() @IsIn(ACCOUNT_STATUSES, { each: true }) statuses?: AccountStatus[];
 }
 
+class ConsoleSearchDto {
+  @Trim() @IsString() @MaxLength(80) q: string;
+}
+
 class StatusDto {
   @IsIn(MODERATED_STATUSES) status: ModeratedStatus;
   @IsOptional() @Trim() @IsString() @MaxLength(500) reason?: string;
@@ -45,6 +49,12 @@ class ChangeEmailDto {
 @Controller('admin')
 export class AdminUsersController {
   constructor(private readonly users: AdminUsersService) {}
+
+  /** The topbar search across accounts, listings, transactions and disputes. */
+  @Get('search')
+  search(@Query() query: ConsoleSearchDto) {
+    return this.users.search(query.q ?? '');
+  }
 
   @Get('buyers')
   buyers(@Query() query: UsersQueryDto) {

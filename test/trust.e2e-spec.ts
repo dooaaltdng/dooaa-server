@@ -1,7 +1,7 @@
 import request from 'supertest';
 import { createTestApp, type TestApp } from './utils/app';
 import { API, Http, data, failure } from './utils/http';
-import { createProduct, model, registerSeller, registerUser, staffToken, uploadImage, type TestUser } from './utils/factories';
+import { codeFromMail, createProduct, model, registerSeller, registerUser, staffToken, uploadImage, type TestUser } from './utils/factories';
 import { completeOrder, paidOrder, settle } from './utils/commerce';
 import { FILES } from './utils/files';
 import { Product } from '../src/modules/products/schemas/product.schema';
@@ -232,6 +232,56 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       const resumed = data(await http.get(`/orders/${second.order.id}`, buyer.token));
       expect(resumed.escrow.phase).toBe('inspection');
       expect(resumed.escrow.inspectionSeconds).toBeGreaterThan(6 * 86_400);
+    });
+
+    it('reopens a dispute closed without action, putting the payment back on hold', async () => {
+      const seller = await registerSeller(t);
+      const buyer = await registerUser(t);
+      const admin = await staffToken(t, 'admin');
+      const moderator = await staffToken(t, 'moderator');
+      const { order } = await shippedOrder(buyer, seller, 25_000);
+      const dispute = data(await http.post(`/orders/${order.id}/dispute`, { reason: 'The charger in the box does not work.' }, buyer.token));
+
+      failure(await http.post(`/admin/disputes/${dispute.id}/reopen`, {}, admin.token), 409, 'DISPUTE_OPEN');
+      data(await http.post(`/admin/disputes/${dispute.id}/resolve`, { outcome: 'closed' }, admin.token));
+      expect(data(await http.get(`/orders/${order.id}`, buyer.token)).escrow.phase).toBe('shipped');
+
+      const reopened = data(await http.post(`/admin/disputes/${dispute.id}/reopen`, { note: 'The buyer sent a video of the fault.' }, moderator.token));
+      expect(reopened).toMatchObject({ id: dispute.id, state: 'active', dispute: { state: 'active', outcome: null, resolutionNote: null } });
+      expect(reopened.dispute.thread.at(-1)).toMatchObject({ party: 'admin' });
+      expect(reopened.dispute.thread.at(-1).body).toContain('reopened dispute');
+      expect(data(await http.get(`/orders/${order.id}`, buyer.token)).escrow.phase).toBe('disputed');
+      expect(data(await http.get(`/disputes/${dispute.id}`, buyer.token))).toMatchObject({ state: 'active', outcome: null });
+
+      // Ruled again — this time with money moving — it can no longer come back.
+      data(await http.post(`/admin/disputes/${dispute.id}/resolve`, { outcome: 'refunded' }, admin.token));
+      failure(await http.post(`/admin/disputes/${dispute.id}/reopen`, {}, admin.token), 409, 'DISPUTE_SETTLED');
+      const log = data(await http.get('/admin/audit?targetType=dispute', admin.token));
+      expect(log.rows.map((row: any) => row.action)).toContain('Reopened a dispute');
+      await settle(t);
+      expect(data(await http.get('/notifications', seller.token)).rows.some((row: any) => row.type === 'dispute.reopened')).toBe(true);
+    });
+
+    it('refuses to reopen once the reopen window has passed or the order has moved on', async () => {
+      const seller = await registerSeller(t);
+      const buyer = await registerUser(t);
+      const admin = await staffToken(t, 'admin');
+      const { order } = await shippedOrder(buyer, seller, 22_000);
+      const dispute = data(await http.post(`/orders/${order.id}/dispute`, { reason: 'Wrong size was delivered to me.' }, buyer.token));
+      data(await http.post(`/admin/disputes/${dispute.id}/resolve`, { outcome: 'closed' }, admin.token));
+
+      const disputes = model<any>(t, 'Dispute');
+      await disputes.updateOne({ _id: dispute.id }, { $set: { resolvedAt: new Date(Date.now() - 8 * 86_400_000) } });
+      failure(await http.post(`/admin/disputes/${dispute.id}/reopen`, {}, admin.token), 409, 'REOPEN_WINDOW_PASSED');
+
+      await disputes.updateOne({ _id: dispute.id }, { $set: { resolvedAt: new Date() } });
+      data(await http.post(`/orders/${order.id}/received`, {}, buyer.token));
+      data(await http.post(`/orders/${order.id}/release/code`, {}, buyer.token));
+      const code = await codeFromMail(t, buyer.email);
+      data(await http.post(`/orders/${order.id}/release`, { code }, buyer.token));
+      failure(await http.post(`/admin/disputes/${dispute.id}/reopen`, {}, admin.token), 409, 'ORDER_MOVED_ON');
+      // The failed attempt left the dispute as it was.
+      expect(data(await http.get(`/admin/disputes/${dispute.id}`, admin.token))).toMatchObject({ state: 'completed', outcome: 'closed' });
     });
 
     it('closes the dispute when a superadmin force-releases from the ledger', async () => {

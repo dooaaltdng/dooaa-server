@@ -73,10 +73,14 @@ describe('Admin team, console auth and settings (e2e)', () => {
   });
 
   describe('team', () => {
-    it('lists the team, superadmins first', async () => {
+    it('lists the team, superadmins first and removed members last', async () => {
+      const removed = await createStaff(t, 'superadmin', { status: 'disabled' });
       const team = data(await http.get('/admin/staff', superadmin.token));
       expect(team[0].role).toBe('superadmin');
-      expect(team.every((member: any) => !('passwordHash' in member))).toBe(true);
+      expect(team.find((member: any) => member.id === removed.id)).toMatchObject({ status: 'disabled' });
+      const firstRemoved = team.findIndex((member: any) => member.status === 'disabled');
+      expect(team.slice(firstRemoved).every((member: any) => member.status === 'disabled')).toBe(true);
+      expect(team.every((member: any) => !('passwordHash' in member) && !('inviteTokenHash' in member))).toBe(true);
     });
 
     it('invites by email; the invitee sets a password and is signed in', async () => {
@@ -94,6 +98,50 @@ describe('Admin team, console auth and settings (e2e)', () => {
       expect(accepted.session).toMatchObject({ email, status: 'active' });
       failure(await http.post('/admin/auth/accept-invite', { token, password: 'Console#2025' }), 404, 'INVITE_INVALID');
       data(await http.post('/admin/auth/sign-in', { email, password: 'Console#2025' }));
+    });
+
+    it('sends a one-time password reset link that ends the member’s other sessions', async () => {
+      const member = await staffToken(t, 'admin');
+      const admin = await staffToken(t, 'admin');
+      const invitee = data(await http.post('/admin/staff/invite', { email: uniqueEmail('new'), firstName: 'Joy', lastName: 'Ekanem', role: 'moderator' }, superadmin.token));
+
+      failure(await http.post(`/admin/staff/${member.id}/reset-password`, {}, admin.token), 403, 'PERMISSION_DENIED');
+      failure(await http.post(`/admin/staff/${invitee.id}/reset-password`, {}, superadmin.token), 409, 'STAFF_INVITED');
+
+      const sent = data(await http.post(`/admin/staff/${member.id}/reset-password`, {}, superadmin.token));
+      expect(new Date(sent.resetExpiresAt).getTime()).toBeGreaterThan(Date.now() + 23 * 3_600_000);
+      await t.mail.idle();
+      const mail = t.mail.lastTo(member.email)!;
+      expect(mail.subject).toBe('Reset your DOOAA console password');
+      const token = decodeURIComponent(mail.text.match(/token=([^\s]+)/)![1]);
+
+      expect(data(await http.get(`/admin/auth/invite/${encodeURIComponent(token)}`))).toMatchObject({ email: member.email, purpose: 'reset' });
+      // Until the link is used the old password still works.
+      data(await http.post('/admin/auth/sign-in', { email: member.email, password: PASSWORD }));
+
+      const accepted = data(await http.post('/admin/auth/accept-invite', { token, password: 'Fresh#Console1' }));
+      expect(accepted.session).toMatchObject({ email: member.email, status: 'active' });
+      failure(await http.get('/admin/auth/me', member.token), 401, 'SESSION_REVOKED');
+      data(await http.get('/admin/auth/me', accepted.tokens.accessToken));
+      failure(await http.post('/admin/auth/sign-in', { email: member.email, password: PASSWORD }), 401);
+      data(await http.post('/admin/auth/sign-in', { email: member.email, password: 'Fresh#Console1' }));
+      failure(await http.post('/admin/auth/accept-invite', { token, password: 'Fresh#Console2' }), 404, 'INVITE_INVALID');
+    });
+
+    it('lets a member change their own password, keeping only this session', async () => {
+      const member = await staffToken(t, 'moderator');
+      const other = data(await http.post('/admin/auth/sign-in', { email: member.email, password: PASSWORD }));
+
+      failure(await http.post('/admin/auth/password', { currentPassword: 'wrong-one', newPassword: 'Another#Pass9' }, member.token), 400, 'WRONG_PASSWORD');
+      failure(await http.post('/admin/auth/password', { currentPassword: PASSWORD, newPassword: 'short' }, member.token), 400, 'VALIDATION_FAILED');
+      failure(await http.post('/admin/auth/password', { currentPassword: PASSWORD, newPassword: PASSWORD }, member.token), 400, 'PASSWORD_REUSED');
+
+      const changed = data(await http.post('/admin/auth/password', { currentPassword: PASSWORD, newPassword: 'Another#Pass9' }, member.token));
+      expect(changed.tokens.accessToken).toBeTruthy();
+      failure(await http.get('/admin/auth/me', member.token), 401, 'SESSION_REVOKED');
+      failure(await http.post('/admin/auth/refresh', { refreshToken: other.tokens.refreshToken }), 401);
+      data(await http.get('/admin/auth/me', changed.tokens.accessToken));
+      data(await http.post('/admin/auth/sign-in', { email: member.email, password: 'Another#Pass9' }));
     });
 
     it('only lets members with settings.manage invite', async () => {

@@ -6,7 +6,7 @@ import type { AuthStaff } from '../../common/auth/principal';
 import { AuthThrottle } from '../../common/auth/throttle';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
-import { AcceptInviteDto, StaffRefreshDto, StaffSignInDto } from './dto/staff.dto';
+import { AcceptInviteDto, ChangeStaffPasswordDto, StaffRefreshDto, StaffSignInDto } from './dto/staff.dto';
 import { StaffService } from './staff.service';
 
 export const STAFF_REFRESH_COOKIE = 'dooaa_admin_rt';
@@ -66,6 +66,21 @@ export class StaffAuthController {
   @Get('me')
   me(@CurrentStaff() actor: AuthStaff) {
     return this.staff.me(actor);
+  }
+
+  /** Your own password. Every other session ends; this one gets fresh tokens. */
+  @AuthThrottle()
+  @HttpCode(200)
+  @Post('password')
+  async changePassword(
+    @CurrentStaff() actor: AuthStaff,
+    @Body() body: ChangeStaffPasswordDto,
+    @RequestMeta() meta: RequestMetaValue,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const result = await this.staff.changePassword(actor, body.currentPassword, body.newPassword, meta);
+    response.cookie(STAFF_REFRESH_COOKIE, result.tokens.refreshToken, this.cookieOptions(new Date(result.tokens.refreshExpiresAt)));
+    return result;
   }
 
   @Public()

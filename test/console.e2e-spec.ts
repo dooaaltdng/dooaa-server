@@ -1,5 +1,6 @@
 import { createTestApp, type TestApp } from './utils/app';
 import { Http, data, failure } from './utils/http';
+import { eventually } from './utils/eventually';
 import { createProduct, model, registerSeller, registerUser, staffToken, uploadImage, type TestUser } from './utils/factories';
 import { DELIVERY, completeOrder, paidOrder, payAndVerify, settle } from './utils/commerce';
 import { Product } from '../src/modules/products/schemas/product.schema';
@@ -174,6 +175,34 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
     });
   });
 
+  describe('console search', () => {
+    it('finds accounts, listings, escrow transactions and disputes from one box', async () => {
+      const seller = await registerSeller(t, { storeName: 'Zainab Gadget Hub' });
+      const buyer = await registerUser(t, { firstName: 'Zainab', lastName: 'Yusuf' });
+      const product = await createProduct(t, seller.id, { title: 'Zainab Special Edition Speaker' });
+      const order = await paidOrder(t, buyer, String(product._id));
+      data(await http.post(`/seller/orders/${order.id}/ship`, { carrier: 'GIG', trackingNumber: 'GIG-1' }, seller.token));
+      const dispute = data(await http.post(`/orders/${order.id}/dispute`, { reason: 'Zainab speaker does not power on at all.' }, buyer.token));
+      const moderator = await staffToken(t, 'moderator');
+
+      const hits = data(await http.get('/admin/search?q=zainab', moderator.token));
+      expect(hits.users.map((row: any) => row.id)).toEqual(expect.arrayContaining([seller.id, buyer.id]));
+      expect(hits.users.find((row: any) => row.id === seller.id)).toMatchObject({ role: 'seller', href: `/users/sellers/${seller.id}` });
+      expect(hits.listings[0]).toMatchObject({ id: String(product._id), sellerName: 'Zainab Gadget Hub', href: `/listings?item=${product._id}` });
+      expect(hits.transactions.map((row: any) => row.id)).toContain(order.orderId);
+      expect(hits.disputes[0]).toMatchObject({ id: dispute.id, href: `/disputes?id=${dispute.id}` });
+
+      const byReference = data(await http.get(`/admin/search?q=${encodeURIComponent(dispute.reference)}`, moderator.token));
+      expect(byReference.disputes.map((row: any) => row.id)).toContain(dispute.id);
+      const byPhone = data(await http.get(`/admin/search?q=${buyer.phone.slice(-6)}`, moderator.token));
+      expect(byPhone.users.map((row: any) => row.id)).toContain(buyer.id);
+
+      expect(data(await http.get('/admin/search?q=z', moderator.token))).toEqual({ users: [], listings: [], transactions: [], disputes: [] });
+      expect(data(await http.get(`/admin/search?q=${encodeURIComponent('.*(')}`, moderator.token)).users).toEqual([]);
+      failure(await http.get('/admin/search?q=zainab'), 401);
+    });
+  });
+
   describe('content', () => {
     it('serves the six published pages, including under the client’s route names', async () => {
       const pages = data(await http.get('/content'));
@@ -242,8 +271,12 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       const product = await createProduct(t, seller.id, { price: 50_000 });
       data(await http.get(`/products/${product._id}`, buyer.token));
       await paidOrder(t, buyer, String(product._id));
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      const analytics = data(await http.get('/seller/analytics?range=7d', seller.token));
+      // The view is counted just after the product page is answered.
+      const analytics = await eventually(async () => {
+        const page = data(await http.get('/seller/analytics?range=7d', seller.token));
+        expect(page.views).toBe(1);
+        return page;
+      });
       expect(analytics.revenue).toHaveLength(7);
       expect(analytics.revenue.at(-1).current).toBe(55_000);
       expect(analytics.totals).toMatchObject({ revenue: 55_000, orders: 1 });

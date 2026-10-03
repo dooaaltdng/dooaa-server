@@ -38,6 +38,12 @@ export class SellerOrdersController {
     return this.orders.sellerSummary(user);
   }
 
+  /** The Escrow Payments tiles: held, released and refunded across every sale. */
+  @Get('escrow/summary')
+  escrowSummary(@CurrentUser() user: AuthUser) {
+    return this.orders.sellerEscrowSummary(user);
+  }
+
   @Get('orders')
   list(@CurrentUser() user: AuthUser, @Query() query: OrdersQueryDto) {
     return this.orders.sellerList(user, query);

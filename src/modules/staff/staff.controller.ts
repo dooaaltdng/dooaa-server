@@ -40,6 +40,14 @@ export class StaffController {
     return this.staff.updateRole(actor, id, body.role);
   }
 
+  /** The platform team's password reset: a one-time link by email. */
+  @RequirePermissions('settings.manage')
+  @HttpCode(200)
+  @Post('staff/:id/reset-password')
+  resetPassword(@CurrentStaff() actor: AuthStaff, @Param('id', ObjectIdPipe) id: string) {
+    return this.staff.sendPasswordReset(actor, id);
+  }
+
   @RequirePermissions('settings.manage')
   @HttpCode(200)
   @Post('staff/:id/disable')

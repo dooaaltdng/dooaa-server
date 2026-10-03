@@ -1,6 +1,6 @@
 import { Transform, Type } from 'class-transformer';
 import { IsEmail, IsIn, IsInt, IsMongoId, IsOptional, IsString, IsUrl, Max, MaxLength, Min, MinLength, ValidateNested } from 'class-validator';
-import { CARRIERS, CHECKOUT_METHODS, ORDER_STATUSES, type CheckoutMethod, type OrderStatus } from '../../../common/domain';
+import { CARRIERS, CHECKOUT_METHODS, ORDER_KINDS, ORDER_STATUSES, type CheckoutMethod, type OrderKind, type OrderStatus } from '../../../common/domain';
 import { PageQueryDto } from '../../../common/util/pagination';
 import { ToLowerTrim, Trim } from '../../../common/util/transforms';
 import { IsPhoneNumber } from '../../../common/util/validators';
@@ -52,9 +52,16 @@ const ToStatus = () =>
     return normalized === 'all-orders' || normalized === 'all' || normalized === '' ? undefined : normalized;
   });
 
+export const ESCROW_STATES = ['held', 'released', 'refunded'] as const;
+export type EscrowState = (typeof ESCROW_STATES)[number];
+
 export class OrdersQueryDto extends PageQueryDto {
   @IsOptional() @ToStatus() @IsIn(ORDER_STATUSES) status?: OrderStatus;
   @IsOptional() @Trim() @IsString() @MaxLength(80) q?: string;
+  /** "escrow" for Buy-via-Escrow purchases only (the seller's Escrow Orders tab), "standard" for cart checkouts. */
+  @IsOptional() @IsIn(ORDER_KINDS) kind?: OrderKind;
+  /** Where the buyer's money stands: held (funded through inspection or disputed), released or refunded. */
+  @IsOptional() @IsIn(ESCROW_STATES) escrow?: EscrowState;
 }
 
 export class ReasonDto {

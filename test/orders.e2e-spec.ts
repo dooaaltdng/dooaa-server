@@ -367,6 +367,27 @@ describe('Cart, checkout, orders and escrow (e2e)', () => {
       expect((await model<Offer>(t, Offer.name).findById(offer._id).lean())!.status).toBe('used');
       const sellerView = data(await http.get(`/seller/orders/${checkout.orders[0].id}`, sellerA.token));
       expect(sellerView).toMatchObject({ kindLabel: 'Escrow payment', status: 'pending', sellerEarning: 3_805_000 });
+
+      // The seller's Escrow Orders tab lists only Buy-via-Escrow sales.
+      const escrowOnly = data(await http.get('/seller/orders?kind=escrow&limit=50', sellerA.token));
+      expect(escrowOnly.rows.map((row: { id: string }) => row.id)).toContain(checkout.orders[0].id);
+      expect(escrowOnly.rows.every((row: { kind: string }) => row.kind === 'escrow')).toBe(true);
+      const standardOnly = data(await http.get('/seller/orders?kind=standard&limit=50', sellerA.token));
+      expect(standardOnly.rows.map((row: { id: string }) => row.id)).not.toContain(checkout.orders[0].id);
+      failure(await http.get('/seller/orders?kind=layaway', sellerA.token), 400, 'VALIDATION_FAILED');
+
+      // Escrow Payments: the order is paid and held, and counted in the held total.
+      const held = data(await http.get('/seller/orders?escrow=held&limit=50', sellerA.token));
+      expect(held.rows.map((row: { id: string }) => row.id)).toContain(checkout.orders[0].id);
+      const released = data(await http.get('/seller/orders?escrow=released&limit=50', sellerA.token));
+      expect(released.rows.map((row: { id: string }) => row.id)).not.toContain(checkout.orders[0].id);
+      const summary = data(await http.get('/seller/escrow/summary', sellerA.token));
+      expect(summary).toEqual({ held: expect.any(Number), released: expect.any(Number), refunded: expect.any(Number), orders: expect.any(Number) });
+      expect(summary.held).toBeGreaterThanOrEqual(3_824_000);
+      expect(summary.orders).toBeGreaterThanOrEqual(1);
+      failure(await http.get('/seller/orders?escrow=lost', sellerA.token), 400, 'VALIDATION_FAILED');
+      // Buyers have no escrow summary of their own.
+      failure(await http.get('/seller/escrow/summary', buyer.token), 403);
     });
 
     it('refuses offers that were not accepted, and someone else’s offers', async () => {
@@ -500,7 +521,8 @@ describe('Cart, checkout, orders and escrow (e2e)', () => {
       const failed = data(await http.get('/admin/payouts?status=failed', admin.token));
       expect(failed.rows.map((row: any) => row.id)).toContain(payout.id);
       const retried = data(await http.post(`/admin/payouts/${payout.id}/retry`, {}, admin.token));
-      expect(retried.status).toBe('processing');
+      // The provider may confirm the transfer before the console's answer is built.
+      expect(['processing', 'completed']).toContain(retried.status);
       await settle(t);
       expect(data(await http.get('/seller/earnings', seller.token)).overview).toEqual({ available: 0, pending: 0, withdrawn: 25_000 });
     });

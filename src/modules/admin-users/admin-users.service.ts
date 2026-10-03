@@ -54,6 +54,13 @@ export type SellerRow = AccountRow & {
   listingLimit: number | null;
 };
 
+export type ConsoleSearchResults = {
+  users: { id: string; name: string; email: string; role: 'buyer' | 'seller'; status: AccountStatus; href: string }[];
+  listings: { id: string; title: string; sellerName: string; status: string; href: string }[];
+  transactions: { id: string; reference: string; orderNumber: string; item: string; amount: number; href: string }[];
+  disputes: { id: string; reference: string; item: string; state: string; href: string }[];
+};
+
 type ProfileDispute = { id: string; reference: string; subject: string; orderId: string; status: 'review' | 'resolved' };
 type ProfileMessage = { id: string; reference: string; excerpt: string; date: string };
 
@@ -370,5 +377,85 @@ export class AdminUsersService {
       paragraphs: [`Hi ${user.firstName},`, 'Your DOOAA account now uses this email address. Sign in and confirm it from your account settings to keep receiving order updates.'],
     });
     return { id, email: next, emailVerified: false };
+  }
+
+  /**
+   * The topbar search: one box across accounts, listings, escrow
+   * transactions and disputes. Each group is capped, and every hit carries
+   * the console route that opens it.
+   */
+  async search(raw: string): Promise<ConsoleSearchResults> {
+    const term = raw.trim().slice(0, 80);
+    const empty: ConsoleSearchResults = { users: [], listings: [], transactions: [], disputes: [] };
+    if (term.length < 2) return empty;
+    const pattern = new RegExp(escapeRegex(term), 'i');
+    const bare = term.replace(/^#/, '');
+    const refPattern = new RegExp(`^#?${escapeRegex(bare)}`, 'i');
+    const digits = term.replace(/\D/g, '');
+
+    const [users, listings, orders, disputes] = await Promise.all([
+      this.users
+        .find({
+          email: { $ne: OFFICIAL_STORE_EMAIL },
+          $or: [
+            { firstName: pattern },
+            { lastName: pattern },
+            { email: pattern },
+            { 'seller.storeName': pattern },
+            ...(term.includes(' ') ? [{ $and: term.split(/\s+/).slice(0, 3).map((word) => ({ $or: [{ firstName: new RegExp(escapeRegex(word), 'i') }, { lastName: new RegExp(escapeRegex(word), 'i') }] })) }] : []),
+            ...(digits.length >= 4 ? [{ phone: new RegExp(escapeRegex(digits)) }] : []),
+          ],
+        })
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .lean<Lean<User>[]>(),
+      this.products.find({ deletedAt: null, title: pattern }).sort({ createdAt: -1 }).limit(5).lean<Lean<Product>[]>(),
+      this.orders
+        .find({ escrow: { $exists: true }, $or: [{ 'escrow.reference': refPattern }, { reference: refPattern }, { 'items.title': pattern }] })
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .lean<Lean<Order>[]>(),
+      this.disputes.find({ $or: [{ reference: refPattern }, { orderNumber: refPattern }, { item: pattern }] }).sort({ createdAt: -1 }).limit(5).lean<Lean<Dispute>[]>(),
+    ]);
+
+    const sellerIds = [...new Set(listings.map((product) => String(product.sellerId)))];
+    const sellers = await this.users.find({ _id: { $in: sellerIds } }).select('firstName lastName seller').lean<Lean<User>[]>();
+    const sellerName = new Map(sellers.map((seller) => [String(seller._id), seller.seller?.storeName || `${seller.firstName} ${seller.lastName}`]));
+
+    return {
+      users: users.map((user) => {
+        const role = user.role === 'seller' ? 'seller' : 'buyer';
+        return {
+          id: String(user._id),
+          name: `${user.firstName} ${user.lastName}`.trim(),
+          email: user.email,
+          role,
+          status: user.status,
+          href: `/users/${role === 'seller' ? 'sellers' : 'buyers'}/${String(user._id)}`,
+        };
+      }),
+      listings: listings.map((product) => ({
+        id: String(product._id),
+        title: product.title,
+        sellerName: sellerName.get(String(product.sellerId)) ?? 'Seller',
+        status: product.status,
+        href: `/listings?item=${String(product._id)}`,
+      })),
+      transactions: orders.map((order) => ({
+        id: String(order._id),
+        reference: order.escrow!.reference,
+        orderNumber: `#${order.reference}`,
+        item: order.items.length > 1 ? `${order.items[0].title} +${order.items.length - 1} more` : (order.items[0]?.title ?? 'Order'),
+        amount: order.total,
+        href: `/payments?search=${encodeURIComponent(order.escrow!.reference)}`,
+      })),
+      disputes: disputes.map((dispute) => ({
+        id: String(dispute._id),
+        reference: dispute.reference,
+        item: dispute.item,
+        state: dispute.state,
+        href: `/disputes?id=${String(dispute._id)}`,
+      })),
+    };
   }
 }

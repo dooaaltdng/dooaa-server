@@ -157,7 +157,7 @@ export type ListedAs = (typeof LISTED_AS)[number];
 export const COLLECTIONS = ['top-sellers', 'featured', 'popular'] as const;
 export type Collection = (typeof COLLECTIONS)[number];
 
-export const SORT_KEYS = ['relevance', 'newest', 'price-asc', 'price-desc'] as const;
+export const SORT_KEYS = ['relevance', 'newest', 'oldest', 'price-asc', 'price-desc'] as const;
 export type SortKey = (typeof SORT_KEYS)[number];
 
 export const PRICE_BANDS = {

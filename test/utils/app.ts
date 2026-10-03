@@ -15,8 +15,8 @@ export type TestApp = {
   mail: MailService;
   sms: SmsService;
   connection: Connection;
-  /** Base URL when started with `listen: true` (WebSocket tests). */
-  url?: string;
+  /** The app's own base URL on the loopback address (WebSocket tests dial it). */
+  url: string;
   get<T>(token: unknown): T;
   close(): Promise<void>;
 };
@@ -26,7 +26,7 @@ export type TestApp = {
  * in-memory MongoDB. `env` overrides are applied only while the app reads
  * its configuration.
  */
-export async function createTestApp(options: { env?: Record<string, string>; listen?: boolean } = {}): Promise<TestApp> {
+export async function createTestApp(options: { env?: Record<string, string>; /** Kept for callers; every test app listens now. */ listen?: boolean } = {}): Promise<TestApp> {
   const saved: Record<string, string | undefined> = {};
   const env: Record<string, string> = {
     MONGODB_URI: process.env.MONGO_TEST_URI!,
@@ -42,14 +42,13 @@ export async function createTestApp(options: { env?: Record<string, string>; lis
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
     const app = moduleRef.createNestApplication<NestExpressApplication>({ rawBody: true, logger: false });
     configureApp(app);
-    let url: string | undefined;
-    if (options.listen) {
-      await app.listen(0, '127.0.0.1');
-      const address = app.getHttpServer().address() as { port: number };
-      url = `http://127.0.0.1:${address.port}`;
-    } else {
-      await app.init();
-    }
+    // Always listen on the loopback address itself. Left to supertest, each
+    // request would bind a wildcard ephemeral port and dial 127.0.0.1 on it —
+    // and on macOS that port number can already belong to another process's
+    // loopback socket, which then answers instead of this app.
+    await app.listen(0, '127.0.0.1');
+    const address = app.getHttpServer().address() as { port: number };
+    const url = `http://127.0.0.1:${address.port}`;
     const connection = app.get<Connection>(getConnectionToken());
     return {
       app,
