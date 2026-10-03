@@ -12,6 +12,8 @@ export type MailTransport = 'smtp' | 'memory' | 'log';
 export type SmsDriver = 'termii' | 'memory' | 'log';
 export type StorageDriver = 'local' | 'cloudinary' | 'memory';
 export type PaymentProviderName = 'paystack' | 'sandbox';
+/** `live` talks to Google/Facebook; `sandbox` signs in offline with a fake profile (development and tests). */
+export type OAuthDriver = 'live' | 'sandbox';
 
 export interface AppConfig {
   env: NodeEnv;
@@ -71,6 +73,11 @@ export interface AppConfig {
     sandboxSecret: string;
     /** How long the sandbox takes to "settle" transfers, refunds and charge webhooks. */
     sandboxDelayMs: number;
+  };
+  oauth: {
+    driver: OAuthDriver;
+    google: { clientId?: string; clientSecret?: string };
+    facebook: { appId?: string; appSecret?: string; graphVersion: string };
   };
   throttle: { ttlMs: number; limit: number; authLimit: number };
   scheduler: { enabled: boolean };
@@ -210,6 +217,18 @@ export function loadConfig(): AppConfig {
       sandboxSecret: str('PAYMENT_WEBHOOK_SECRET', devSecret('sandbox-webhook')),
       sandboxDelayMs: num('PAYMENT_SANDBOX_DELAY_MS', env === 'test' ? 0 : 800),
     },
+    oauth: {
+      driver: oneOf<OAuthDriver>('OAUTH_DRIVER', ['live', 'sandbox'], env === 'production' ? 'live' : 'sandbox'),
+      google: {
+        clientId: str('GOOGLE_CLIENT_ID') || undefined,
+        clientSecret: str('GOOGLE_CLIENT_SECRET') || undefined,
+      },
+      facebook: {
+        appId: str('FACEBOOK_APP_ID') || undefined,
+        appSecret: str('FACEBOOK_APP_SECRET') || undefined,
+        graphVersion: str('FACEBOOK_GRAPH_VERSION', 'v21.0'),
+      },
+    },
     throttle: {
       ttlMs: num('THROTTLE_TTL_MS', 60_000),
       limit: num('THROTTLE_LIMIT', 300),
@@ -259,6 +278,8 @@ export function assertProductionConfig(config: AppConfig): void {
   if (config.mail.transport === 'smtp') need(process.env.SMTP_HOST, 'SMTP_HOST');
   if (config.sms.driver === 'termii') need(config.sms.termii.apiKey, 'TERMII_API_KEY');
   if (config.payments.provider === 'paystack') need(config.payments.paystack.secretKey, 'PAYSTACK_SECRET_KEY');
+  // Social sign-in is optional (a provider without credentials is just hidden), but never the fake one.
+  if (config.oauth.driver === 'sandbox') missing.push('OAUTH_DRIVER (sandbox is for development only; use live)');
   for (const [name, secret] of [
     ['JWT_ACCESS_SECRET', config.jwt.accessSecret],
     ['JWT_REFRESH_SECRET', config.jwt.refreshSecret],

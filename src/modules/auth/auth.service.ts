@@ -86,7 +86,8 @@ export class AuthService {
     return { user: toPublicUser(fresh), tokens };
   }
 
-  private assertCanSignIn(user: Lean<User>): void {
+  /** Closed and banned accounts cannot start a session, whatever the sign-in method. */
+  assertCanSignIn(user: Lean<User>): void {
     if (user.status === 'closed') throw Errors.unauthorized('This account has been closed.', 'ACCOUNT_CLOSED');
     if (user.status === 'banned') {
       throw Errors.forbidden('This account has been banned. Contact support if you think this is a mistake.', 'ACCOUNT_BANNED');

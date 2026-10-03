@@ -31,6 +31,20 @@ export class SellerProfile {
 }
 const SellerProfileSchema = SchemaFactory.createForClass(SellerProfile);
 
+export const OAUTH_PROVIDERS = ['google', 'facebook'] as const;
+export type OAuthProviderId = (typeof OAUTH_PROVIDERS)[number];
+
+/** A Google or Facebook account that signs in to this user. */
+@Schema({ _id: false })
+export class OAuthIdentity {
+  @Prop({ type: String, enum: OAUTH_PROVIDERS, required: true }) provider: OAuthProviderId;
+  /** The provider's stable account id (Google `sub`, Facebook `id`). */
+  @Prop({ required: true }) subject: string;
+  @Prop({ lowercase: true, trim: true }) email?: string;
+  @Prop({ required: true }) linkedAt: Date;
+}
+const OAuthIdentitySchema = SchemaFactory.createForClass(OAuthIdentity);
+
 @Schema({ _id: false })
 export class UserStats {
   /** Paid orders placed as a buyer — the console's "Total Purchase". */
@@ -71,6 +85,8 @@ export class User {
   @Prop({ type: UserStatsSchema, default: () => ({}) }) stats: UserStats;
   @Prop({ type: Object, default: () => ({ ...DEFAULT_NOTIFICATION_PREFS }) }) notificationPrefs: NotificationPrefs;
 
+  @Prop({ type: [OAuthIdentitySchema], default: [] }) oauth: OAuthIdentity[];
+
   @Prop() lastLoginAt?: Date;
   @Prop({ default: 0 }) failedSignIns: number;
   @Prop() lockedUntil?: Date;
@@ -94,3 +110,7 @@ UserSchema.index({ email: 1 }, { unique: true });
 UserSchema.index({ role: 1, status: 1, createdAt: -1 });
 UserSchema.index({ phone: 1 });
 UserSchema.index({ identity: 1 });
+UserSchema.index(
+  { 'oauth.provider': 1, 'oauth.subject': 1 },
+  { unique: true, partialFilterExpression: { 'oauth.subject': { $exists: true } } },
+);
