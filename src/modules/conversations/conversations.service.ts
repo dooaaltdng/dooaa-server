@@ -428,8 +428,14 @@ export class ConversationsService implements OnModuleInit {
       senderName: 'DOOAA Support',
       kind: 'admin',
       body,
-      media: mediaUrl ? { url: mediaUrl } : undefined,
+      media: mediaUrl ? await this.describeMedia(mediaUrl) : undefined,
     });
+  }
+
+  /** Name, size and format of an uploaded file, so the chat can show a photo or a document card. */
+  private async describeMedia(url: string): Promise<NonNullable<Lean<Message>['media']>> {
+    const record = await this.media.byUrl(url);
+    return { url, posterUrl: record?.posterUrl, name: record?.name, size: record?.size, format: record?.mimeType.split('/')[1]?.toUpperCase() };
   }
 
   /** The red dispute panel, posted when a buyer raises one. */

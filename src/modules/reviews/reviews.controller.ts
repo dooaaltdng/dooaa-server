@@ -28,6 +28,10 @@ class ReplyDto {
   @Trim() @IsString() @MinLength(2, { message: 'Write a reply.' }) @MaxLength(1000) body: string;
 }
 
+class HighlightsQueryDto {
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(12) limit?: number;
+}
+
 class HideDto {
   @IsBoolean() hidden: boolean;
 }
@@ -41,6 +45,13 @@ export class ReviewsController {
   @Post('orders/:id/review')
   create(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() body: CreateReviewDto) {
     return this.reviews.create(user, id, body);
+  }
+
+  /** The landing page's testimonials rail. */
+  @Public()
+  @Get('reviews/highlights')
+  highlights(@Query() query: HighlightsQueryDto) {
+    return this.reviews.highlights(query.limit ?? 3);
   }
 
   @Public()

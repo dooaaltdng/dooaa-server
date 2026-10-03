@@ -35,8 +35,20 @@ export type ThreadEntry = {
   time: string;
   at: string;
   body?: string;
+  /** The attachment's URL (a still for videos). */
   image?: string;
+  /** Set when the attachment is a document rather than a picture. */
+  fileName?: string;
 };
+
+const PICTURE_FORMATS = new Set(['JPEG', 'JPG', 'PNG', 'GIF', 'WEBP', 'AVIF', 'HEIC']);
+
+/** The attachment fields of a thread entry for a message's media. */
+function attachmentOf(media: Lean<Message>['media'], kind: Lean<Message>['kind']): Pick<ThreadEntry, 'image' | 'fileName'> {
+  if (!media) return {};
+  const picture = kind === 'image' || kind === 'video' || (kind !== 'file' && PICTURE_FORMATS.has((media.format ?? '').toUpperCase()));
+  return picture ? { image: media.posterUrl ?? media.url } : { image: media.url, fileName: media.name ?? 'Document' };
+}
 
 export type AdminDisputeView = {
   id: string;
@@ -300,7 +312,7 @@ export class DisputesService implements OnModuleInit {
         case 'image':
         case 'video':
         case 'file':
-          entries.push({ id: `${id}_a`, kind: 'attachment', ...base, image: message.media?.posterUrl ?? message.media?.url });
+          entries.push({ id: `${id}_a`, kind: 'attachment', ...base, ...attachmentOf(message.media, message.kind) });
           if (message.body) entries.push({ id, kind: 'message', ...base, body: message.body });
           break;
         case 'dispute':
@@ -313,6 +325,8 @@ export class DisputesService implements OnModuleInit {
           entries.push({ id, kind: 'message', ...base, body: `Proposed a meetup at ${message.meetup?.venue ?? 'a public place'} on ${message.meetup?.date ?? ''} (${message.meetup?.from ?? ''}–${message.meetup?.to ?? ''}).` });
           break;
         default:
+          // Support can attach a photo or a document to what it says.
+          if (message.media) entries.push({ id: `${id}_a`, kind: 'attachment', ...base, ...attachmentOf(message.media, message.kind) });
           entries.push({ id, kind: 'message', ...base, body: message.body });
       }
     }
@@ -349,7 +363,7 @@ export class DisputesService implements OnModuleInit {
     if (!row?.conversationId) throw Errors.notFound('That dispute is no longer open to moderation.', 'DISPUTE_NOT_FOUND');
     if (image) await this.media.assertOwnedUrls([image], { id: staff.id, type: 'staff' }, ['evidence', 'message']);
     const message = await this.conversations.postAdmin(row.conversationId, staff, body, image);
-    return { id: String(message._id), kind: 'message', party: 'admin', day: dayKey(message.createdAt), time: clockTime(message.createdAt), at: new Date(message.createdAt).toISOString(), body, ...(image ? { image } : {}) };
+    return { id: String(message._id), kind: 'message', party: 'admin', day: dayKey(message.createdAt), time: clockTime(message.createdAt), at: new Date(message.createdAt).toISOString(), body, ...attachmentOf(message.media, message.kind) };
   }
 
   /**

@@ -85,6 +85,33 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       expect(data(await http.get('/seller/reviews', seller.token)).summary).toMatchObject({ average: 0, total: 0 });
       expect((await model<User>(t, User.name).findById(seller.id).lean())!.stats.ratingCount).toBe(0);
     });
+
+    it('highlights real, visible, positive reviews with something to say, one per buyer', async () => {
+      const seller = await registerSeller(t);
+      const review = async (buyer: TestUser, rating: number, body: string) => {
+        const product = await createProduct(t, seller.id, { title: `Item for ${body.slice(0, 10)}` });
+        const order = await paidOrder(t, buyer, String(product._id));
+        await completeOrder(t, buyer, seller, order.id);
+        return data(await http.post(`/orders/${order.id}/review`, { rating, body }, buyer.token));
+      };
+      const fan = await registerUser(t, { firstName: 'Amaka', lastName: 'Nwosu', location: 'Ikeja' });
+      const praise = 'Exactly as described, quick delivery and the escrow made me feel safe.';
+      await review(fan, 5, praise);
+      await review(fan, 5, 'A second glowing review from the same buyer, long enough to count.');
+      await review(await registerUser(t), 2, 'Long enough body but a low rating should never be highlighted here.');
+      await review(await registerUser(t), 5, 'Too short');
+      const hidden = await review(await registerUser(t), 5, 'This one is lovely but a moderator hid it, so it stays off the landing page.');
+      data(await http.patch(`/admin/reviews/${hidden.id}`, { hidden: true }, (await staffToken(t, 'moderator')).token));
+
+      const highlights = data(await http.get('/reviews/highlights?limit=12'));
+      const mine = highlights.filter((entry: any) => entry.author === 'Amaka N.');
+      expect(mine).toHaveLength(1);
+      expect(mine[0]).toMatchObject({ rating: 5, location: expect.stringContaining('Ikeja'), title: expect.stringMatching(/^Item for/) });
+      expect(highlights.every((entry: any) => entry.rating >= 4 && entry.body.length >= 40)).toBe(true);
+      expect(highlights.some((entry: any) => entry.id === hidden.id)).toBe(false);
+      expect(highlights[0]).not.toHaveProperty('buyerId');
+      failure(await http.get('/reviews/highlights?limit=50'), 400, 'VALIDATION_FAILED');
+    });
   });
 
   describe('identity verification', () => {
@@ -201,6 +228,25 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       const entry = data(await http.post(`/admin/disputes/${dispute.id}/messages`, { body: 'Hi both, I am reviewing the dispute details.' }, moderator.token));
       expect(entry).toMatchObject({ kind: 'message', party: 'admin', body: 'Hi both, I am reviewing the dispute details.' });
       expect(data(await http.get(`/conversations/${dispute.conversationId}`, buyer.token)).messages.at(-1)).toMatchObject({ kind: 'admin', senderRole: 'staff' });
+
+      // Support can attach a photo or a document; both sides see it and the console draws it.
+      const staffUpload = async (buffer: Buffer, name: string, purpose = 'evidence') =>
+        data(await request(t.server).post(`${API}/admin/media`).set('Authorization', `Bearer ${moderator.token}`).field('purpose', purpose).attach('file', buffer, name)).url as string;
+      const photo = await staffUpload(FILES.png(), 'crack.png');
+      const policy = await staffUpload(FILES.pdf(), 'packaging-policy.pdf', 'message');
+      expect(data(await http.post(`/admin/disputes/${dispute.id}/messages`, { body: 'This is the crack I mean.', image: photo }, moderator.token))).toMatchObject({ image: photo });
+      expect(data(await http.post(`/admin/disputes/${dispute.id}/messages`, { body: 'Our packaging policy.', image: policy }, moderator.token))).toMatchObject({ image: policy, fileName: 'packaging-policy.pdf' });
+      const seen = data(await http.get(`/conversations/${dispute.conversationId}`, buyer.token)).messages.slice(-2);
+      expect(seen[0]).toMatchObject({ kind: 'admin', media: { url: photo, format: 'PNG' } });
+      expect(seen[1]).toMatchObject({ kind: 'admin', media: { url: policy, name: 'packaging-policy.pdf', format: 'PDF' } });
+      const drawn = data(await http.get(`/admin/disputes/${dispute.id}`, moderator.token)).thread.filter((row: any) => row.kind === 'attachment' && row.party === 'admin');
+      expect(drawn.map((row: any) => [row.image, row.fileName ?? null])).toEqual([
+        [photo, null],
+        [policy, 'packaging-policy.pdf'],
+      ]);
+      const stranger = await staffUpload(FILES.png(), 'other.png');
+      await model<User>(t, User.name).db.collection('media').updateOne({ url: stranger }, { $set: { purpose: 'product' } });
+      failure(await http.post(`/admin/disputes/${dispute.id}/messages`, { body: 'Wrong kind of upload.', image: stranger }, moderator.token), 400, 'MEDIA_NOT_FOUND');
 
       const asked = data(await http.post(`/admin/disputes/${dispute.id}/resolve`, { outcome: 'evidence-requested' }, moderator.token));
       expect(asked).toMatchObject({ outcome: 'evidence-requested', state: 'pending' });

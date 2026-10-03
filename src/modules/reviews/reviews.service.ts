@@ -36,6 +36,20 @@ export type RatingSummary = {
   aspects: { key: ReviewAspect; label: string; score: number }[];
 };
 
+/** A review chosen for the landing page's "Trusted by sellers loved by buyers" rail. */
+export type ReviewHighlight = {
+  id: string;
+  rating: number;
+  /** What was bought, as the card's heading. */
+  title: string;
+  body: string;
+  /** First name and last initial only. */
+  author: string;
+  location: string | null;
+  avatar: string | null;
+  at: string;
+};
+
 const round1 = (value: number) => Math.round(value * 10) / 10;
 
 @Injectable()
@@ -166,6 +180,47 @@ export class ReviewsService {
     const window = pageWindow(total, page, limit);
     const rows = await this.reviews.find(filter).sort({ createdAt: -1 }).skip(window.skip).limit(window.size).lean<Lean<Review>[]>();
     return toPage(await this.views(rows), total, window);
+  }
+
+  /**
+   * Recent 4–5 star reviews with something to say, at most one per buyer,
+   * for the landing page. Only real reviews from paid orders appear.
+   */
+  async highlights(limit = 3): Promise<ReviewHighlight[]> {
+    const rows = await this.reviews
+      .aggregate<Lean<Review>>([
+        { $match: { hidden: false, rating: { $gte: 4 }, $expr: { $gte: [{ $strLenCP: '$body' }, 40] } } },
+        { $sort: { rating: -1, createdAt: -1 } },
+        { $limit: 200 },
+        { $group: { _id: '$buyerId', review: { $first: '$$ROOT' } } },
+        { $replaceRoot: { newRoot: '$review' } },
+        { $sort: { rating: -1, createdAt: -1 } },
+        { $limit: limit },
+      ])
+      .exec();
+    const [buyers, products] = await Promise.all([
+      this.users.find({ _id: { $in: rows.map((row) => row.buyerId) }, status: { $ne: 'closed' } }).select('firstName lastName avatarUrl location region').lean(),
+      this.products.find({ _id: { $in: rows.map((row) => row.productIds[0]).filter(Boolean) } }).select('title').lean(),
+    ]);
+    const buyerById = new Map(buyers.map((buyer) => [String(buyer._id), buyer]));
+    const titleById = new Map(products.map((product) => [String(product._id), (product as { title?: string }).title ?? '']));
+    return rows.flatMap((row) => {
+      const buyer = buyerById.get(String(row.buyerId));
+      if (!buyer) return [];
+      const place = [buyer.location, buyer.region].filter(Boolean);
+      return [
+        {
+          id: String(row._id),
+          rating: row.rating,
+          title: titleById.get(String(row.productIds[0])) || 'Verified purchase',
+          body: row.body,
+          author: `${buyer.firstName} ${buyer.lastName ? `${buyer.lastName[0]}.` : ''}`.trim(),
+          location: place.length ? Array.from(new Set(place)).join(', ') : null,
+          avatar: buyer.avatarUrl ?? null,
+          at: new Date(row.createdAt).toISOString(),
+        },
+      ];
+    });
   }
 
   /** The seller's public reply under a review. */
