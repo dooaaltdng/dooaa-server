@@ -14,7 +14,7 @@ The backend for **DOOAA.NG** — the marketplace (`dooaa-client`) and the manage
 
 ```bash
 npm install
-cp .env.development.example .env      # fill in Cloudinary keys (or STORAGE_DRIVER=local offline)
+cp .env.local .env                # fill in Cloudinary keys (or STORAGE_DRIVER=local offline)
 npm run start:dev                      # http://localhost:4000/api/v1  ·  docs at /docs
 npm run seed                           # superadmin + demo buyer/seller/listings
 ```
@@ -22,7 +22,7 @@ npm run seed                           # superadmin + demo buyer/seller/listings
 Production:
 
 ```bash
-cp .env.example .env                   # fill every value marked REQUIRED IN PRODUCTION
+cp .env.production .env                # fill every value marked REQUIRED IN PRODUCTION
 npm ci && npm run build
 npm run seed:prod                      # creates the first console superadmin (needs SEED_SUPERADMIN_PASSWORD)
 npm run start:prod                     # node dist/main
