@@ -1,5 +1,4 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, desc, eq, inArray, isNull, lt, ne, or, sql, type SQL } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import { EventBus } from '../../common/events/event-bus';
 import type { CheckoutMethod, PaymentStatus } from '../../common/domain';
@@ -7,8 +6,8 @@ import { paymentReference, refundReference } from '../../common/util/ids';
 import { formatNaira, sumMoney, toKobo } from '../../common/util/money';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
-import { InjectDb, isUniqueViolation, type Database } from '../../database/database';
-import { paymentOrders, paymentRefunds, payments, providerEvents } from '../../database/schema';
+import { InjectDb, isUniqueViolation, type Database, type Patch, type Where } from '../../database/database';
+import { paymentOrders, paymentRefunds, payments, providerEvents, type PaymentRow } from '../../database/schema';
 import {
   PAYMENT_PROVIDER,
   type ChargeStatus,
@@ -100,29 +99,24 @@ export class PaymentsService {
 
   /* --- Reads --------------------------------------------------------------------- */
 
-  private async load(where: SQL): Promise<Payment | null> {
-    const [row] = await this.db.select().from(payments).where(where).orderBy(desc(payments.createdAt)).limit(1);
+  private async load(where: Where<PaymentRow>): Promise<Payment | null> {
+    const row = await this.db.findOne(payments, where, { sort: { createdAt: -1 } });
     if (!row) return null;
-    const links = await this.db.select({ orderId: paymentOrders.orderId }).from(paymentOrders).where(eq(paymentOrders.paymentId, row.id));
+    const links = await this.db.find(paymentOrders, { paymentId: row.id });
     return { ...row, orderIds: links.map((link) => link.orderId) };
   }
 
   private async reload(id: string): Promise<Payment> {
-    return (await this.load(eq(payments.id, id)))!;
+    return (await this.load({ id }))!;
   }
 
   async findByReference(reference: string): Promise<Payment | null> {
-    return this.load(eq(payments.reference, reference));
+    return this.load({ reference });
   }
 
   /** The live (paid or still pending) charge for an order. */
   async findByOrder(orderId: string): Promise<Payment | null> {
-    return this.load(
-      and(
-        inArray(payments.id, this.db.select({ id: paymentOrders.paymentId }).from(paymentOrders).where(eq(paymentOrders.orderId, orderId))),
-        inArray(payments.status, ['paid', 'pending']),
-      )!,
-    );
+    return this.load({ id: { $in: await this.db.distinct(paymentOrders, 'paymentId', { orderId }) }, status: { $in: ['paid', 'pending'] } });
   }
 
   /* --- Charging ------------------------------------------------------------------ */
@@ -144,9 +138,7 @@ export class PaymentsService {
     }
     const reference = paymentReference();
     const created = await this.db.transaction(async (tx) => {
-      const [row] = await tx
-        .insert(payments)
-        .values({
+      const row = await tx.insert(payments, {
           reference,
           provider: this.provider.name,
           buyerId: input.buyer.id,
@@ -154,9 +146,11 @@ export class PaymentsService {
           amount: input.amount,
           method: input.method,
           status: 'pending',
-        })
-        .returning();
-      await tx.insert(paymentOrders).values(input.orderIds.map((orderId) => ({ paymentId: row.id, orderId })));
+        });
+      await tx.insertMany(
+        paymentOrders,
+        input.orderIds.map((orderId) => ({ paymentId: row.id, orderId })),
+      );
       return row;
     });
 
@@ -175,16 +169,10 @@ export class PaymentsService {
         expiresInMinutes: input.expiresInMinutes,
         metadata: { checkoutId: input.checkoutId, buyerId: input.buyer.id, orders: input.orderIds.join(',') },
       });
-      await this.db
-        .update(payments)
-        .set({ providerReference: session.checkoutId, checkoutUrl: session.checkoutUrl })
-        .where(eq(payments.id, created.id));
+      await this.db.update(payments, { id: created.id }, { providerReference: session.checkoutId, checkoutUrl: session.checkoutUrl });
       return this.reload(created.id);
     } catch (error) {
-      await this.db
-        .update(payments)
-        .set({ status: 'failed', failureReason: (error as Error).message, events: this.appendEvent('failed') })
-        .where(and(eq(payments.id, created.id), eq(payments.status, 'pending')));
+      await this.db.update(payments, { id: created.id, status: 'pending' }, this.withEvent('failed', { status: 'failed', failureReason: (error as Error).message }));
       await this.events.emit<PaymentFailed>(PAYMENT_EVENTS.failed, { payment: await this.reload(created.id), reason: 'provider-error' });
       throw error;
     }
@@ -204,8 +192,9 @@ export class PaymentsService {
     return this.applyChargeStatus(payment, await this.provider.getCharge(payment.providerReference));
   }
 
-  private appendEvent(label: string): SQL {
-    return sql`array_append(${payments.events}, ${`${label}:${new Date().toISOString()}`})`;
+  /** A change that also appends to the payment's audit trail. */
+  private withEvent(label: string, set: Partial<PaymentRow>): Patch<PaymentRow> {
+    return { $set: set, $push: { events: `${label}:${new Date().toISOString()}` } };
   }
 
   /**
@@ -221,9 +210,10 @@ export class PaymentsService {
       const amountOk = toKobo(status.amount) === toKobo(payment.amount);
       if (!currencyOk || !amountOk) return this.flagMismatch(payment, status);
 
-      await this.db
-        .update(payments)
-        .set({
+      await this.db.update(
+        payments,
+        { id: payment.id, status: 'pending' },
+        this.withEvent('paid', {
           status: 'paid',
           paidAt: status.paidAt ?? new Date(),
           channel: status.channel ?? null,
@@ -231,9 +221,8 @@ export class PaymentsService {
           providerTransactionId: status.chargeId ?? null,
           cardBrand: status.card?.brand ?? null,
           cardLast4: status.card?.last4 ?? null,
-          events: this.appendEvent('paid'),
-        })
-        .where(and(eq(payments.id, payment.id), eq(payments.status, 'pending')));
+        }),
+      );
       const paid = await this.reload(payment.id);
       if (paid.status !== 'paid') return paid;
       if (!paid.fulfilledAt) await this.fulfil(paid);
@@ -241,13 +230,9 @@ export class PaymentsService {
     }
 
     const next = status.status === 'abandoned' ? 'abandoned' : 'failed';
-    const changed = await this.db
-      .update(payments)
-      .set({ status: next, failureReason: status.gatewayResponse ?? next, events: this.appendEvent(next) })
-      .where(and(eq(payments.id, payment.id), eq(payments.status, 'pending')))
-      .returning({ id: payments.id });
+    const changed = await this.db.update(payments, { id: payment.id, status: 'pending' }, this.withEvent(next, { status: next, failureReason: status.gatewayResponse ?? next }));
     const latest = await this.reload(payment.id);
-    if (changed.length) await this.events.emit<PaymentFailed>(PAYMENT_EVENTS.failed, { payment: latest, reason: next });
+    if (changed) await this.events.emit<PaymentFailed>(PAYMENT_EVENTS.failed, { payment: latest, reason: next });
     return latest;
   }
 
@@ -258,57 +243,46 @@ export class PaymentsService {
    */
   private async fulfil(paid: Payment): Promise<void> {
     const staleClaim = new Date(Date.now() - STALE_CLAIM_MS);
-    const [claimed] = await this.db
-      .update(payments)
-      .set({ fulfillingAt: new Date() })
-      .where(
-        and(
-          eq(payments.id, paid.id),
-          eq(payments.status, 'paid'),
-          isNull(payments.fulfilledAt),
-          or(isNull(payments.fulfillingAt), lt(payments.fulfillingAt, staleClaim)),
-        ),
-      )
-      .returning({ id: payments.id });
+    const claimed = await this.db.update(
+      payments,
+      { id: paid.id, status: 'paid', fulfilledAt: null, $or: [{ fulfillingAt: null }, { fulfillingAt: { $lt: staleClaim } }] },
+      { fulfillingAt: new Date() },
+    );
     if (!claimed) return;
     try {
       await this.events.emit<PaymentSucceeded>(PAYMENT_EVENTS.succeeded, { payment: await this.reload(paid.id) });
-      await this.db.update(payments).set({ fulfilledAt: new Date(), fulfillingAt: null }).where(eq(payments.id, paid.id));
+      await this.db.update(payments, { id: paid.id }, { fulfilledAt: new Date(), fulfillingAt: null });
     } catch (error) {
-      await this.db
-        .update(payments)
-        .set({ fulfillingAt: null })
-        .where(and(eq(payments.id, paid.id), isNull(payments.fulfilledAt)));
+      await this.db.update(payments, { id: paid.id, fulfilledAt: null }, { fulfillingAt: null });
       throw error;
     }
   }
 
   /** The provider says it collected something other than what we asked for: never fulfil, give it back. */
   private async flagMismatch(payment: Payment, status: ChargeStatus): Promise<Payment> {
-    const changed = await this.db
-      .update(payments)
-      .set({
+    const changed = await this.db.update(
+      payments,
+      { id: payment.id, status: 'pending' },
+      this.withEvent(`mismatch:${status.amount}:${status.currency}`, {
         status: 'failed',
         failureReason: 'amount-mismatch',
         reportedAmount: status.amount,
         providerTransactionId: status.chargeId ?? null,
-        events: this.appendEvent(`mismatch:${status.amount}:${status.currency}`),
-      })
-      .where(and(eq(payments.id, payment.id), eq(payments.status, 'pending')))
-      .returning({ id: payments.id });
+      }),
+    );
     const latest = await this.reload(payment.id);
-    if (changed.length) {
+    if (changed) {
       this.logger.error(`Amount mismatch on ${payment.reference}: expected ${payment.amount}, provider reported ${status.amount} ${status.currency}`);
       if (status.amount > 0 && status.chargeId) {
         // Everything that was collected goes back: the refund takes the whole remaining balance of the charge.
         const reference = refundReference();
-        await this.db.insert(paymentRefunds).values({ paymentId: payment.id, refundReference: reference, amount: status.amount, reason: 'Payment amount did not match the order' });
+        await this.db.insert(paymentRefunds, { paymentId: payment.id, refundReference: reference, amount: status.amount, reason: 'Payment amount did not match the order' });
         await this.provider
           .refund({ chargeId: status.chargeId, reference, reason: 'Payment amount did not match the order' })
-          .then((result) => this.db.update(paymentRefunds).set({ providerRefundId: result.providerRefundId }).where(eq(paymentRefunds.refundReference, reference)))
+          .then((result) => this.db.update(paymentRefunds, { refundReference: reference }, { providerRefundId: result.providerRefundId }))
           .catch(async (error: Error) => {
             this.logger.error(`Mismatch refund failed for ${payment.reference}: ${error.message}`);
-            await this.db.update(paymentRefunds).set({ status: 'failed', failureReason: error.message }).where(eq(paymentRefunds.refundReference, reference));
+            await this.db.update(paymentRefunds, { refundReference: reference }, { status: 'failed', failureReason: error.message });
           });
       }
       await this.events.emit<PaymentFailed>(PAYMENT_EVENTS.failed, { payment: latest, reason: 'amount-mismatch' });
@@ -328,26 +302,23 @@ export class PaymentsService {
     if (!rawBody || !this.provider.verifyWebhook(rawBody, headers)) return false;
     const event = this.provider.parseWebhook(body);
     if (event.id) {
-      await this.db
-        .insert(providerEvents)
-        .values({ id: event.id, provider: this.provider.name, type: event.type === 'ignored' ? event.name : event.type })
-        .onConflictDoNothing();
-      const [seen] = await this.db.select({ processedAt: providerEvents.processedAt }).from(providerEvents).where(eq(providerEvents.id, event.id));
+      await this.db.insertIgnoringDuplicates(providerEvents, [{ id: event.id, provider: this.provider.name, type: event.type === 'ignored' ? event.name : event.type }]);
+      const seen = await this.db.findOne(providerEvents, { id: event.id });
       if (seen?.processedAt) return true;
     }
     await this.handleEvent(event);
-    if (event.id) await this.db.update(providerEvents).set({ processedAt: new Date() }).where(eq(providerEvents.id, event.id));
+    if (event.id) await this.db.update(providerEvents, { id: event.id }, { processedAt: new Date() });
     return true;
   }
 
   async handleEvent(event: ProviderEvent): Promise<void> {
     switch (event.type) {
       case 'charge.updated': {
-        const matches: SQL[] = [];
-        if (event.reference) matches.push(eq(payments.reference, event.reference));
-        if (event.checkoutId) matches.push(eq(payments.providerReference, event.checkoutId));
-        if (event.chargeId) matches.push(eq(payments.providerTransactionId, event.chargeId));
-        const payment = matches.length ? await this.load(or(...matches)!) : null;
+        const matches: Where<PaymentRow>[] = [];
+        if (event.reference) matches.push({ reference: event.reference });
+        if (event.checkoutId) matches.push({ providerReference: event.checkoutId });
+        if (event.chargeId) matches.push({ providerTransactionId: event.chargeId });
+        const payment = matches.length ? await this.load({ $or: matches }) : null;
         if (!payment?.providerReference) return; // Not one of ours.
         // Never trust the event body alone: confirm with the provider before giving value.
         await this.applyChargeStatus(payment, await this.provider.getCharge(payment.providerReference));
@@ -375,17 +346,17 @@ export class PaymentsService {
   private async applyRefundEvent(event: Extract<ProviderEvent, { type: 'refund.processed' | 'refund.failed' | 'refund.pending' }>): Promise<void> {
     if (event.type === 'refund.pending') return;
     const match = event.providerRefundId
-      ? eq(paymentRefunds.providerRefundId, event.providerRefundId)
+      ? { providerRefundId: event.providerRefundId }
       : event.refundReference
-        ? eq(paymentRefunds.refundReference, event.refundReference)
+        ? { refundReference: event.refundReference }
         : null;
     if (!match) return;
     const status = event.type === 'refund.processed' ? 'processed' : 'failed';
-    const [refund] = await this.db
-      .update(paymentRefunds)
-      .set({ status, processedAt: new Date(), ...(status === 'failed' ? { failureReason: event.reason ?? 'Refund failed' } : {}) })
-      .where(and(match, eq(paymentRefunds.status, 'pending')))
-      .returning();
+    const refund = await this.db.update(
+      paymentRefunds,
+      { ...match, status: 'pending' },
+      { status, processedAt: new Date(), ...(status === 'failed' ? { failureReason: event.reason ?? 'Refund failed' } : {}) },
+    );
     if (!refund) return;
     await this.events.emit<RefundUpdated>(PAYMENT_EVENTS.refundUpdated, { payment: await this.reload(refund.paymentId), refund });
   }
@@ -400,18 +371,10 @@ export class PaymentsService {
    * provider and recorded as failed for the console to settle by hand.
    */
   async refundOrder(input: { orderId: string; amount: number; reason: string }): Promise<PaymentRefund> {
-    const payment = await this.load(
-      and(
-        inArray(payments.id, this.db.select({ id: paymentOrders.paymentId }).from(paymentOrders).where(eq(paymentOrders.orderId, input.orderId))),
-        eq(payments.status, 'paid'),
-      )!,
-    );
+    const payment = await this.load({ id: { $in: await this.db.distinct(paymentOrders, 'paymentId', { orderId: input.orderId }) }, status: 'paid' });
     if (!payment) throw Errors.conflict('There is no completed payment to refund for this order.', 'NOTHING_TO_REFUND');
 
-    const liveRefunds = await this.db
-      .select()
-      .from(paymentRefunds)
-      .where(and(eq(paymentRefunds.paymentId, payment.id), ne(paymentRefunds.status, 'failed')));
+    const liveRefunds = await this.db.find(paymentRefunds, { paymentId: payment.id, status: { $ne: 'failed' } });
     const existing = liveRefunds.find((refund) => refund.orderId === input.orderId);
     if (existing) return existing;
     const committed = sumMoney(...liveRefunds.map((refund) => refund.amount));
@@ -422,40 +385,36 @@ export class PaymentsService {
     const reference = refundReference();
     let refund: PaymentRefund;
     try {
-      [refund] = await this.db
-        .insert(paymentRefunds)
-        .values({ paymentId: payment.id, refundReference: reference, orderId: input.orderId, amount: input.amount, status: 'pending', reason: input.reason })
-        .returning();
+      refund = await this.db.insert(paymentRefunds, {
+        paymentId: payment.id,
+        refundReference: reference,
+        orderId: input.orderId,
+        amount: input.amount,
+        status: 'pending',
+        reason: input.reason,
+      });
     } catch (error) {
       // Two callers raced; the partial unique index let one refund through. Return that one.
       if (!isUniqueViolation(error, 'payment_refunds_one_per_order_key')) throw error;
-      const [winner] = await this.db
-        .select()
-        .from(paymentRefunds)
-        .where(and(eq(paymentRefunds.paymentId, payment.id), eq(paymentRefunds.orderId, input.orderId), ne(paymentRefunds.status, 'failed')));
-      return winner;
+      return (await this.db.findOne(paymentRefunds, { paymentId: payment.id, orderId: input.orderId, status: { $ne: 'failed' } }))!;
     }
 
     try {
       const chargeId = payment.providerTransactionId ?? (payment.providerReference ? (await this.provider.getCharge(payment.providerReference)).chargeId : undefined);
       if (!chargeId) throw Errors.badGateway('The provider has no charge to refund for this payment.', 'REFUND_REJECTED');
       const result = await this.provider.refund({ chargeId, reference, amount: input.amount, reason: input.reason });
-      const [applied] = await this.db
-        .update(paymentRefunds)
-        .set({
+      const applied = (await this.db.update(
+        paymentRefunds,
+        { id: refund.id },
+        {
           providerRefundId: result.providerRefundId,
           ...(result.status !== 'pending' ? { status: result.status, processedAt: new Date(), failureReason: result.failureReason ?? null } : {}),
-        })
-        .where(eq(paymentRefunds.id, refund.id))
-        .returning();
+        },
+      ))!;
       if (applied.status !== 'pending') await this.events.emit<RefundUpdated>(PAYMENT_EVENTS.refundUpdated, { payment, refund: applied });
       return applied;
     } catch (error) {
-      const [failed] = await this.db
-        .update(paymentRefunds)
-        .set({ status: 'failed', failureReason: this.refundFailure(error) })
-        .where(eq(paymentRefunds.id, refund.id))
-        .returning();
+      const failed = (await this.db.update(paymentRefunds, { id: refund.id }, { status: 'failed', failureReason: this.refundFailure(error) }))!;
       await this.events.emit<RefundUpdated>(PAYMENT_EVENTS.refundUpdated, { payment, refund: failed });
       return failed;
     }
@@ -470,11 +429,7 @@ export class PaymentsService {
 
   /** Payments that have sat unpaid past the window: confirm with the provider, then let them lapse. */
   async expireStale(olderThan: Date): Promise<number> {
-    const stale = await this.db
-      .select({ id: payments.id })
-      .from(payments)
-      .where(and(eq(payments.status, 'pending'), lt(payments.createdAt, olderThan)))
-      .limit(200);
+    const stale = await this.db.find(payments, { status: 'pending', createdAt: { $lt: olderThan } }, { limit: 200 });
     let expired = 0;
     for (const { id } of stale) {
       const payment = await this.reload(id);
@@ -483,12 +438,8 @@ export class PaymentsService {
         await this.applyChargeStatus(payment, status);
         continue;
       }
-      const changed = await this.db
-        .update(payments)
-        .set({ status: 'abandoned', failureReason: 'expired', events: this.appendEvent('expired') })
-        .where(and(eq(payments.id, id), eq(payments.status, 'pending')))
-        .returning({ id: payments.id });
-      if (changed.length) {
+      const changed = await this.db.update(payments, { id, status: 'pending' }, this.withEvent('expired', { status: 'abandoned', failureReason: 'expired' }));
+      if (changed) {
         expired += 1;
         await this.events.emit<PaymentFailed>(PAYMENT_EVENTS.failed, { payment: await this.reload(id), reason: 'expired' });
       }
@@ -498,11 +449,7 @@ export class PaymentsService {
 
   /** Re-runs fulfilment for charges that were paid but whose fulfilment crashed. */
   async retryUnfulfilled(): Promise<number> {
-    const stuck = await this.db
-      .select({ id: payments.id, reference: payments.reference })
-      .from(payments)
-      .where(and(eq(payments.status, 'paid'), isNull(payments.fulfilledAt), lt(payments.paidAt, new Date(Date.now() - 60_000))))
-      .limit(100);
+    const stuck = await this.db.find(payments, { status: 'paid', fulfilledAt: null, paidAt: { $lt: new Date(Date.now() - 60_000) } }, { limit: 100 });
     for (const row of stuck) {
       await this.fulfil(await this.reload(row.id)).catch((error: Error) => this.logger.error(`Fulfilment retry failed for ${row.reference}: ${error.message}`));
     }
