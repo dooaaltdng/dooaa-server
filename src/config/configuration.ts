@@ -23,10 +23,11 @@ export interface AppConfig {
   corsOrigins: string[];
   logLevel: string;
   database: {
+    /** MongoDB connection string (Atlas or local). */
     url: string;
+    /** Database name inside the cluster. */
+    name: string;
     poolMax: number;
-    /** Server-side ceiling on any one statement, so a runaway query cannot hold a connection. */
-    statementTimeoutMs: number;
   };
   redis: {
     url: string;
@@ -152,9 +153,9 @@ export function loadConfig(): AppConfig {
     corsOrigins: Array.from(new Set([clientUrl, adminUrl, ...extraOrigins])),
     logLevel: str('LOG_LEVEL', production ? 'info' : env === 'test' ? 'silent' : 'debug'),
     database: {
-      url: str('DATABASE_URL'),
+      url: str('MONGODB_URI'),
+      name: str('MONGODB_DB', env === 'test' ? 'dooaa_test' : 'dooaa'),
       poolMax: num('DATABASE_POOL_MAX', 10),
-      statementTimeoutMs: num('DATABASE_STATEMENT_TIMEOUT_MS', 30_000),
     },
     redis: {
       url: str('REDIS_URL'),
@@ -261,7 +262,7 @@ export function assertConfig(config: AppConfig): void {
   const need = (value: unknown, name: string) => {
     if (!value) missing.push(name);
   };
-  need(config.database.url, 'DATABASE_URL');
+  need(config.database.url, 'MONGODB_URI');
   if (config.env !== 'test') {
     need(config.redis.url, 'REDIS_URL');
     need(config.mail.smtp.host, 'SMTP_HOST');

@@ -1,79 +1,83 @@
 import { Global, Inject, Injectable, Logger, Module, type OnApplicationBootstrap, type OnApplicationShutdown } from '@nestjs/common';
-import { sql } from 'drizzle-orm';
-import { drizzle } from 'drizzle-orm/node-postgres';
-import type { PgSequence } from 'drizzle-orm/pg-core';
-import { Pool } from 'pg';
+import { MongoClient } from 'mongodb';
 import { APP_CONFIG, type AppConfig } from '../config/configuration';
-import { DATABASE, InjectDb, PG_POOL, type Database } from './database';
-import { pendingMigrations } from './migrations';
+import { DATABASE, Database, InjectDb, MONGO_CLIENT } from './database';
 import * as schema from './schema';
+import { counters, type Table } from './schema';
 
-export function createPool(config: AppConfig['database']): Pool {
-  return new Pool({
-    connectionString: config.url,
-    max: config.poolMax,
-    idleTimeoutMillis: 30_000,
-    connectionTimeoutMillis: 10_000,
-    statement_timeout: config.statementTimeoutMs,
-    application_name: 'dooaa-server',
+export function createClient(config: AppConfig['database']): MongoClient {
+  return new MongoClient(config.url, {
+    maxPoolSize: config.poolMax,
+    serverSelectionTimeoutMS: 10_000,
+    appName: 'dooaa-server',
   });
 }
 
-export function createDatabase(pool: Pool): Database {
-  return drizzle({ client: pool, schema, casing: 'snake_case' });
+export function createDatabase(client: MongoClient, config: AppConfig['database']): Database {
+  return new Database(client, client.db(config.name));
 }
 
-/** Next value of a Postgres sequence (dispute and support ticket numbers). */
+/** Every collection the schema declares. */
+export const TABLES: Table[] = Object.values(schema).filter(
+  (value): value is Table => !!value && typeof value === 'object' && 'name' in value && 'key' in value && 'indexes' in value,
+);
+
+/** Creates every declared index. Idempotent; MongoDB skips indexes that already exist. */
+export async function ensureIndexes(db: Database): Promise<void> {
+  for (const table of TABLES) {
+    if (table.indexes.length) await db.collection(table).createIndexes(table.indexes);
+  }
+}
+
+/** Next value of a named sequence (dispute and support ticket numbers). */
 @Injectable()
 export class SequencesService {
   constructor(@InjectDb() private readonly db: Database) {}
 
-  async next(sequence: PgSequence): Promise<number> {
-    const result = await this.db.execute<{ value: string }>(sql`select nextval(${sequence.seqName}::regclass) as value`);
-    return Number(result.rows[0].value);
+  async next(sequence: { name: string; startWith: number }): Promise<number> {
+    const row = await this.db.upsert(counters, { id: sequence.name }, { $inc: { value: 1 } }, { value: sequence.startWith - 1 } as never);
+    return row.value;
   }
 }
 
 /**
- * Connects before the app serves anything, refuses to start on a schema that
- * is behind the code, and closes the pool on shutdown. Migrations are applied
- * by `npm run db:migrate` as a release step, never by the app itself.
+ * Connects before the app serves anything, makes sure the indexes exist and
+ * closes the client on shutdown.
  */
 @Injectable()
 export class DatabaseLifecycle implements OnApplicationBootstrap, OnApplicationShutdown {
   private readonly logger = new Logger('Database');
 
   constructor(
-    @Inject(PG_POOL) private readonly pool: Pool,
+    @Inject(MONGO_CLIENT) private readonly client: MongoClient,
     @InjectDb() private readonly db: Database,
-  ) {
-    // An idle client losing its connection must not take the process down; the pool replaces it.
-    this.pool.on('error', (error) => this.logger.error(`Idle database connection failed: ${error.message}`));
-  }
+  ) {}
 
   async onApplicationBootstrap(): Promise<void> {
     const started = Date.now();
-    await this.pool.query('select 1');
-    const pending = await pendingMigrations(this.db);
-    if (pending.length) {
-      throw new Error(`The database schema is behind this build (${pending.length} pending: ${pending.join(', ')}). Run \`npm run db:migrate\`.`);
-    }
-    this.logger.log(`Connected to PostgreSQL in ${Date.now() - started}ms`);
+    await this.client.connect();
+    await this.db.db.command({ ping: 1 });
+    await ensureIndexes(this.db);
+    this.logger.log(`Connected to MongoDB (${this.db.db.databaseName}) in ${Date.now() - started}ms`);
   }
 
   async onApplicationShutdown(): Promise<void> {
-    await this.pool.end();
+    await this.client.close();
   }
 }
 
 @Global()
 @Module({
   providers: [
-    { provide: PG_POOL, inject: [APP_CONFIG], useFactory: (config: AppConfig) => createPool(config.database) },
-    { provide: DATABASE, inject: [PG_POOL], useFactory: createDatabase },
+    { provide: MONGO_CLIENT, inject: [APP_CONFIG], useFactory: (config: AppConfig) => createClient(config.database) },
+    {
+      provide: DATABASE,
+      inject: [MONGO_CLIENT, APP_CONFIG],
+      useFactory: (client: MongoClient, config: AppConfig) => createDatabase(client, config.database),
+    },
     DatabaseLifecycle,
     SequencesService,
   ],
-  exports: [DATABASE, PG_POOL, SequencesService],
+  exports: [DATABASE, MONGO_CLIENT, SequencesService],
 })
 export class DatabaseModule {}

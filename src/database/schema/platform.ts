@@ -1,200 +1,231 @@
-import { sql } from 'drizzle-orm';
-import { boolean, date, index, integer, jsonb, pgSequence, pgTable, primaryKey, text, unique, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
-import { primaryId, timestamps, timestamptz } from './columns';
-import { mediaKind, mediaPurpose, mediaVisibility, notificationTone, statScope, subjectType, supportStatus } from './enums';
-import { users } from './identity';
+import type { MediaKind, MediaPurpose, MediaVisibility, NotificationTone, StatScope, SubjectType, SupportStatus } from '../../common/domain';
+import { index, table } from '../database';
 import type { HomeTile } from './values';
 
-/** Dispute numbers ("#3790") and support ticket numbers ("#SUP-1001"). */
-export const disputeNumberSeq = pgSequence('dispute_number_seq', { startWith: 3601 });
-export const supportNumberSeq = pgSequence('support_number_seq', { startWith: 1001 });
+type Timestamps = { createdAt: Date; updatedAt: Date };
 
-/** One row, `id = 'platform'`, holding every settings section as stored by the console. */
-export const settings = pgTable('settings', {
-  id: text().primaryKey(),
-  values: jsonb().$type<Record<string, unknown>>().notNull().default({}),
-  updatedBy: text(),
-  ...timestamps,
+/** Named counters handing out increasing numbers. */
+export type CounterRow = { id: string; value: number };
+
+export const counters = table<CounterRow>()('counters', { key: 'id', autoId: false, timestamps: false });
+
+/** Dispute numbers ("#3790") and support ticket numbers ("#SUP-1001"). */
+export const disputeNumberSeq = { name: 'dispute_number', startWith: 3601 };
+export const supportNumberSeq = { name: 'support_number', startWith: 1001 };
+
+/** One document, `id = 'platform'`, holding every settings section as stored by the console. */
+export type SettingsRow = Timestamps & {
+  id: string;
+  values: Record<string, unknown>;
+  updatedBy: string | null;
+};
+
+export const settings = table<SettingsRow>()('settings', {
+  key: 'id',
+  autoId: false,
+  defaults: () => ({ values: {} }),
+  nullable: ['updatedBy'],
 });
 
 /** Permissions say who may; this says who did. Written by every destructive console verb. */
-export const auditLog = pgTable(
-  'audit_log',
-  {
-    id: primaryId(),
-    /** The staff member, when a person did it. Kept without a foreign key: the log outlives accounts. */
-    actorId: uuid(),
-    actorName: text().notNull(),
-    actorRole: text(),
-    action: text().notNull(),
-    target: text().notNull(),
-    targetType: text(),
-    /** An id or a slug, depending on the target type. */
-    targetId: text(),
-    /** Marks the superadmin-only verbs, which read differently in a log. */
-    elevated: boolean().notNull().default(false),
-    meta: jsonb().$type<Record<string, unknown>>(),
-    ...timestamps,
-  },
-  (t) => [
-    index('audit_log_created_idx').on(t.createdAt.desc()),
-    index('audit_log_actor_idx').on(t.actorId, t.createdAt.desc()),
-    index('audit_log_target_idx').on(t.targetType, t.targetId),
+export type AuditLogRow = Timestamps & {
+  id: string;
+  /** The staff member, when a person did it. Kept without a reference: the log outlives accounts. */
+  actorId: string | null;
+  actorName: string;
+  actorRole: string | null;
+  action: string;
+  target: string;
+  targetType: string | null;
+  /** An id or a slug, depending on the target type. */
+  targetId: string | null;
+  /** Marks the superadmin-only verbs, which read differently in a log. */
+  elevated: boolean;
+  meta: Record<string, unknown> | null;
+};
+
+export const auditLog = table<AuditLogRow>()('audit_log', {
+  key: 'id',
+  defaults: () => ({ elevated: false }),
+  nullable: ['actorId', 'actorRole', 'targetType', 'targetId', 'meta'],
+  indexes: [
+    index('audit_log_created_idx', { createdAt: -1 }),
+    index('audit_log_actor_idx', { actorId: 1, createdAt: -1 }),
+    index('audit_log_target_idx', { targetType: 1, targetId: 1 }),
   ],
-);
+});
 
 /** Every uploaded file. Public files have a permanent URL; private ones are served through signed links. */
-export const media = pgTable(
-  'media',
-  {
-    id: primaryId(),
-    /** A users.id or staff.id, depending on owner_type. */
-    ownerId: uuid().notNull(),
-    ownerType: subjectType().notNull(),
-    purpose: mediaPurpose().notNull(),
-    kind: mediaKind().notNull(),
-    name: text().notNull(),
-    mimeType: text().notNull(),
-    /** Bytes. */
-    size: integer().notNull(),
-    visibility: mediaVisibility().notNull(),
-    storageKey: text().notNull(),
-    url: text(),
-    /** A still frame for videos, used as the chat bubble's poster. */
-    posterUrl: text(),
-    /** The storage backend holding the bytes ("cloudinary"). */
-    provider: text().notNull(),
-    ...timestamps,
-  },
-  (t) => [
-    uniqueIndex('media_storage_key_key').on(t.storageKey),
-    index('media_owner_idx').on(t.ownerId, t.createdAt.desc()),
-    index('media_url_idx').on(t.url),
+export type MediaRow = Timestamps & {
+  id: string;
+  /** A users.id or staff.id, depending on ownerType. */
+  ownerId: string;
+  ownerType: SubjectType;
+  purpose: MediaPurpose;
+  kind: MediaKind;
+  name: string;
+  mimeType: string;
+  /** Bytes. */
+  size: number;
+  visibility: MediaVisibility;
+  storageKey: string;
+  url: string | null;
+  /** A still frame for videos, used as the chat bubble's poster. */
+  posterUrl: string | null;
+  /** The storage backend holding the bytes ("cloudinary"). */
+  provider: string;
+};
+
+export const media = table<MediaRow>()('media', {
+  key: 'id',
+  nullable: ['url', 'posterUrl'],
+  indexes: [
+    index('media_storage_key_key', { storageKey: 1 }, { unique: true }),
+    index('media_owner_idx', { ownerId: 1, createdAt: -1 }),
+    index('media_url_idx', { url: 1 }),
   ],
-);
+});
 
 /** The catalog taxonomy. Products reference categories by slug, which is also the route segment. */
-export const categories = pgTable(
-  'categories',
-  {
-    slug: text().primaryKey(),
-    name: text().notNull(),
-    description: text().notNull().default(''),
-    image: text().notNull().default(''),
-    order: integer('sort_order').notNull().default(0),
-    active: boolean().notNull().default(true),
-    /** A category may appear on the landing rail more than once, under different labels. */
-    home: jsonb().$type<HomeTile[]>().notNull().default([]),
-    ...timestamps,
-  },
-  (t) => [index('categories_active_order_idx').on(t.active, t.order)],
-);
+export type CategoryRow = Timestamps & {
+  slug: string;
+  name: string;
+  description: string;
+  image: string;
+  order: number;
+  active: boolean;
+  /** A category may appear on the landing rail more than once, under different labels. */
+  home: HomeTile[];
+};
+
+export const categories = table<CategoryRow>()('categories', {
+  key: 'slug',
+  autoId: false,
+  defaults: () => ({ description: '', image: '', order: 0, active: true, home: [] as HomeTile[] }),
+  indexes: [index('categories_active_order_idx', { active: 1, order: 1 })],
+});
 
 /** A page the console publishes (About Us, Help Center, the four policies). */
-export const contentPages = pgTable(
-  'content_pages',
-  {
-    id: primaryId(),
-    slug: text().notNull(),
-    title: text().notNull(),
-    summary: text().notNull().default(''),
-    /** Sanitised rich text, exactly what the editor saves. */
-    body: text().notNull().default(''),
-    updatedBy: text(),
-    order: integer('sort_order').notNull().default(0),
-    ...timestamps,
-  },
-  (t) => [unique('content_pages_slug_key').on(t.slug)],
-);
+export type ContentPageRow = Timestamps & {
+  id: string;
+  slug: string;
+  title: string;
+  summary: string;
+  /** Sanitised rich text, exactly what the editor saves. */
+  body: string;
+  updatedBy: string | null;
+  order: number;
+};
+
+export const contentPages = table<ContentPageRow>()('content_pages', {
+  key: 'id',
+  defaults: () => ({ summary: '', body: '', order: 0 }),
+  nullable: ['updatedBy'],
+  indexes: [index('content_pages_slug_key', { slug: 1 }, { unique: true })],
+});
 
 /** Every publish keeps the body it replaced, so a page can be restored. */
-export const contentVersions = pgTable(
-  'content_versions',
-  {
-    id: primaryId(),
-    slug: text()
-      .notNull()
-      .references(() => contentPages.slug, { onDelete: 'cascade', onUpdate: 'cascade' }),
-    title: text().notNull(),
-    body: text().notNull(),
-    author: text().notNull(),
-    authorId: uuid(),
-    note: text().notNull().default(''),
-    ...timestamps,
-  },
-  (t) => [index('content_versions_slug_idx').on(t.slug, t.createdAt.desc())],
-);
+export type ContentVersionRow = Timestamps & {
+  id: string;
+  slug: string;
+  title: string;
+  body: string;
+  author: string;
+  authorId: string | null;
+  note: string;
+};
+
+export const contentVersions = table<ContentVersionRow>()('content_versions', {
+  key: 'id',
+  defaults: () => ({ note: '' }),
+  nullable: ['authorId'],
+  indexes: [index('content_versions_slug_idx', { slug: 1, createdAt: -1 })],
+});
 
 /** "Send us a mail" from the Contact page. */
-export const supportTickets = pgTable(
-  'support_tickets',
-  {
-    id: primaryId(),
-    reference: text().notNull(),
-    userId: uuid().references(() => users.id, { onDelete: 'set null' }),
-    name: text().notNull(),
-    email: text().notNull(),
-    orderReference: text(),
-    /** One of SUPPORT_TOPICS; kept as text because the topics are display copy. */
-    topic: text().notNull(),
-    detail: text().notNull(),
-    attachments: text().array().notNull().default(sql`'{}'::text[]`),
-    status: supportStatus().notNull().default('open'),
-    resolvedAt: timestamptz(),
-    resolvedBy: text(),
-    ...timestamps,
-  },
-  (t) => [uniqueIndex('support_tickets_reference_key').on(t.reference), index('support_tickets_status_idx').on(t.status, t.createdAt.desc())],
-);
+export type SupportTicketRow = Timestamps & {
+  id: string;
+  reference: string;
+  userId: string | null;
+  name: string;
+  email: string;
+  orderReference: string | null;
+  /** One of SUPPORT_TOPICS; kept as text because the topics are display copy. */
+  topic: string;
+  detail: string;
+  attachments: string[];
+  status: SupportStatus;
+  resolvedAt: Date | null;
+  resolvedBy: string | null;
+};
 
-/** The bell: one row per recipient. Rows older than 120 days are purged by a job. */
-export const notifications = pgTable(
-  'notifications',
-  {
-    id: primaryId(),
-    /** A users.id or staff.id, depending on recipient_type. */
-    recipientId: uuid().notNull(),
-    recipientType: subjectType().notNull(),
-    /** order.shipped, message.new, dispute.opened, listing.flagged… */
-    type: text().notNull(),
-    title: text().notNull(),
-    body: text().notNull().default(''),
-    tone: notificationTone().notNull().default('blue'),
-    /** Where tapping it goes, as an app path ("/orders/123-456"). */
-    link: text(),
-    data: jsonb().$type<Record<string, unknown>>(),
-    readAt: timestamptz(),
-    ...timestamps,
-  },
-  (t) => [
-    index('notifications_recipient_idx').on(t.recipientId, t.recipientType, t.createdAt.desc()),
-    index('notifications_unread_idx').on(t.recipientId, t.readAt),
-    index('notifications_created_idx').on(t.createdAt),
+export const supportTickets = table<SupportTicketRow>()('support_tickets', {
+  key: 'id',
+  defaults: () => ({ attachments: [] as string[], status: 'open' as SupportStatus }),
+  nullable: ['userId', 'orderReference', 'resolvedAt', 'resolvedBy'],
+  indexes: [
+    index('support_tickets_reference_key', { reference: 1 }, { unique: true }),
+    index('support_tickets_status_idx', { status: 1, createdAt: -1 }),
   ],
-);
+});
+
+/** The bell: one document per recipient. Ones older than 120 days are purged by a job. */
+export type NotificationRow = Timestamps & {
+  id: string;
+  /** A users.id or staff.id, depending on recipientType. */
+  recipientId: string;
+  recipientType: SubjectType;
+  /** order.shipped, message.new, dispute.opened, listing.flagged… */
+  type: string;
+  title: string;
+  body: string;
+  tone: NotificationTone;
+  /** Where tapping it goes, as an app path ("/orders/123-456"). */
+  link: string | null;
+  data: Record<string, unknown> | null;
+  readAt: Date | null;
+};
+
+export const notifications = table<NotificationRow>()('notifications', {
+  key: 'id',
+  defaults: () => ({ body: '', tone: 'blue' as NotificationTone }),
+  nullable: ['link', 'data', 'readAt'],
+  indexes: [
+    index('notifications_recipient_idx', { recipientId: 1, recipientType: 1, createdAt: -1 }),
+    index('notifications_unread_idx', { recipientId: 1, readAt: 1 }),
+    index('notifications_created_idx', { createdAt: 1 }),
+  ],
+});
 
 /** Per-day counters (Lagos days). Site rows have no seller. */
-export const dailyStats = pgTable(
-  'daily_stats',
-  {
-    id: primaryId(),
-    day: date({ mode: 'string' }).notNull(),
-    scope: statScope().notNull(),
-    sellerId: uuid().references(() => users.id, { onDelete: 'cascade' }),
-    visits: integer().notNull().default(0),
-    productViews: integer().notNull().default(0),
-    ...timestamps,
-  },
-  (t) => [unique('daily_stats_scope_seller_day_key').on(t.scope, t.sellerId, t.day).nullsNotDistinct()],
-);
+export type DailyStatRow = Timestamps & {
+  id: string;
+  /** YYYY-MM-DD. */
+  day: string;
+  scope: StatScope;
+  sellerId: string | null;
+  visits: number;
+  productViews: number;
+};
+
+export const dailyStats = table<DailyStatRow>()('daily_stats', {
+  key: 'id',
+  defaults: () => ({ visits: 0, productViews: 0 }),
+  nullable: ['sellerId'],
+  indexes: [index('daily_stats_scope_seller_day_key', { scope: 1, sellerId: 1, day: 1 }, { unique: true })],
+});
 
 /** Which visitors were already counted on a day, so a visit counts once. Purged after three days. */
-export const visitorDays = pgTable(
-  'visitor_days',
-  {
-    visitorId: text().notNull(),
-    day: date({ mode: 'string' }).notNull(),
-    at: timestamptz().notNull().defaultNow(),
-  },
-  (t) => [primaryKey({ columns: [t.visitorId, t.day] }), index('visitor_days_at_idx').on(t.at)],
-);
+export type VisitorDayRow = {
+  id: string;
+  visitorId: string;
+  day: string;
+  at: Date;
+};
+
+export const visitorDays = table<VisitorDayRow>()('visitor_days', {
+  key: 'id',
+  timestamps: false,
+  defaults: () => ({ at: new Date() }),
+  indexes: [index('visitor_days_visitor_day_key', { visitorId: 1, day: 1 }, { unique: true }), index('visitor_days_at_idx', { at: 1 })],
+});

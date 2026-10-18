@@ -1,26 +1,22 @@
-import { sql } from 'drizzle-orm';
-import { boolean, char, check, index, integer, jsonb, numeric, pgTable, smallint, text, uniqueIndex, uuid, type AnyPgColumn } from 'drizzle-orm/pg-core';
-import { money, primaryId, timestamps, timestamptz } from './columns';
-import {
-  checkoutMethod,
-  disputeOutcome,
-  disputeParty,
-  disputeState,
-  escrowPhase,
-  escrowStatus,
-  messageKind,
-  offerStatus,
-  orderActor,
-  orderKind,
-  orderPaymentStatus,
-  orderStatus,
-  productCondition,
-  refundStatus,
-  senderRole,
-  settlement,
-} from './enums';
-import { users } from './identity';
-import { products } from './catalog';
+import type {
+  CheckoutMethod,
+  Condition,
+  DisputeOutcome,
+  DisputeParty,
+  DisputeState,
+  EscrowPhase,
+  EscrowStatus,
+  MessageKind,
+  OfferStatus,
+  OrderActor,
+  OrderKind,
+  OrderPaymentStatus,
+  OrderStatus,
+  RefundStatus,
+  SenderRole,
+  Settlement,
+} from '../../common/domain';
+import { index, table } from '../database';
 import type {
   ConversationSubject,
   DeliveryInfo,
@@ -37,320 +33,350 @@ import type {
 
 /*
  * Orders and the conversations, offers, disputes and reviews around them.
- * They point at each other (an order knows its dispute, a dispute its order),
- * so they live in one module.
  */
+
+type Timestamps = { createdAt: Date; updatedAt: Date };
+
+const presentString = (field: string) => ({ partialFilterExpression: { [field]: { $type: 'string' } } });
 
 /**
  * One seller's share of a checkout. The buyer's money sits with the payment
- * provider; the escrow columns record which way DOOAA has instructed it to go.
+ * provider; the escrow fields record which way DOOAA has instructed it to go.
  */
-export const orders = pgTable(
-  'orders',
-  {
-    id: primaryId(),
-    /** "482-301948271", also accepted in routes. The display number is "#" + this. */
-    reference: text().notNull(),
-    checkoutId: text().notNull(),
-    buyerId: uuid()
-      .notNull()
-      .references(() => users.id, { onDelete: 'restrict' }),
-    sellerId: uuid()
-      .notNull()
-      .references(() => users.id, { onDelete: 'restrict' }),
-    kind: orderKind().notNull(),
+export type OrderRow = Timestamps & {
+  id: string;
+  /** "482-301948271", also accepted in routes. The display number is "#" + this. */
+  reference: string;
+  checkoutId: string;
+  buyerId: string;
+  sellerId: string;
+  kind: OrderKind;
+  subtotal: number;
+  discount: number;
+  /** Percent, e.g. 7.5. */
+  taxRate: number;
+  tax: number;
+  shipping: number;
+  escrowFee: number;
+  total: number;
+  commission: number;
+  /** What the seller is owed once escrow releases. */
+  sellerEarning: number;
+  currency: string;
+  couponCode: string | null;
+  delivery: DeliveryInfo;
+  /* The order's copy of its charge. */
+  paymentMethod: CheckoutMethod;
+  paymentReference: string | null;
+  paymentProvider: string | null;
+  paymentStatus: OrderPaymentStatus;
+  paymentPaidAt: Date | null;
+  paymentBrand: string | null;
+  paymentLast4: string | null;
+  paymentChannel: string | null;
+  status: OrderStatus;
+  /* Escrow, from the moment the charge is confirmed. */
+  /** "#3588-A3849-6788" — the console ledger's reference. */
+  escrowReference: string | null;
+  escrowPhase: EscrowPhase | null;
+  escrowStatus: EscrowStatus | null;
+  escrowSettlement: Settlement | null;
+  escrowPhaseBeforeDispute: EscrowPhase | null;
+  escrowFundedAt: Date | null;
+  escrowShippedAt: Date | null;
+  escrowReceivedAt: Date | null;
+  escrowInspectionEndsAt: Date | null;
+  escrowDisputedAt: Date | null;
+  escrowReleasedAt: Date | null;
+  escrowRefundedAt: Date | null;
+  escrowSettledBy: string | null;
+  escrowSettledAt: Date | null;
+  escrowHistory: EscrowHistoryEntry[];
+  /** The seller's dispatch deadline, counted from payment. */
+  shipBy: Date | null;
+  shipmentCarrier: string | null;
+  shipmentTrackingNumber: string | null;
+  shipmentProofUrl: string | null;
+  shipmentNote: string | null;
+  shippedAt: Date | null;
+  confirmedAt: Date | null;
+  deliveredAt: Date | null;
+  /** End of the return window — "until Nov 2, 2025" on delivered orders. */
+  returnBy: Date | null;
+  completedAt: Date | null;
+  cancelledAt: Date | null;
+  cancellationReason: string | null;
+  cancelledBy: OrderActor | null;
+  /** The buyer asked to cancel after the seller confirmed. */
+  cancellationRequestReason: string | null;
+  cancellationRequestedAt: Date | null;
+  /* The refund DOOAA asked the provider to make, if any. */
+  refundStatus: RefundStatus | null;
+  refundAmount: number | null;
+  refundReference: string | null;
+  refundRequestedAt: Date | null;
+  refundProcessedAt: Date | null;
+  refundFailureReason: string | null;
+  timeline: TimelineEntry[];
+  conversationId: string | null;
+  offerId: string | null;
+  disputeId: string | null;
+  reviewId: string | null;
+  /** When an unpaid order lapses. */
+  expiresAt: Date | null;
+};
 
-    subtotal: money().notNull(),
-    discount: money().notNull().default(0),
-    /** Percent, e.g. 7.5. */
-    taxRate: numeric({ precision: 6, scale: 3, mode: 'number' }).notNull().default(0),
-    tax: money().notNull().default(0),
-    shipping: money().notNull().default(0),
-    escrowFee: money().notNull().default(0),
-    total: money().notNull(),
-    commission: money().notNull().default(0),
-    /** What the seller is owed once escrow releases. */
-    sellerEarning: money().notNull(),
-    currency: char({ length: 3 }).notNull().default('NGN'),
-    couponCode: text(),
-    delivery: jsonb().$type<DeliveryInfo>().notNull(),
-
-    /* The order's copy of its charge. */
-    paymentMethod: checkoutMethod().notNull(),
-    paymentReference: text(),
-    paymentProvider: text(),
-    paymentStatus: orderPaymentStatus().notNull().default('pending'),
-    paymentPaidAt: timestamptz(),
-    paymentBrand: text(),
-    paymentLast4: text(),
-    paymentChannel: text(),
-
-    status: orderStatus().notNull().default('awaiting-payment'),
-
-    /* Escrow, from the moment the charge is confirmed. */
-    /** "#3588-A3849-6788" — the console ledger's reference. */
-    escrowReference: text(),
-    escrowPhase: escrowPhase(),
-    escrowStatus: escrowStatus(),
-    escrowSettlement: settlement(),
-    escrowPhaseBeforeDispute: escrowPhase(),
-    escrowFundedAt: timestamptz(),
-    escrowShippedAt: timestamptz(),
-    escrowReceivedAt: timestamptz(),
-    escrowInspectionEndsAt: timestamptz(),
-    escrowDisputedAt: timestamptz(),
-    escrowReleasedAt: timestamptz(),
-    escrowRefundedAt: timestamptz(),
-    escrowSettledBy: text(),
-    escrowSettledAt: timestamptz(),
-    escrowHistory: jsonb().$type<EscrowHistoryEntry[]>().notNull().default([]),
-
-    /** The seller's dispatch deadline, counted from payment. */
-    shipBy: timestamptz(),
-    shipmentCarrier: text(),
-    shipmentTrackingNumber: text(),
-    shipmentProofUrl: text(),
-    shipmentNote: text(),
-    shippedAt: timestamptz(),
-
-    confirmedAt: timestamptz(),
-    deliveredAt: timestamptz(),
-    /** End of the return window — "until Nov 2, 2025" on delivered orders. */
-    returnBy: timestamptz(),
-    completedAt: timestamptz(),
-    cancelledAt: timestamptz(),
-    cancellationReason: text(),
-    cancelledBy: orderActor(),
-    /** The buyer asked to cancel after the seller confirmed. */
-    cancellationRequestReason: text(),
-    cancellationRequestedAt: timestamptz(),
-
-    /* The refund DOOAA asked the provider to make, if any. */
-    refundStatus: refundStatus(),
-    refundAmount: money(),
-    refundReference: text(),
-    refundRequestedAt: timestamptz(),
-    refundProcessedAt: timestamptz(),
-    refundFailureReason: text(),
-
-    timeline: jsonb().$type<TimelineEntry[]>().notNull().default([]),
-    conversationId: uuid().references((): AnyPgColumn => conversations.id, { onDelete: 'set null' }),
-    offerId: uuid().references((): AnyPgColumn => offers.id, { onDelete: 'set null' }),
-    disputeId: uuid().references((): AnyPgColumn => disputes.id, { onDelete: 'set null' }),
-    reviewId: uuid().references((): AnyPgColumn => reviews.id, { onDelete: 'set null' }),
-    /** When an unpaid order lapses. */
-    expiresAt: timestamptz(),
-    ...timestamps,
-  },
-  (t) => [
-    uniqueIndex('orders_reference_key').on(t.reference),
-    uniqueIndex('orders_escrow_reference_key').on(t.escrowReference),
-    index('orders_buyer_idx').on(t.buyerId, t.createdAt.desc()),
-    index('orders_seller_idx').on(t.sellerId, t.createdAt.desc()),
-    index('orders_checkout_idx').on(t.checkoutId),
-    index('orders_payment_reference_idx').on(t.paymentReference),
-    index('orders_status_ship_by_idx').on(t.status, t.shipBy),
-    index('orders_escrow_status_idx').on(t.escrowStatus, t.escrowFundedAt.desc()),
-    index('orders_escrow_inspection_idx').on(t.escrowPhase, t.escrowInspectionEndsAt),
-    index('orders_expires_at_idx').on(t.expiresAt).where(sql`status = 'awaiting-payment'`),
+export const orders = table<OrderRow>()('orders', {
+  key: 'id',
+  defaults: () => ({
+    discount: 0,
+    taxRate: 0,
+    tax: 0,
+    shipping: 0,
+    escrowFee: 0,
+    commission: 0,
+    currency: 'NGN',
+    paymentStatus: 'pending' as OrderPaymentStatus,
+    status: 'awaiting-payment' as OrderStatus,
+    escrowHistory: [] as EscrowHistoryEntry[],
+    timeline: [] as TimelineEntry[],
+  }),
+  nullable: [
+    'couponCode',
+    'paymentReference',
+    'paymentProvider',
+    'paymentPaidAt',
+    'paymentBrand',
+    'paymentLast4',
+    'paymentChannel',
+    'escrowReference',
+    'escrowPhase',
+    'escrowStatus',
+    'escrowSettlement',
+    'escrowPhaseBeforeDispute',
+    'escrowFundedAt',
+    'escrowShippedAt',
+    'escrowReceivedAt',
+    'escrowInspectionEndsAt',
+    'escrowDisputedAt',
+    'escrowReleasedAt',
+    'escrowRefundedAt',
+    'escrowSettledBy',
+    'escrowSettledAt',
+    'shipBy',
+    'shipmentCarrier',
+    'shipmentTrackingNumber',
+    'shipmentProofUrl',
+    'shipmentNote',
+    'shippedAt',
+    'confirmedAt',
+    'deliveredAt',
+    'returnBy',
+    'completedAt',
+    'cancelledAt',
+    'cancellationReason',
+    'cancelledBy',
+    'cancellationRequestReason',
+    'cancellationRequestedAt',
+    'refundStatus',
+    'refundAmount',
+    'refundReference',
+    'refundRequestedAt',
+    'refundProcessedAt',
+    'refundFailureReason',
+    'conversationId',
+    'offerId',
+    'disputeId',
+    'reviewId',
+    'expiresAt',
   ],
-);
+  indexes: [
+    index('orders_reference_key', { reference: 1 }, { unique: true }),
+    index('orders_escrow_reference_key', { escrowReference: 1 }, { unique: true, ...presentString('escrowReference') }),
+    index('orders_buyer_idx', { buyerId: 1, createdAt: -1 }),
+    index('orders_seller_idx', { sellerId: 1, createdAt: -1 }),
+    index('orders_checkout_idx', { checkoutId: 1 }),
+    index('orders_payment_reference_idx', { paymentReference: 1 }),
+    index('orders_status_ship_by_idx', { status: 1, shipBy: 1 }),
+    index('orders_escrow_status_idx', { escrowStatus: 1, escrowFundedAt: -1 }),
+    index('orders_escrow_inspection_idx', { escrowPhase: 1, escrowInspectionEndsAt: 1 }),
+    index('orders_expires_at_idx', { status: 1, expiresAt: 1 }),
+  ],
+});
 
 /** An order line, frozen at the price and title it was bought at. */
-export const orderItems = pgTable(
-  'order_items',
-  {
-    id: primaryId(),
-    orderId: uuid()
-      .notNull()
-      .references(() => orders.id, { onDelete: 'cascade' }),
-    position: smallint().notNull(),
-    productId: uuid()
-      .notNull()
-      .references(() => products.id, { onDelete: 'restrict' }),
-    title: text().notNull(),
-    sku: text().notNull(),
-    quantity: integer().notNull(),
-    price: money().notNull(),
-    image: text().notNull().default(''),
-    condition: productCondition(),
-  },
-  (t) => [
-    uniqueIndex('order_items_order_position_key').on(t.orderId, t.position),
-    index('order_items_product_idx').on(t.productId),
-    index('order_items_title_trgm_idx').using('gin', t.title.op('gin_trgm_ops')),
-    check('order_items_quantity_positive', sql`${t.quantity} >= 1`),
+export type OrderItemRow = {
+  id: string;
+  orderId: string;
+  position: number;
+  productId: string;
+  title: string;
+  sku: string;
+  quantity: number;
+  price: number;
+  image: string;
+  condition: Condition | null;
+};
+
+export const orderItems = table<OrderItemRow>()('order_items', {
+  key: 'id',
+  timestamps: false,
+  defaults: () => ({ image: '' }),
+  nullable: ['condition'],
+  indexes: [
+    index('order_items_order_position_key', { orderId: 1, position: 1 }, { unique: true }),
+    index('order_items_product_idx', { productId: 1 }),
   ],
-);
+});
 
 /** A buyer and a seller talking, usually about one listing and often one order. */
-export const conversations = pgTable(
-  'conversations',
-  {
-    id: primaryId(),
-    buyerId: uuid()
-      .notNull()
-      .references(() => users.id, { onDelete: 'restrict' }),
-    sellerId: uuid()
-      .notNull()
-      .references(() => users.id, { onDelete: 'restrict' }),
-    productId: uuid().references(() => products.id, { onDelete: 'set null' }),
-    subject: jsonb().$type<ConversationSubject>(),
-    /** The escrow order this thread follows, once the buyer pays. */
-    orderId: uuid().references((): AnyPgColumn => orders.id, { onDelete: 'set null' }),
-    disputeId: uuid().references((): AnyPgColumn => disputes.id, { onDelete: 'set null' }),
-    lastMessagePreview: text().notNull().default(''),
-    lastMessageKind: messageKind(),
-    lastMessageAt: timestamptz(),
-    /** A users.id or staff.id (staff speak in dispute threads). */
-    lastMessageSenderId: uuid(),
-    buyerUnread: integer().notNull().default(0),
-    sellerUnread: integer().notNull().default(0),
-    buyerReadAt: timestamptz(),
-    sellerReadAt: timestamptz(),
-    ...timestamps,
-  },
-  (t) => [
-    index('conversations_buyer_idx').on(t.buyerId, t.lastMessageAt.desc()),
-    index('conversations_seller_idx').on(t.sellerId, t.lastMessageAt.desc()),
-    index('conversations_thread_idx').on(t.buyerId, t.sellerId, t.productId, t.orderId),
-    index('conversations_order_idx').on(t.orderId),
-  ],
-);
+export type ConversationRow = Timestamps & {
+  id: string;
+  buyerId: string;
+  sellerId: string;
+  productId: string | null;
+  subject: ConversationSubject | null;
+  /** The escrow order this thread follows, once the buyer pays. */
+  orderId: string | null;
+  disputeId: string | null;
+  lastMessagePreview: string;
+  lastMessageKind: MessageKind | null;
+  lastMessageAt: Date | null;
+  /** A users.id or staff.id (staff speak in dispute threads). */
+  lastMessageSenderId: string | null;
+  buyerUnread: number;
+  sellerUnread: number;
+  buyerReadAt: Date | null;
+  sellerReadAt: Date | null;
+};
 
-export const messages = pgTable(
-  'messages',
-  {
-    id: primaryId(),
-    conversationId: uuid()
-      .notNull()
-      .references(() => conversations.id, { onDelete: 'cascade' }),
-    /** A users.id or staff.id; null for platform system lines. */
-    senderId: uuid(),
-    senderRole: senderRole().notNull(),
-    kind: messageKind().notNull(),
-    body: text().notNull().default(''),
-    /** The highlighted lead-in on a system line ("Item marked as received."). */
-    systemLead: text(),
-    media: jsonb().$type<MessageMedia>(),
-    product: jsonb().$type<MessageProduct>(),
-    offerId: uuid().references((): AnyPgColumn => offers.id, { onDelete: 'set null' }),
-    meetup: jsonb().$type<MessageMeetup>(),
-    dispute: jsonb().$type<MessageDispute>(),
-    ...timestamps,
-  },
-  (t) => [index('messages_conversation_idx').on(t.conversationId, t.createdAt.desc(), t.id.desc())],
-);
+export const conversations = table<ConversationRow>()('conversations', {
+  key: 'id',
+  defaults: () => ({ lastMessagePreview: '', buyerUnread: 0, sellerUnread: 0 }),
+  nullable: ['productId', 'subject', 'orderId', 'disputeId', 'lastMessageKind', 'lastMessageAt', 'lastMessageSenderId', 'buyerReadAt', 'sellerReadAt'],
+  indexes: [
+    index('conversations_buyer_idx', { buyerId: 1, lastMessageAt: -1 }),
+    index('conversations_seller_idx', { sellerId: 1, lastMessageAt: -1 }),
+    index('conversations_thread_idx', { buyerId: 1, sellerId: 1, productId: 1, orderId: 1 }),
+    index('conversations_order_idx', { orderId: 1 }),
+  ],
+});
+
+export type MessageRow = Timestamps & {
+  id: string;
+  conversationId: string;
+  /** A users.id or staff.id; null for platform system lines. */
+  senderId: string | null;
+  senderRole: SenderRole;
+  kind: MessageKind;
+  body: string;
+  /** The highlighted lead-in on a system line ("Item marked as received."). */
+  systemLead: string | null;
+  media: MessageMedia | null;
+  product: MessageProduct | null;
+  offerId: string | null;
+  meetup: MessageMeetup | null;
+  dispute: MessageDispute | null;
+};
+
+export const messages = table<MessageRow>()('messages', {
+  key: 'id',
+  defaults: () => ({ body: '' }),
+  nullable: ['senderId', 'systemLead', 'media', 'product', 'offerId', 'meetup', 'dispute'],
+  indexes: [index('messages_conversation_idx', { conversationId: 1, createdAt: -1, _id: -1 })],
+});
 
 /**
  * A price negotiated in chat. An accepted offer (or an accepted counter)
  * becomes the price "Buy via Escrow" charges that buyer.
  */
-export const offers = pgTable(
-  'offers',
-  {
-    id: primaryId(),
-    conversationId: uuid()
-      .notNull()
-      .references(() => conversations.id, { onDelete: 'cascade' }),
-    productId: uuid()
-      .notNull()
-      .references(() => products.id, { onDelete: 'cascade' }),
-    buyerId: uuid()
-      .notNull()
-      .references(() => users.id, { onDelete: 'restrict' }),
-    sellerId: uuid()
-      .notNull()
-      .references(() => users.id, { onDelete: 'restrict' }),
-    amount: money().notNull(),
-    /** The listing's asking price when the offer was made — "Product Price (Listed)". */
-    listed: money().notNull(),
-    note: text().notNull().default(''),
-    status: offerStatus().notNull().default('pending'),
-    counter: jsonb().$type<OfferCounter>(),
-    /** The price both sides agreed, once accepted. */
-    agreedAmount: money(),
-    respondedAt: timestamptz(),
-    orderId: uuid().references((): AnyPgColumn => orders.id, { onDelete: 'set null' }),
-    ...timestamps,
-  },
-  (t) => [
-    index('offers_conversation_idx').on(t.conversationId, t.createdAt.desc()),
-    index('offers_buyer_product_idx').on(t.buyerId, t.productId, t.status),
-  ],
-);
+export type OfferRow = Timestamps & {
+  id: string;
+  conversationId: string;
+  productId: string;
+  buyerId: string;
+  sellerId: string;
+  amount: number;
+  /** The listing's asking price when the offer was made — "Product Price (Listed)". */
+  listed: number;
+  note: string;
+  status: OfferStatus;
+  counter: OfferCounter | null;
+  /** The price both sides agreed, once accepted. */
+  agreedAmount: number | null;
+  respondedAt: Date | null;
+  orderId: string | null;
+};
 
-export const disputes = pgTable(
-  'disputes',
-  {
-    id: primaryId(),
-    /** "#3790". */
-    reference: text().notNull(),
-    orderId: uuid()
-      .notNull()
-      .references((): AnyPgColumn => orders.id, { onDelete: 'restrict' }),
-    conversationId: uuid().references((): AnyPgColumn => conversations.id, { onDelete: 'set null' }),
-    buyerId: uuid()
-      .notNull()
-      .references(() => users.id, { onDelete: 'restrict' }),
-    sellerId: uuid()
-      .notNull()
-      .references(() => users.id, { onDelete: 'restrict' }),
-    item: text().notNull(),
-    orderValue: money().notNull(),
-    orderNumber: text().notNull(),
-    purchaseDate: timestamptz().notNull(),
-    state: disputeState().notNull().default('active'),
-    outcome: disputeOutcome(),
-    openedBy: disputeParty().notNull().default('buyer'),
-    /** The buyer's claim. */
-    reason: text().notNull(),
-    sellerClaim: text(),
-    evidence: text().array().notNull().default(sql`'{}'::text[]`),
-    sellerEvidence: text().array().notNull().default(sql`'{}'::text[]`),
-    responseDueAt: timestamptz().notNull(),
-    resolvedBy: text(),
-    resolvedAt: timestamptz(),
-    resolutionNote: text(),
-    ...timestamps,
-  },
-  (t) => [
-    uniqueIndex('disputes_reference_key').on(t.reference),
-    index('disputes_order_idx').on(t.orderId),
-    index('disputes_state_idx').on(t.state, t.createdAt.desc()),
-    index('disputes_buyer_idx').on(t.buyerId, t.createdAt.desc()),
-    index('disputes_seller_idx').on(t.sellerId, t.createdAt.desc()),
+export const offers = table<OfferRow>()('offers', {
+  key: 'id',
+  defaults: () => ({ note: '', status: 'pending' as OfferStatus }),
+  nullable: ['counter', 'agreedAmount', 'respondedAt', 'orderId'],
+  indexes: [
+    index('offers_conversation_idx', { conversationId: 1, createdAt: -1 }),
+    index('offers_buyer_product_idx', { buyerId: 1, productId: 1, status: 1 }),
   ],
-);
+});
+
+export type DisputeRow = Timestamps & {
+  id: string;
+  /** "#3790". */
+  reference: string;
+  orderId: string;
+  conversationId: string | null;
+  buyerId: string;
+  sellerId: string;
+  item: string;
+  orderValue: number;
+  orderNumber: string;
+  purchaseDate: Date;
+  state: DisputeState;
+  outcome: DisputeOutcome | null;
+  openedBy: DisputeParty;
+  /** The buyer's claim. */
+  reason: string;
+  sellerClaim: string | null;
+  evidence: string[];
+  sellerEvidence: string[];
+  responseDueAt: Date;
+  resolvedBy: string | null;
+  resolvedAt: Date | null;
+  resolutionNote: string | null;
+};
+
+export const disputes = table<DisputeRow>()('disputes', {
+  key: 'id',
+  defaults: () => ({ state: 'active' as DisputeState, openedBy: 'buyer' as DisputeParty, evidence: [] as string[], sellerEvidence: [] as string[] }),
+  nullable: ['conversationId', 'outcome', 'sellerClaim', 'resolvedBy', 'resolvedAt', 'resolutionNote'],
+  indexes: [
+    index('disputes_reference_key', { reference: 1 }, { unique: true }),
+    index('disputes_order_idx', { orderId: 1 }),
+    index('disputes_state_idx', { state: 1, createdAt: -1 }),
+    index('disputes_buyer_idx', { buyerId: 1, createdAt: -1 }),
+    index('disputes_seller_idx', { sellerId: 1, createdAt: -1 }),
+  ],
+});
 
 /**
  * "Rate your experience with …" — one per completed order, always a verified
  * purchase. The products it covers are the order's items.
  */
-export const reviews = pgTable(
-  'reviews',
-  {
-    id: primaryId(),
-    orderId: uuid()
-      .notNull()
-      .references((): AnyPgColumn => orders.id, { onDelete: 'cascade' }),
-    buyerId: uuid()
-      .notNull()
-      .references(() => users.id, { onDelete: 'restrict' }),
-    sellerId: uuid()
-      .notNull()
-      .references(() => users.id, { onDelete: 'restrict' }),
-    rating: smallint().notNull(),
-    aspects: jsonb().$type<ReviewAspects>().notNull().default({}),
-    body: text().notNull().default(''),
-    response: jsonb().$type<ReviewResponse>(),
-    /** Hidden by moderation; kept for the record but out of every average and list. */
-    hidden: boolean().notNull().default(false),
-    ...timestamps,
-  },
-  (t) => [
-    uniqueIndex('reviews_order_key').on(t.orderId),
-    index('reviews_seller_idx').on(t.sellerId, t.hidden, t.createdAt.desc()),
-    check('reviews_rating_range', sql`${t.rating} between 1 and 5`),
-  ],
-);
+export type ReviewRow = Timestamps & {
+  id: string;
+  orderId: string;
+  buyerId: string;
+  sellerId: string;
+  rating: number;
+  aspects: ReviewAspects;
+  body: string;
+  response: ReviewResponse | null;
+  /** Hidden by moderation; kept for the record but out of every average and list. */
+  hidden: boolean;
+};
+
+export const reviews = table<ReviewRow>()('reviews', {
+  key: 'id',
+  defaults: () => ({ aspects: {} as ReviewAspects, body: '', hidden: false }),
+  nullable: ['response'],
+  indexes: [index('reviews_order_key', { orderId: 1 }, { unique: true }), index('reviews_seller_idx', { sellerId: 1, hidden: 1, createdAt: -1 })],
+});
