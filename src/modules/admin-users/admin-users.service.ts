@@ -1,12 +1,12 @@
 import { Injectable } from '@nestjs/common';
-import { and, count, desc, eq, exists, gte, inArray, isNotNull, isNull, lte, ne, or, sql, type SQL } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff } from '../../common/auth/principal';
 import type { AccountStatus, IdentityStatus, ModeratedStatus, OrderStatus, VerificationLevel } from '../../common/domain';
 import { dayKey } from '../../common/util/dates';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
 import { excerpt, normalizeEmail } from '../../common/util/text';
-import { containsText, InjectDb, isUniqueViolation, type Database } from '../../database/database';
+import { escapeRegex, InjectDb, isUniqueViolation, type Database } from '../../database/database';
+import { and, contains, eq, gte, inArray, isNotNull, isNull, lte, ne, or, type Condition } from '../../database/query';
 import { disputes, messages, orderItems, orders, products, users } from '../../database/schema';
 import { AuditService } from '../audit/audit.service';
 import { MailService } from '../mail/mail.service';
@@ -14,7 +14,7 @@ import type { Order } from '../orders/order.model';
 import { OrdersService } from '../orders/orders.service';
 import { ProductsService } from '../products/products.service';
 import { SettingsService } from '../settings/settings.service';
-import { toUser, userColumns, type User } from '../users/user.model';
+import { toUser, userOmit, type User } from '../users/user.model';
 import { UsersService } from '../users/users.service';
 import { VerificationService, type KycDocumentView } from '../verification/verification.service';
 
@@ -92,10 +92,10 @@ export class AdminUsersService {
     private readonly mail: MailService,
   ) {}
 
-  private filter(role: 'buyer' | 'seller', query: UserFilters): SQL {
-    const conditions: SQL[] = [
+  private filter(role: 'buyer' | 'seller', query: UserFilters): Condition {
+    const conditions: Condition[] = [
       // Accounts that have not picked a role yet sit with the buyers.
-      role === 'seller' ? eq(users.role, 'seller') : sql`${users.role} is distinct from 'seller'`,
+      role === 'seller' ? eq(users.role, 'seller') : ne(users.role, 'seller'),
       ne(users.email, OFFICIAL_STORE_EMAIL),
       query.statuses?.length ? inArray(users.status, query.statuses) : ne(users.status, 'closed'),
     ];
@@ -109,12 +109,12 @@ export class AdminUsersService {
     if (term) {
       // Each word must match a name, the email or the store; phone numbers match on digits alone.
       for (const word of term.split(/\s+/).slice(0, 4)) {
-        const matches = [containsText(users.firstName, word), containsText(users.lastName, word), containsText(users.email, word), containsText(users.sellerStoreName, word)];
-        if (/^\+?[\d\s]{4,}$/.test(word)) matches.push(containsText(users.phone, word.replace(/\D/g, '')));
-        conditions.push(or(...matches)!);
+        const matches = [contains(users.firstName, word), contains(users.lastName, word), contains(users.email, word), contains(users.sellerStoreName, word)];
+        if (/^\+?[\d\s]{4,}$/.test(word)) matches.push(contains(users.phone, word.replace(/\D/g, '')));
+        conditions.push(or(...matches));
       }
     }
-    return and(...conditions)!;
+    return and(...conditions);
   }
 
   private base(user: User): AccountRow {
@@ -146,10 +146,10 @@ export class AdminUsersService {
     };
   }
 
-  private async page(where: SQL, query: UserFilters): Promise<{ rows: User[]; total: number; window: ReturnType<typeof pageWindow> }> {
-    const [{ total }] = await this.db.select({ total: count() }).from(users).where(where);
+  private async page(where: Condition, query: UserFilters): Promise<{ rows: User[]; total: number; window: ReturnType<typeof pageWindow> }> {
+    const total = await this.db.count(users, where);
     const window = pageWindow(total, query.page, query.limit ?? 7);
-    const rows = await this.db.select(userColumns).from(users).where(where).orderBy(desc(users.createdAt), desc(users.id)).offset(window.skip).limit(window.size);
+    const rows = await this.db.find(users, where, { sort: { createdAt: -1, id: -1 }, skip: window.skip, limit: window.size, omit: userOmit });
     return { rows: rows.map(toUser), total, window };
   }
 
@@ -179,12 +179,7 @@ export class AdminUsersService {
   }
 
   private async disputesOf(userId: string): Promise<{ disputes: ProfileDispute[]; messages: ProfileMessage[] }> {
-    const rows = await this.db
-      .select()
-      .from(disputes)
-      .where(or(eq(disputes.buyerId, userId), eq(disputes.sellerId, userId)))
-      .orderBy(desc(disputes.createdAt))
-      .limit(10);
+    const rows = await this.db.find(disputes, or(eq(disputes.buyerId, userId), eq(disputes.sellerId, userId)), { sort: { createdAt: -1 }, limit: 10 });
     const profileDisputes = rows.map((row) => ({
       id: row.id,
       reference: row.reference,
@@ -194,18 +189,11 @@ export class AdminUsersService {
     }));
     const byConversation = new Map(rows.filter((row) => row.conversationId).map((row) => [row.conversationId!, row.reference]));
     const authored = byConversation.size
-      ? await this.db
-          .select()
-          .from(messages)
-          .where(
-            and(
-              inArray(messages.conversationId, [...byConversation.keys()]),
-              eq(messages.senderId, userId),
-              or(ne(messages.body, ''), eq(messages.kind, 'dispute')),
-            ),
-          )
-          .orderBy(desc(messages.createdAt))
-          .limit(5)
+      ? await this.db.find(
+          messages,
+          and(inArray(messages.conversationId, [...byConversation.keys()]), eq(messages.senderId, userId), or(ne(messages.body, ''), eq(messages.kind, 'dispute'))),
+          { sort: { createdAt: -1 }, limit: 5 },
+        )
       : [];
     const profileMessages = authored.map((message) => ({
       id: message.id,
@@ -216,13 +204,13 @@ export class AdminUsersService {
     return { disputes: profileDisputes, messages: profileMessages };
   }
 
-  private async recentOrders(where: SQL, limit: number): Promise<Order[]> {
-    return this.orderService.withItems(await this.db.select().from(orders).where(where).orderBy(desc(orders.createdAt)).limit(limit));
+  private async recentOrders(where: Condition, limit: number): Promise<Order[]> {
+    return this.orderService.withItems(await this.db.find(orders, where, { sort: { createdAt: -1 }, limit }));
   }
 
   async buyerProfile(id: string) {
     const user = await this.account(id, 'buyer');
-    const recent = await this.recentOrders(and(eq(orders.buyerId, user.id), ne(orders.status, 'awaiting-payment'))!, 5);
+    const recent = await this.recentOrders(and(eq(orders.buyerId, user.id), ne(orders.status, 'awaiting-payment')), 5);
     const sellers = await this.userService.findByIds(recent.map((order) => order.sellerId));
     const sellerEmail = new Map(sellers.map((seller) => [seller.id, seller.email]));
     const verified = user.identity === 'verified';
@@ -247,12 +235,12 @@ export class AdminUsersService {
   async sellerProfile(id: string) {
     const user = await this.account(id, 'seller');
     const listed = and(eq(products.sellerId, user.id), isNull(products.deletedAt));
-    const paidSales = and(eq(orders.sellerId, user.id), eq(orders.paymentStatus, 'paid'))!;
-    const [listings, [{ listingCount }], sold, [{ soldCount }], verification] = await Promise.all([
-      this.db.select().from(products).where(listed).orderBy(desc(products.createdAt)).limit(4),
-      this.db.select({ listingCount: count() }).from(products).where(listed),
+    const paidSales = and(eq(orders.sellerId, user.id), eq(orders.paymentStatus, 'paid'));
+    const [listings, listingCount, sold, soldCount, verification] = await Promise.all([
+      this.db.find(products, listed, { sort: { createdAt: -1 }, limit: 4 }),
+      this.db.count(products, listed),
       this.recentOrders(paidSales, 4),
-      this.db.select({ soldCount: count() }).from(orders).where(paidSales),
+      this.db.count(orders, paidSales),
       this.verification.latestFor(user.id),
     ]);
     const documents: KycDocumentView[] = verification ? await this.verification.documentsFor(verification) : [];
@@ -404,64 +392,37 @@ export class AdminUsersService {
     const term = raw.trim().slice(0, 80);
     const empty: ConsoleSearchResults = { users: [], listings: [], transactions: [], disputes: [] };
     if (term.length < 2) return empty;
-    const bare = escapeLike(term.replace(/^#/, ''));
+    const bare = escapeRegex(term.replace(/^#/, ''));
     // References match from the start, with or without the leading "#".
-    const startsRef = (column: SQL | typeof orders.reference) => or(sql`${column} ilike ${`${bare}%`}`, sql`${column} ilike ${`#${bare}%`}`)!;
+    const startsRef = (field: string): Condition => ({ [field]: { $regex: `^#?${bare}`, $options: 'i' } });
+    const itemOrders = await this.db.distinct(orderItems, 'orderId', contains(orderItems.title, term));
     const digits = term.replace(/\D/g, '');
     const words = term.split(/\s+/).slice(0, 3);
 
     const [userRows, listings, orderRows, disputeRows] = await Promise.all([
-      this.db
-        .select(userColumns)
-        .from(users)
-        .where(
+      this.db.find(
+        users,
           and(
             ne(users.email, OFFICIAL_STORE_EMAIL),
             or(
-              containsText(users.firstName, term),
-              containsText(users.lastName, term),
-              containsText(users.email, term),
-              containsText(users.sellerStoreName, term),
-              term.includes(' ') ? and(...words.map((word) => or(containsText(users.firstName, word), containsText(users.lastName, word))!)) : undefined,
-              digits.length >= 4 ? containsText(users.phone, digits) : undefined,
+              contains(users.firstName, term),
+              contains(users.lastName, term),
+              contains(users.email, term),
+              contains(users.sellerStoreName, term),
+              term.includes(' ') ? and(...words.map((word) => or(contains(users.firstName, word), contains(users.lastName, word)))) : undefined,
+              digits.length >= 4 ? contains(users.phone, digits) : undefined,
             ),
           ),
-        )
-        .orderBy(desc(users.createdAt))
-        .limit(5),
+        { sort: { createdAt: -1 }, limit: 5, omit: userOmit },
+      ),
+      this.db.find(products, and(isNull(products.deletedAt), contains(products.title, term)), { sort: { createdAt: -1 }, limit: 5 }),
       this.db
-        .select({ id: products.id, title: products.title, sellerId: products.sellerId, status: products.status })
-        .from(products)
-        .where(and(isNull(products.deletedAt), containsText(products.title, term)))
-        .orderBy(desc(products.createdAt))
-        .limit(5),
-      this.db
-        .select()
-        .from(orders)
-        .where(
-          and(
-            isNotNull(orders.escrowReference),
-            or(
-              startsRef(sql`${orders.escrowReference}`),
-              startsRef(orders.reference),
-              exists(
-                this.db
-                  .select({ one: sql`1` })
-                  .from(orderItems)
-                  .where(and(eq(orderItems.orderId, orders.id), containsText(orderItems.title, term))),
-              ),
-            ),
-          ),
-        )
-        .orderBy(desc(orders.createdAt))
-        .limit(5)
+        .find(orders, and(isNotNull(orders.escrowReference), or(startsRef('escrowReference'), startsRef('reference'), inArray(orders.id, itemOrders))), {
+          sort: { createdAt: -1 },
+          limit: 5,
+        })
         .then((rows) => this.orderService.withItems(rows)),
-      this.db
-        .select({ id: disputes.id, reference: disputes.reference, item: disputes.item, state: disputes.state })
-        .from(disputes)
-        .where(or(startsRef(sql`${disputes.reference}`), startsRef(sql`${disputes.orderNumber}`), containsText(disputes.item, term)))
-        .orderBy(desc(disputes.createdAt))
-        .limit(5),
+      this.db.find(disputes, or(startsRef('reference'), startsRef('orderNumber'), contains(disputes.item, term)), { sort: { createdAt: -1 }, limit: 5 }),
     ]);
 
     const sellers = await this.userService.findByIds(listings.map((product) => product.sellerId));
