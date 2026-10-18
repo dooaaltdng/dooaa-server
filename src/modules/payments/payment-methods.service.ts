@@ -1,5 +1,4 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, asc, count, desc, eq } from 'drizzle-orm';
 import { createHash } from 'node:crypto';
 import { CacheService } from '../../cache/cache.service';
 import { Errors } from '../../common/api/app-error';
@@ -95,7 +94,7 @@ export class PaymentMethodsService {
       bankCode: input.bankCode,
       label: `DOOAA seller ${userId}`,
     });
-    const [{ total }] = await this.db.select({ total: count() }).from(payoutAccounts).where(eq(payoutAccounts.userId, userId));
+    const total = await this.db.count(payoutAccounts, { userId });
     const primary = input.primary === true || total === 0;
     const details = {
       provider: this.provider.name,
@@ -108,39 +107,26 @@ export class PaymentMethodsService {
       source,
     };
     const row = await this.db.transaction(async (tx) => {
-      if (primary) await tx.update(payoutAccounts).set({ primary: false }).where(eq(payoutAccounts.userId, userId));
-      const [saved] = await tx
-        .insert(payoutAccounts)
-        .values({ userId, fingerprint: fingerprint(input.bankCode, input.accountNumber), primary, ...details })
-        .onConflictDoUpdate({
-          target: [payoutAccounts.userId, payoutAccounts.fingerprint],
-          set: { ...details, ...(primary ? { primary: true } : {}) },
-        })
-        .returning();
-      return saved;
+      if (primary) await tx.updateMany(payoutAccounts, { userId }, { primary: false });
+      return tx.upsert(
+        payoutAccounts,
+        { userId, fingerprint: fingerprint(input.bankCode, input.accountNumber) },
+        { ...details, ...(primary ? { primary: true } : {}) },
+        { primary },
+      );
     });
     return this.accountView(row);
   }
 
   async payoutAccounts(userId: string): Promise<PaymentAccountView[]> {
-    const rows = await this.db
-      .select()
-      .from(payoutAccounts)
-      .where(eq(payoutAccounts.userId, userId))
-      .orderBy(desc(payoutAccounts.primary), asc(payoutAccounts.createdAt));
+    const rows = await this.db.find(payoutAccounts, { userId }, { sort: { primary: -1, createdAt: 1 } });
     return rows.map((row) => this.accountView(row));
   }
 
   /** The chosen account, or the primary one. */
   async payoutAccount(userId: string, id?: string): Promise<PayoutAccount | null> {
     if (id !== undefined && !isUuid(id)) return null;
-    const [row] = await this.db
-      .select()
-      .from(payoutAccounts)
-      .where(and(eq(payoutAccounts.userId, userId), id ? eq(payoutAccounts.id, id) : undefined))
-      .orderBy(desc(payoutAccounts.primary), asc(payoutAccounts.createdAt))
-      .limit(1);
-    return row ?? null;
+    return this.db.findOne(payoutAccounts, { userId, ...(id ? { id } : {}) }, { sort: { primary: -1, createdAt: 1 } });
   }
 
   /**
@@ -154,30 +140,23 @@ export class PaymentMethodsService {
       return null;
     });
     if (!destination?.usable) return false;
-    await this.db.update(payoutAccounts).set({ verified: true }).where(eq(payoutAccounts.id, account.id));
+    await this.db.update(payoutAccounts, { id: account.id }, { verified: true });
     return true;
   }
 
   /* --- The settings panel ---------------------------------------------------- */
 
   async accountsFor(userId: string, holder: string): Promise<PaymentAccountView[]> {
-    const rows = await this.db
-      .select()
-      .from(payoutAccounts)
-      .where(eq(payoutAccounts.userId, userId))
-      .orderBy(desc(payoutAccounts.primary), asc(payoutAccounts.createdAt));
+    const rows = await this.db.find(payoutAccounts, { userId }, { sort: { primary: -1, createdAt: 1 } });
     return rows.map((row) => this.accountView(row, holder));
   }
 
   async remove(userId: string, id: string): Promise<{ removed: true }> {
     const removed = await this.db.transaction(async (tx) => {
-      const [row] = await tx
-        .delete(payoutAccounts)
-        .where(and(eq(payoutAccounts.id, id), eq(payoutAccounts.userId, userId)))
-        .returning();
+      const row = isUuid(id) ? await tx.delete(payoutAccounts, { id, userId }) : null;
       if (row?.primary) {
-        const [next] = await tx.select({ id: payoutAccounts.id }).from(payoutAccounts).where(eq(payoutAccounts.userId, userId)).orderBy(asc(payoutAccounts.createdAt)).limit(1);
-        if (next) await tx.update(payoutAccounts).set({ primary: true }).where(eq(payoutAccounts.id, next.id));
+        const next = await tx.findOne(payoutAccounts, { userId }, { sort: { createdAt: 1 } });
+        if (next) await tx.update(payoutAccounts, { id: next.id }, { primary: true });
       }
       return row;
     });
@@ -188,13 +167,10 @@ export class PaymentMethodsService {
   /** The bank payouts default to. */
   async setPrimary(userId: string, id: string): Promise<{ primary: true }> {
     const updated = await this.db.transaction(async (tx) => {
-      const [owned] = await tx
-        .select({ id: payoutAccounts.id })
-        .from(payoutAccounts)
-        .where(and(eq(payoutAccounts.id, id), eq(payoutAccounts.userId, userId)));
+      const owned = isUuid(id) ? await tx.findOne(payoutAccounts, { id, userId }) : null;
       if (!owned) return false;
-      await tx.update(payoutAccounts).set({ primary: false }).where(eq(payoutAccounts.userId, userId));
-      await tx.update(payoutAccounts).set({ primary: true }).where(eq(payoutAccounts.id, id));
+      await tx.updateMany(payoutAccounts, { userId }, { primary: false });
+      await tx.update(payoutAccounts, { id }, { primary: true });
       return true;
     });
     if (!updated) throw Errors.notFound('That payment account is not on your profile.', 'ACCOUNT_NOT_FOUND');
