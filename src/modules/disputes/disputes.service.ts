@@ -1,6 +1,4 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
-import { and, desc, eq, gte, inArray, lte, ne, or, sql, type SQL } from 'drizzle-orm';
-import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
 import { EventBus } from '../../common/events/event-bus';
@@ -11,7 +9,7 @@ import { shortName } from '../../common/util/text';
 import { isUuid } from '../../common/util/uuid';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
-import { containsText, InjectDb, type Database } from '../../database/database';
+import { containsText, InjectDb, type Database, type Patch, type Where } from '../../database/database';
 import { SequencesService } from '../../database/database.module';
 import { disputeNumberSeq, disputes, orders, users } from '../../database/schema';
 import { AuditService } from '../audit/audit.service';
@@ -122,26 +120,21 @@ export class DisputesService implements OnModuleInit {
     // A ruling made from the escrow ledger (force-release, refund) closes the dispute too.
     this.events.on<OrderUpdated>(ORDER_EVENTS.updated, async ({ order, event }) => {
       if (!order.disputeId || (event !== 'released' && event !== 'cancelled')) return;
-      await this.db
-        .update(disputes)
-        .set({ state: 'completed', outcome: event === 'released' ? 'released' : 'refunded', resolvedAt: new Date() })
-        .where(and(eq(disputes.id, order.disputeId), ne(disputes.state, 'completed')));
+      await this.db.update(
+        disputes,
+        { id: order.disputeId, state: { $ne: 'completed' } },
+        { state: 'completed', outcome: event === 'released' ? 'released' : 'refunded', resolvedAt: new Date() },
+      );
     });
   }
 
   private async findById(id: string): Promise<Dispute | null> {
     if (!isUuid(id)) return null;
-    const [row] = await this.db.select().from(disputes).where(eq(disputes.id, id));
-    return row ?? null;
+    return this.db.findOne(disputes, { id });
   }
 
-  private async update(id: string, set: PgUpdateSetSource<typeof disputes>, condition?: SQL): Promise<Dispute | null> {
-    const [row] = await this.db
-      .update(disputes)
-      .set(set)
-      .where(and(eq(disputes.id, id), condition))
-      .returning();
-    return row ?? null;
+  private async update(id: string, set: Patch<Dispute>, condition: Where<Dispute> = {}): Promise<Dispute | null> {
+    return this.db.update(disputes, { ...condition, id }, set);
   }
 
   private partyView(row: Dispute): PartyDisputeView {
@@ -170,10 +163,7 @@ export class DisputesService implements OnModuleInit {
   /** "Report a problem" on an order: payment freezes until DOOAA rules. */
   async open(user: AuthUser, orderIdOrReference: string, input: { reason: string; evidence?: string[] }): Promise<PartyDisputeView> {
     const reference = orderIdOrReference.replace(/^#/, '');
-    const [orderRow] = await this.db
-      .select({ id: orders.id })
-      .from(orders)
-      .where(and(isUuid(reference) ? eq(orders.id, reference) : eq(orders.reference, reference), eq(orders.buyerId, user.id)));
+    const orderRow = await this.db.findOne(orders, { ...(isUuid(reference) ? { id: reference } : { reference }), buyerId: user.id });
     const order = orderRow ? await this.orderService.findById(orderRow.id) : null;
     if (!order) throw Errors.notFound("We couldn't find that order.", 'ORDER_NOT_FOUND');
     if (order.disputeId) throw Errors.conflict('There is already a dispute on this order.', 'DISPUTE_EXISTS');
@@ -189,9 +179,7 @@ export class DisputesService implements OnModuleInit {
 
     const settings = await this.settings.section('disputes');
     const number = await this.sequences.next(disputeNumberSeq);
-    const [dispute] = await this.db
-      .insert(disputes)
-      .values({
+    const dispute = await this.db.insert(disputes, {
         reference: `#${number}`,
         orderId: order.id,
         buyerId: order.buyerId,
@@ -205,8 +193,7 @@ export class DisputesService implements OnModuleInit {
         reason: input.reason,
         evidence,
         responseDueAt: addHours(new Date(), settings.responseHours),
-      })
-      .returning();
+      });
 
     await this.orderService.markDisputed(order.id, dispute.id, { kind: 'buyer', id: user.id, name: user.firstName }, input.reason);
     const conversation = await this.conversations.ensureForOrder((await this.orderService.findById(order.id))!);
@@ -257,12 +244,7 @@ export class DisputesService implements OnModuleInit {
   }
 
   async mine(user: AuthUser): Promise<PartyDisputeView[]> {
-    const rows = await this.db
-      .select()
-      .from(disputes)
-      .where(or(eq(disputes.buyerId, user.id), eq(disputes.sellerId, user.id)))
-      .orderBy(desc(disputes.createdAt))
-      .limit(100);
+    const rows = await this.db.find(disputes, { $or: [{ buyerId: user.id }, { sellerId: user.id }] }, { sort: { createdAt: -1 }, limit: 100 });
     return rows.map((row) => this.partyView(row));
   }
 
@@ -274,9 +256,8 @@ export class DisputesService implements OnModuleInit {
     const evidence = input.evidence ?? [];
     if (evidence.length) await this.media.assertOwnedUrls(evidence, { id: user.id, type: 'user' }, ['evidence', 'message']);
     const updated = await this.update(dispute.id, {
-      sellerClaim: input.claim,
-      state: 'active',
-      ...(evidence.length ? { sellerEvidence: sql`${disputes.sellerEvidence} || array[${sql.join(evidence.map((url) => sql`${url}`), sql`, `)}]::text[]` } : {}),
+      $set: { sellerClaim: input.claim, state: 'active' },
+      ...(evidence.length ? { $push: { sellerEvidence: { $each: evidence } } } : {}),
     });
     if (dispute.conversationId) {
       await this.conversations.send(user, dispute.conversationId, { kind: 'text', body: input.claim });
@@ -362,33 +343,20 @@ export class DisputesService implements OnModuleInit {
   }
 
   async adminList(query: { search?: string; states?: DisputeState[]; outcomes?: DisputeOutcome[]; openedFrom?: string; openedTo?: string }): Promise<AdminDisputeView[]> {
-    const conditions: SQL[] = [];
-    if (query.states?.length) conditions.push(inArray(disputes.state, query.states));
-    if (query.outcomes?.length) conditions.push(inArray(disputes.outcome, query.outcomes));
-    if (query.openedFrom) conditions.push(gte(disputes.createdAt, new Date(`${query.openedFrom}T00:00:00+01:00`)));
-    if (query.openedTo) conditions.push(lte(disputes.createdAt, new Date(`${query.openedTo}T23:59:59.999+01:00`)));
+    const where: Where<Dispute> = {};
+    if (query.states?.length) where.state = { $in: query.states };
+    if (query.outcomes?.length) where.outcome = { $in: query.outcomes };
+    const created: Record<string, Date> = {};
+    if (query.openedFrom) created.$gte = new Date(`${query.openedFrom}T00:00:00+01:00`);
+    if (query.openedTo) created.$lte = new Date(`${query.openedTo}T23:59:59.999+01:00`);
+    if (Object.keys(created).length) where.createdAt = created;
     const search = query.search?.trim();
     if (search) {
-      const people = this.db
-        .select({ id: users.id })
-        .from(users)
-        .where(or(containsText(users.firstName, search), containsText(users.lastName, search), containsText(users.sellerStoreName, search)));
-      conditions.push(
-        or(
-          containsText(disputes.reference, search),
-          containsText(disputes.item, search),
-          containsText(disputes.orderNumber, search),
-          inArray(disputes.buyerId, people),
-          inArray(disputes.sellerId, people),
-        )!,
-      );
+      const match = containsText(search);
+      const people = await this.db.distinct(users, 'id', { $or: [{ firstName: match }, { lastName: match }, { sellerStoreName: match }] });
+      where.$or = [{ reference: match }, { item: match }, { orderNumber: match }, { buyerId: { $in: people } }, { sellerId: { $in: people } }];
     }
-    const rows = await this.db
-      .select()
-      .from(disputes)
-      .where(and(...conditions))
-      .orderBy(desc(disputes.createdAt))
-      .limit(56);
+    const rows = await this.db.find(disputes, where, { sort: { createdAt: -1 }, limit: 56 });
     return this.adminViews(rows);
   }
 
@@ -423,7 +391,7 @@ export class DisputesService implements OnModuleInit {
     const state = OUTCOME_STATE[outcome];
 
     // Claim the ruling first so two moderators cannot both settle it.
-    const claimed = await this.update(row.id, { state, outcome, resolvedBy: staff.id, resolvedAt: new Date(), resolutionNote: note ?? null }, ne(disputes.state, 'completed'));
+    const claimed = await this.update(row.id, { state, outcome, resolvedBy: staff.id, resolvedAt: new Date(), resolutionNote: note ?? null }, { state: { $ne: 'completed' } });
     if (!claimed) throw Errors.conflict('This dispute has already been settled.', 'DISPUTE_CLOSED');
 
     try {
@@ -497,7 +465,7 @@ export class DisputesService implements OnModuleInit {
     const claimed = await this.update(
       row.id,
       { state: 'active', outcome: null, responseDueAt: addHours(new Date(), settings.responseHours), resolvedBy: null, resolvedAt: null, resolutionNote: null },
-      and(eq(disputes.state, 'completed'), eq(disputes.outcome, 'closed')),
+      { state: 'completed', outcome: 'closed' },
     );
     if (!claimed) throw Errors.conflict('This dispute changed while you were looking at it. Refresh and try again.', 'DISPUTE_CHANGED');
 
@@ -549,11 +517,6 @@ export class DisputesService implements OnModuleInit {
   /** For the console's user profiles. */
   async forUser(userId: string): Promise<Dispute[]> {
     if (!isUuid(userId)) return [];
-    return this.db
-      .select()
-      .from(disputes)
-      .where(or(eq(disputes.buyerId, userId), eq(disputes.sellerId, userId)))
-      .orderBy(desc(disputes.createdAt))
-      .limit(20);
+    return this.db.find(disputes, { $or: [{ buyerId: userId }, { sellerId: userId }] }, { sort: { createdAt: -1 }, limit: 20 });
   }
 }
