@@ -1,5 +1,4 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
-import { and, eq } from 'drizzle-orm';
 import { randomBytes } from 'node:crypto';
 import { Errors } from '../../common/api/app-error';
 import type { AuthUser } from '../../common/auth/principal';
@@ -90,10 +89,7 @@ export class CheckoutService implements OnModuleInit {
     if (coupon) await this.coupons.redeem(coupon);
     for (const order of funded) {
       if (order.offerId) {
-        await this.db
-          .update(offers)
-          .set({ status: 'used', orderId: order.id })
-          .where(and(eq(offers.id, order.offerId), eq(offers.status, 'accepted')));
+        await this.db.update(offers, { id: order.offerId, status: 'accepted' }, { status: 'used', orderId: order.id });
       }
     }
   }
@@ -102,12 +98,7 @@ export class CheckoutService implements OnModuleInit {
 
   private async agreedPrice(user: AuthUser, product: Product, offerId?: string): Promise<{ price: number; offerId?: string }> {
     if (!offerId) return { price: product.price };
-    const [offer] = isUuid(offerId)
-      ? await this.db
-          .select()
-          .from(offers)
-          .where(and(eq(offers.id, offerId), eq(offers.buyerId, user.id), eq(offers.productId, product.id)))
-      : [];
+    const offer = isUuid(offerId) ? await this.db.findOne(offers, { id: offerId, buyerId: user.id, productId: product.id }) : null;
     if (!offer) throw Errors.notFound('That offer is not available.', 'OFFER_NOT_FOUND');
     if (offer.status !== 'accepted' || !offer.agreedAmount) throw Errors.conflict('That offer has not been accepted.', 'OFFER_NOT_ACCEPTED');
     return { price: offer.agreedAmount, offerId: offer.id };
@@ -165,7 +156,8 @@ export class CheckoutService implements OnModuleInit {
         method,
         expiresInMinutes,
       });
-      const rows = await this.db.update(orders).set({ paymentReference: payment.reference, paymentProvider: payment.provider }).where(and(eq(orders.checkoutId, checkoutId))).returning();
+      await this.db.updateMany(orders, { checkoutId }, { paymentReference: payment.reference, paymentProvider: payment.provider });
+      const rows = await this.db.find(orders, { checkoutId });
       const created = await this.orders.withItems(rows.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id)));
       return { checkoutId, orders: await this.orders.buyerViews(created), payment: this.payments.view(payment) };
     } catch (error) {
@@ -203,9 +195,7 @@ export class CheckoutService implements OnModuleInit {
       const byId = new Map(reserved.map((product) => [product.id, product]));
       const ids: string[] = [];
       for (const group of pricing.groups) {
-        const [order] = await tx
-          .insert(orders)
-          .values({
+        const order = await tx.insert(orders, {
             reference: orderReference(),
             checkoutId,
             buyerId: user.id,
@@ -225,8 +215,7 @@ export class CheckoutService implements OnModuleInit {
             paymentMethod: input.method,
             status: 'awaiting-payment',
             expiresAt: window.expiresAt,
-          })
-          .returning({ id: orders.id });
+          });
         await this.insertItems(
           tx,
           order.id,
@@ -258,9 +247,7 @@ export class CheckoutService implements OnModuleInit {
 
     const orderId = await this.db.transaction(async (tx) => {
       const [reserved] = await this.reserveAll(tx, [{ productId: product.id, quantity }]);
-      const [order] = await tx
-        .insert(orders)
-        .values({
+      const order = await tx.insert(orders, {
           reference: orderReference(),
           checkoutId,
           buyerId: user.id,
@@ -280,8 +267,7 @@ export class CheckoutService implements OnModuleInit {
           status: 'awaiting-payment',
           offerId: offerId ?? null,
           expiresAt: window.expiresAt,
-        })
-        .returning({ id: orders.id });
+        });
       await this.insertItems(tx, order.id, [{ product: reserved, quantity, price }]);
       return order.id;
     });
@@ -290,7 +276,8 @@ export class CheckoutService implements OnModuleInit {
   }
 
   private async insertItems(tx: Transaction, orderId: string, lines: { product: Product; quantity: number; price: number }[]): Promise<void> {
-    await tx.insert(orderItems).values(
+    await tx.insertMany(
+      orderItems,
       lines.map((line, position) => ({
         orderId,
         position,

@@ -1,5 +1,4 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, eq, inArray } from 'drizzle-orm';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { Errors } from '../../common/api/app-error';
 import { PRIVATE_MEDIA_PURPOSES, type MediaKind, type MediaPurpose, type MediaVisibility } from '../../common/domain';
@@ -164,9 +163,7 @@ export class MediaService {
     posterUrl?: string;
   }): Promise<MediaView> {
     const id = uuidv7();
-    const [created] = await this.db
-      .insert(media)
-      .values({
+    const created = await this.db.insert(media, {
         id,
         ownerId: input.owner.id,
         ownerType: input.owner.type,
@@ -181,8 +178,7 @@ export class MediaService {
         // Drivers without a CDN serve public objects through the content route.
         url: input.visibility === 'public' ? (input.url ?? this.contentUrl(id)) : null,
         posterUrl: input.posterUrl ?? null,
-      })
-      .returning();
+      });
     return this.view(created);
   }
 
@@ -224,7 +220,7 @@ export class MediaService {
     if (payload.ownerId !== owner.id || payload.ownerType !== owner.type) {
       throw Errors.forbidden('That upload belongs to someone else.', 'UPLOAD_TICKET_INVALID');
     }
-    const [existing] = await this.db.select().from(media).where(eq(media.storageKey, payload.key));
+    const existing = await this.db.findOne(media, { storageKey: payload.key });
     if (existing) return this.view(existing);
     if (!this.storage.inspect) throw Errors.badRequest('Direct uploads need Cloudinary.', 'DIRECT_UPLOAD_UNAVAILABLE');
 
@@ -314,8 +310,7 @@ export class MediaService {
 
   async findById(id: string): Promise<MediaRecord | null> {
     if (!isUuid(id)) return null;
-    const [row] = await this.db.select().from(media).where(eq(media.id, id));
-    return row ?? null;
+    return this.db.findOne(media, { id });
   }
 
   /** Streams (or redirects to) a file for the content route. */
@@ -331,15 +326,12 @@ export class MediaService {
   }
 
   async remove(id: string, owner: MediaOwner): Promise<{ deleted: true }> {
-    const [record] = await this.db
-      .select()
-      .from(media)
-      .where(and(eq(media.id, id), eq(media.ownerId, owner.id), eq(media.ownerType, owner.type)));
+    const record = isUuid(id) ? await this.db.findOne(media, { id, ownerId: owner.id, ownerType: owner.type }) : null;
     if (!record) throw Errors.notFound();
     await this.storage.delete(record.storageKey, record.visibility, record.mimeType).catch((error) => {
       this.logger.warn(`Could not delete ${record.storageKey}: ${(error as Error).message}`);
     });
-    await this.db.delete(media).where(eq(media.id, id));
+    await this.db.delete(media, { id });
     return { deleted: true };
   }
 
@@ -350,10 +342,7 @@ export class MediaService {
   async assertOwnedUrls(urls: string[], owner: MediaOwner, purposes: MediaPurpose[], keep: string[] = []): Promise<void> {
     const fresh = [...new Set(urls.filter((url) => !keep.includes(url)))];
     if (!fresh.length) return;
-    const found = await this.db
-      .select({ url: media.url })
-      .from(media)
-      .where(and(inArray(media.url, fresh), eq(media.ownerId, owner.id), eq(media.ownerType, owner.type), inArray(media.purpose, purposes)));
+    const found = await this.db.find(media, { url: { $in: fresh }, ownerId: owner.id, ownerType: owner.type, purpose: { $in: purposes } });
     const known = new Set(found.map((row) => row.url));
     const missing = fresh.filter((url) => !known.has(url));
     if (missing.length) {
@@ -363,8 +352,7 @@ export class MediaService {
 
   /** Looks up public media by URL (for message attachments: name, size, poster). */
   async byUrl(url: string): Promise<MediaRecord | null> {
-    const [row] = await this.db.select().from(media).where(eq(media.url, url)).limit(1);
-    return row ?? null;
+    return this.db.findOne(media, { url });
   }
 
   /** Resolves private media ids (KYC documents) owned by the user. */
@@ -372,10 +360,7 @@ export class MediaService {
     const valid = ids.filter(isUuid);
     if (valid.length !== ids.length) throw Errors.badRequest('Upload each document first.', 'MEDIA_NOT_FOUND');
     const rows = valid.length
-      ? await this.db
-          .select()
-          .from(media)
-          .where(and(inArray(media.id, valid), eq(media.ownerId, owner.id), eq(media.ownerType, owner.type), eq(media.purpose, purpose)))
+      ? await this.db.find(media, { id: { $in: valid }, ownerId: owner.id, ownerType: owner.type, purpose })
       : [];
     if (rows.length !== new Set(valid).size) throw Errors.badRequest('Upload each document first.', 'MEDIA_NOT_FOUND');
     return rows;

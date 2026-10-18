@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import { and, count, desc, eq, inArray } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
 import { ID_TYPE_LABEL, type BankVerificationMethod, type IdentityStatus, type IdType, type UserRole, type VerificationLevel, type VerificationStatus } from '../../common/domain';
@@ -108,9 +107,7 @@ export class VerificationService {
 
     const now = new Date();
     const uploadedAt = now.toISOString();
-    const [created] = await this.db
-      .insert(verifications)
-      .values({
+    const created = await this.db.insert(verifications, {
         userId: user.id,
         status: 'pending',
         idType: input.idType,
@@ -123,8 +120,7 @@ export class VerificationService {
         bank,
         consents: input.consents,
         submittedAt: now,
-      })
-      .returning();
+      });
     await this.users.update(user.id, { identity: 'pending' });
 
     void this.mail.send(record.email, {
@@ -148,21 +144,11 @@ export class VerificationService {
   /* --- Console ----------------------------------------------------------------- */
 
   async list(query: { status?: VerificationStatus; page?: number; limit?: number }): Promise<Page<VerificationView & { userId: string; name: string; email: string; role: UserRole | null }>> {
-    const where = query.status ? eq(verifications.status, query.status) : undefined;
-    const [{ total }] = await this.db.select({ total: count() }).from(verifications).where(where);
+    const where = query.status ? { status: query.status } : {};
+    const total = await this.db.count(verifications, where);
     const window = pageWindow(total, query.page, query.limit ?? 20);
-    const rows = await this.db.select().from(verifications).where(where).orderBy(desc(verifications.submittedAt)).offset(window.skip).limit(window.size);
-    const people = rows.length
-      ? await this.db
-          .select({ id: users.id, firstName: users.firstName, lastName: users.lastName, email: users.email, role: users.role })
-          .from(users)
-          .where(
-            inArray(
-              users.id,
-              rows.map((row) => row.userId),
-            ),
-          )
-      : [];
+    const rows = await this.db.find(verifications, where, { sort: { submittedAt: -1 }, skip: window.skip, limit: window.size });
+    const people = rows.length ? await this.db.find(users, { id: { $in: rows.map((row) => row.userId) } }) : [];
     const byId = new Map(people.map((person) => [person.id, person]));
     return toPage(
       rows.map((row) => {
@@ -199,17 +185,11 @@ export class VerificationService {
 
   async latestFor(userId: string, status?: VerificationStatus): Promise<Verification | null> {
     if (!isUuid(userId)) return null;
-    const [row] = await this.db
-      .select()
-      .from(verifications)
-      .where(and(eq(verifications.userId, userId), status ? eq(verifications.status, status) : undefined))
-      .orderBy(desc(verifications.createdAt))
-      .limit(1);
-    return row ?? null;
+    return this.db.findOne(verifications, { userId, ...(status ? { status } : {}) }, { sort: { createdAt: -1 } });
   }
 
   async get(id: string) {
-    const [row] = isUuid(id) ? await this.db.select().from(verifications).where(eq(verifications.id, id)) : [];
+    const row = isUuid(id) ? await this.db.findOne(verifications, { id }) : null;
     if (!row) throw Errors.notFound('That verification does not exist.', 'VERIFICATION_NOT_FOUND');
     const person = await this.users.findById(row.userId);
     return {
@@ -225,13 +205,7 @@ export class VerificationService {
 
   /** Moves a pending review to its outcome; only one reviewer can decide it. */
   private async decide(id: string, set: Partial<Verification>): Promise<Verification> {
-    const [row] = isUuid(id)
-      ? await this.db
-          .update(verifications)
-          .set(set)
-          .where(and(eq(verifications.id, id), eq(verifications.status, 'pending')))
-          .returning()
-      : [];
+    const row = isUuid(id) ? await this.db.update(verifications, { id, status: 'pending' }, set) : null;
     if (!row) throw Errors.conflict('This verification is not waiting for review.', 'VERIFICATION_NOT_PENDING');
     return row;
   }

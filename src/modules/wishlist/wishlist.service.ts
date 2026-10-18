@@ -1,9 +1,8 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
-import { and, count, desc, eq, sql } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthUser } from '../../common/auth/principal';
 import { EventBus } from '../../common/events/event-bus';
-import { InjectDb, type Database } from '../../database/database';
+import { InjectDb, isUniqueViolation, type Database } from '../../database/database';
 import { wishlistItems } from '../../database/schema';
 import type { ProductCard } from '../products/product.presenter';
 import { PRODUCT_EVENTS, ProductsService, type ProductRestocked } from '../products/products.service';
@@ -28,43 +27,30 @@ export class WishlistService implements OnModuleInit {
   }
 
   async ids(user: AuthUser, limit?: number): Promise<string[]> {
-    const query = this.db
-      .select({ productId: wishlistItems.productId })
-      .from(wishlistItems)
-      .where(eq(wishlistItems.userId, user.id))
-      .orderBy(desc(wishlistItems.createdAt))
-      .$dynamic();
-    const rows = await (limit ? query.limit(limit) : query);
+    const rows = await this.db.find(wishlistItems, { userId: user.id }, { sort: { createdAt: -1 }, limit });
     return rows.map((row) => row.productId);
   }
 
   async count(userId: string): Promise<number> {
-    const [row] = await this.db.select({ total: count() }).from(wishlistItems).where(eq(wishlistItems.userId, userId));
-    return row.total;
+    return this.db.count(wishlistItems, { userId });
   }
 
   async add(user: AuthUser, productId: string): Promise<{ wishlisted: true; count: number }> {
     await this.products.findPublic(productId);
-    const inserted = await this.db
-      .insert(wishlistItems)
-      .values({ userId: user.id, productId })
-      .onConflictDoNothing({ target: [wishlistItems.userId, wishlistItems.productId] })
-      .returning({ id: wishlistItems.id });
-    if (inserted.length) await this.products.adjustWishlistCount(productId, 1);
+    const inserted = await this.db.insertIgnoringDuplicates(wishlistItems, [{ userId: user.id, productId }]);
+    if (inserted) await this.products.adjustWishlistCount(productId, 1);
     return { wishlisted: true, count: await this.count(user.id) };
   }
 
   async remove(user: AuthUser, productId: string): Promise<{ wishlisted: false; count: number }> {
-    const removed = await this.db
-      .delete(wishlistItems)
-      .where(and(eq(wishlistItems.userId, user.id), eq(wishlistItems.productId, productId)))
-      .returning({ id: wishlistItems.id });
-    if (removed.length) await this.products.adjustWishlistCount(productId, -1);
+    const removed = await this.db.delete(wishlistItems, { userId: user.id, productId });
+    if (removed) await this.products.adjustWishlistCount(productId, -1);
     return { wishlisted: false, count: await this.count(user.id) };
   }
 
   async clear(user: AuthUser): Promise<{ cleared: number }> {
-    const removed = await this.db.delete(wishlistItems).where(eq(wishlistItems.userId, user.id)).returning({ productId: wishlistItems.productId });
+    const removed = await this.db.find(wishlistItems, { userId: user.id });
+    await this.db.deleteMany(wishlistItems, { id: { $in: removed.map((row) => row.id) } });
     await Promise.all(removed.map((row) => this.products.adjustWishlistCount(row.productId, -1)));
     return { cleared: removed.length };
   }
@@ -74,29 +60,26 @@ export class WishlistService implements OnModuleInit {
     const product = await this.products.findById(productId);
     if (!product) throw Errors.notFound('This item is no longer listed.', 'PRODUCT_NOT_FOUND');
     if (on) {
-      // `xmax = 0` is true only for a freshly inserted row: the item was not saved before.
-      const [row] = await this.db
-        .insert(wishlistItems)
-        .values({ userId: user.id, productId: product.id, restockAlert: true })
-        .onConflictDoUpdate({ target: [wishlistItems.userId, wishlistItems.productId], set: { restockAlert: true } })
-        .returning({ inserted: sql<boolean>`xmax = 0` });
-      if (row?.inserted) await this.products.adjustWishlistCount(product.id, 1);
+      const existing = await this.db.update(wishlistItems, { userId: user.id, productId: product.id }, { restockAlert: true });
+      if (!existing) {
+        try {
+          await this.db.insert(wishlistItems, { userId: user.id, productId: product.id, restockAlert: true });
+          await this.products.adjustWishlistCount(product.id, 1);
+        } catch (error) {
+          if (!isUniqueViolation(error)) throw error;
+          await this.db.update(wishlistItems, { userId: user.id, productId: product.id }, { restockAlert: true });
+        }
+      }
     } else {
-      await this.db
-        .update(wishlistItems)
-        .set({ restockAlert: false })
-        .where(and(eq(wishlistItems.userId, user.id), eq(wishlistItems.productId, product.id)));
+      await this.db.update(wishlistItems, { userId: user.id, productId: product.id }, { restockAlert: false });
     }
     return { restockAlert: on };
   }
 
   /** Tells everyone waiting on an item that it is back, once. */
   private async notifyRestock(event: ProductRestocked): Promise<void> {
-    const waiting = await this.db
-      .update(wishlistItems)
-      .set({ restockAlert: false })
-      .where(and(eq(wishlistItems.productId, event.productId), eq(wishlistItems.restockAlert, true)))
-      .returning({ userId: wishlistItems.userId });
+    const waiting = await this.db.find(wishlistItems, { productId: event.productId, restockAlert: true });
+    await this.db.updateMany(wishlistItems, { id: { $in: waiting.map((row) => row.id) }, restockAlert: true }, { restockAlert: false });
     if (!waiting.length) return;
     this.events.publish<RestockAlert>(WISHLIST_EVENTS.restockAlert, {
       userIds: waiting.map((row) => row.userId),
