@@ -18,8 +18,8 @@ export function createDatabase(client: MongoClient, config: AppConfig['database'
 }
 
 /** Every collection the schema declares. */
-export const TABLES: Table[] = Object.values(schema).filter(
-  (value): value is Table => !!value && typeof value === 'object' && 'name' in value && 'key' in value && 'indexes' in value,
+export const TABLES: Table[] = (Object.values(schema) as unknown[]).filter(
+  (value): value is Table => !!value && typeof value === 'object' && Array.isArray((value as Table).indexes) && typeof (value as Table).key === 'string',
 );
 
 /** Creates every declared index. Idempotent; MongoDB skips indexes that already exist. */

@@ -27,6 +27,13 @@ type Timestamps = { createdAt: Date; updatedAt: Date };
 /** Fields whose type admits null: an insert may leave them out (they default to null). */
 type NullableKeys<Row> = { [K in keyof Row]-?: null extends Row[K] ? K : never }[keyof Row];
 
+/** A reference to one field, for the condition helpers in ./query (`eq(orders.status, 'paid')`). */
+export type Column<T = unknown> = { readonly field: string; readonly $type?: T };
+
+type Reserved = 'name' | 'key' | 'autoId' | 'timestamps' | 'defaults' | 'indexes' | '$inferSelect' | '$inferInsert';
+
+export type Columns<Row> = { readonly [K in Exclude<keyof Row & string, Reserved>]-?: Column<Row[K]> };
+
 export type Table<Row extends object = any, Key extends keyof Row & string = any, Optional extends keyof Row = any> = {
   readonly name: string;
   /** The field stored as `_id`. */
@@ -60,8 +67,8 @@ export function table<Row extends object>() {
       nullable?: NullableKeys<Row>[];
       indexes?: IndexDescription[];
     },
-  ): Table<Row, Key, Extract<Extract<keyof D, keyof Row> | Key | NullableKeys<Row> | 'createdAt' | 'updatedAt', keyof Row>> =>
-    ({
+  ): Table<Row, Key, Extract<Extract<keyof D, keyof Row> | Key | NullableKeys<Row> | 'createdAt' | 'updatedAt', keyof Row>> & Columns<Row> => {
+    const base = {
       name,
       key: options.key,
       autoId: options.autoId ?? options.key === ('id' as Key),
@@ -71,7 +78,12 @@ export function table<Row extends object>() {
         ...(options.defaults?.() ?? {}),
       }),
       indexes: options.indexes ?? [],
+    };
+    // Any other property is a column reference.
+    return new Proxy(base, {
+      get: (target, property) => (typeof property === 'string' && !(property in target) ? { field: property } : Reflect.get(target, property)),
     }) as never;
+  };
 }
 
 /** An index declaration, named so duplicate-key errors can be matched by name. */
