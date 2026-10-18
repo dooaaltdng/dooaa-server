@@ -1,6 +1,4 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { and, count, desc, eq, exists, gte, inArray, isNotNull, isNull, lt, lte, ne, or, sql, sum, type SQL } from 'drizzle-orm';
-import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
 import { Errors } from '../../common/api/app-error';
 import type { AuthUser } from '../../common/auth/principal';
 import type { EscrowPhase, OrderActor, OrderKind, OrderStatus, OtpChannel, Settlement } from '../../common/domain';
@@ -9,7 +7,8 @@ import { addDays, addHours, DAY } from '../../common/util/dates';
 import { escrowReference } from '../../common/util/ids';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
 import { isUuid } from '../../common/util/uuid';
-import { containsText, InjectDb, type Database } from '../../database/database';
+import { InjectDb, type Database } from '../../database/database';
+import { and, contains, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, or, type Condition } from '../../database/query';
 import { orderItems, orders, products, type EscrowHistoryEntry, type TimelineEntry } from '../../database/schema';
 import { OtpService, type IssuedOtp } from '../otp/otp.service';
 import { PaymentsService } from '../payments/payments.service';
@@ -50,7 +49,7 @@ export type OrderUpdated = {
 
 export type Actor = { kind: OrderActor; id?: string; name: string };
 
-type OrderPatch = PgUpdateSetSource<typeof orders>;
+type OrderPatch = Partial<OrderRow>;
 
 const ACTIVE_FOR_CLOSURE: OrderStatus[] = ['pending', 'confirmed', 'shipped'];
 
@@ -95,22 +94,14 @@ export class OrdersService implements OnModuleInit {
   /** Orders with their items, in the order the rows were given. */
   async withItems(rows: OrderRow[]): Promise<Order[]> {
     if (!rows.length) return [];
-    const items = await this.db
-      .select()
-      .from(orderItems)
-      .where(
-        inArray(
-          orderItems.orderId,
-          rows.map((row) => row.id),
-        ),
-      );
+    const items = await this.db.find(orderItems, inArray(orderItems.orderId, rows.map((row) => row.id)), { sort: { position: 1 } });
     const byOrder = new Map<string, (typeof items)[number][]>();
     for (const item of items) byOrder.set(item.orderId, [...(byOrder.get(item.orderId) ?? []), item]);
     return rows.map((row) => toOrder(row, byOrder.get(row.id) ?? []));
   }
 
-  private async one(where: SQL | undefined): Promise<Order | null> {
-    const [row] = await this.db.select().from(orders).where(where).limit(1);
+  private async one(where: Condition): Promise<Order | null> {
+    const row = await this.db.findOne(orders, where);
     return row ? (await this.withItems([row]))[0] : null;
   }
 
@@ -121,13 +112,13 @@ export class OrdersService implements OnModuleInit {
   async findMany(ids: string[]): Promise<Order[]> {
     const valid = ids.filter(isUuid);
     if (!valid.length) return [];
-    return this.withItems(await this.db.select().from(orders).where(inArray(orders.id, valid)).orderBy(orders.createdAt));
+    return this.withItems(await this.db.find(orders, inArray(orders.id, valid), { sort: { createdAt: 1 } }));
   }
 
   /* --- Lookups ------------------------------------------------------------------ */
 
   /** Routes accept the order id or the "123-47128390" reference (with or without "#"). */
-  private idFilter(idOrReference: string): SQL {
+  private idFilter(idOrReference: string): Condition {
     const reference = idOrReference.replace(/^#/, '');
     return isUuid(reference) ? eq(orders.id, reference) : eq(orders.reference, reference);
   }
@@ -161,47 +152,33 @@ export class OrdersService implements OnModuleInit {
 
   /* --- Reads ----------------------------------------------------------------------- */
 
-  private listFilter(owner: 'buyer' | 'seller', userId: string, query: OrderListQuery): SQL {
-    const conditions: SQL[] = [eq(owner === 'buyer' ? orders.buyerId : orders.sellerId, userId)];
+  private async listFilter(owner: 'buyer' | 'seller', userId: string, query: OrderListQuery): Promise<Condition> {
+    const conditions: Condition[] = [eq(owner === 'buyer' ? orders.buyerId : orders.sellerId, userId)];
     conditions.push(query.status ? eq(orders.status, query.status) : ne(orders.status, 'awaiting-payment'));
     if (query.kind) conditions.push(eq(orders.kind, query.kind));
     if (query.escrow) conditions.push(inArray(orders.escrowPhase, ESCROW_STATE_PHASES[query.escrow]));
     const term = query.q?.trim().replace(/^#/, '');
     if (term) {
-      conditions.push(
-        or(
-          containsText(orders.reference, term),
-          exists(
-            this.db
-              .select({ one: sql`1` })
-              .from(orderItems)
-              .where(and(eq(orderItems.orderId, orders.id), containsText(orderItems.title, term))),
-          ),
-        )!,
-      );
+      const withItem = await this.db.distinct(orderItems, 'orderId', contains(orderItems.title, term));
+      conditions.push(or(contains(orders.reference, term), inArray(orders.id, withItem)));
     }
-    return and(...conditions)!;
+    return and(...conditions);
   }
 
-  private async pageOf(where: SQL, page: number | undefined, limit: number): Promise<{ rows: Order[]; total: number; window: ReturnType<typeof pageWindow> }> {
-    const [{ total }] = await this.db.select({ total: count() }).from(orders).where(where);
+  private async pageOf(where: Condition, page: number | undefined, limit: number): Promise<{ rows: Order[]; total: number; window: ReturnType<typeof pageWindow> }> {
+    const total = await this.db.count(orders, where);
     const window = pageWindow(total, page, limit);
-    const rows = await this.db.select().from(orders).where(where).orderBy(desc(orders.createdAt), desc(orders.id)).offset(window.skip).limit(window.size);
+    const rows = await this.db.find(orders, where, { sort: { createdAt: -1, id: -1 }, skip: window.skip, limit: window.size });
     return { rows: await this.withItems(rows), total, window };
   }
 
   async list(user: AuthUser, query: OrderListQuery & { page?: number; limit?: number }): Promise<Page<BuyerOrderView>> {
-    const { rows, total, window } = await this.pageOf(this.listFilter('buyer', user.id, query), query.page, query.limit ?? 10);
+    const { rows, total, window } = await this.pageOf(await this.listFilter('buyer', user.id, query), query.page, query.limit ?? 10);
     return toPage(await this.buyerViews(rows), total, window);
   }
 
   async recent(user: AuthUser, limit = 4): Promise<BuyerOrderView[]> {
-    const rows = await this.db
-      .select()
-      .from(orders)
-      .where(and(eq(orders.buyerId, user.id), ne(orders.status, 'awaiting-payment')))
-      .orderBy(desc(orders.createdAt))
-      .limit(Math.min(limit, 20));
+    const rows = await this.db.find(orders, and(eq(orders.buyerId, user.id), ne(orders.status, 'awaiting-payment')), { sort: { createdAt: -1 }, limit: Math.min(limit, 20) });
     return this.buyerViews(await this.withItems(rows));
   }
 
@@ -214,17 +191,12 @@ export class OrdersService implements OnModuleInit {
   }
 
   async sellerList(user: AuthUser, query: OrderListQuery & { page?: number; limit?: number }): Promise<Page<SellerOrderView>> {
-    const { rows, total, window } = await this.pageOf(this.listFilter('seller', user.id, query), query.page, query.limit ?? 10);
+    const { rows, total, window } = await this.pageOf(await this.listFilter('seller', user.id, query), query.page, query.limit ?? 10);
     return toPage(await this.sellerViews(rows), total, window);
   }
 
   async sellerRecent(user: AuthUser, limit = 6): Promise<SellerOrderView[]> {
-    const rows = await this.db
-      .select()
-      .from(orders)
-      .where(and(eq(orders.sellerId, user.id), ne(orders.status, 'awaiting-payment')))
-      .orderBy(desc(orders.createdAt))
-      .limit(Math.min(limit, 20));
+    const rows = await this.db.find(orders, and(eq(orders.sellerId, user.id), ne(orders.status, 'awaiting-payment')), { sort: { createdAt: -1 }, limit: Math.min(limit, 20) });
     return this.sellerViews(await this.withItems(rows));
   }
 
@@ -237,11 +209,11 @@ export class OrdersService implements OnModuleInit {
    * was released to the seller and what went back to buyers, over every sale.
    */
   async sellerEscrowSummary(user: AuthUser): Promise<{ held: number; released: number; refunded: number; orders: number }> {
-    const rows = await this.db
-      .select({ phase: orders.escrowPhase, total: sum(orders.total).mapWith(Number), count: count() })
-      .from(orders)
-      .where(and(eq(orders.sellerId, user.id), isNotNull(orders.escrowPhase)))
-      .groupBy(orders.escrowPhase);
+    const rows = await this.db.aggregate<{ phase: EscrowPhase | null; total: number; count: number }>(orders, [
+      { $match: and(eq(orders.sellerId, user.id), isNotNull(orders.escrowPhase)) },
+      { $group: { _id: '$escrowPhase', total: { $sum: '$total' }, count: { $sum: 1 } } },
+      { $project: { _id: 0, phase: '$_id', total: 1, count: 1 } },
+    ]);
     const total = (state: EscrowState) =>
       Math.round(rows.filter((row) => row.phase && ESCROW_STATE_PHASES[state].includes(row.phase)).reduce((running, row) => running + row.total, 0) * 100) / 100;
     return { held: total('held'), released: total('released'), refunded: total('refunded'), orders: rows.reduce((running, row) => running + row.count, 0) };
@@ -255,19 +227,15 @@ export class OrdersService implements OnModuleInit {
    */
   private async transition(
     id: string,
-    condition: SQL | undefined,
+    condition: Condition,
     set: OrderPatch,
     append: { timeline?: TimelineEntry[]; history?: EscrowHistoryEntry[] },
     verb: string,
   ): Promise<Order> {
-    const patch: OrderPatch = { ...set };
-    if (append.timeline?.length) patch.timeline = appendJson(orders.timeline, append.timeline);
-    if (append.history?.length) patch.escrowHistory = appendJson(orders.escrowHistory, append.history);
-    const [row] = await this.db
-      .update(orders)
-      .set(patch)
-      .where(and(eq(orders.id, id), condition))
-      .returning();
+    const push: Record<string, { $each: unknown[] }> = {};
+    if (append.timeline?.length) push.timeline = { $each: append.timeline };
+    if (append.history?.length) push.escrowHistory = { $each: append.history };
+    const row = await this.db.update(orders, and(eq(orders.id, id), condition), { $set: set, ...(Object.keys(push).length ? { $push: push } : {}) });
     if (row) return (await this.withItems([row]))[0];
     const current = await this.findById(id);
     if (!current) throw Errors.notFound("We couldn't find that order.", 'ORDER_NOT_FOUND');
@@ -296,9 +264,8 @@ export class OrdersService implements OnModuleInit {
     const funded: Order[] = [];
     for (const orderId of orderIds) {
       const now = new Date();
-      const [row] = await this.db
-        .update(orders)
-        .set({
+      const row = await this.db.update(orders, and(eq(orders.id, orderId), eq(orders.status, 'awaiting-payment')), {
+        $set: {
           status: 'pending',
           paymentStatus: 'paid',
           paymentPaidAt: payment.paidAt ?? now,
@@ -314,13 +281,16 @@ export class OrdersService implements OnModuleInit {
           escrowFundedAt: now,
           escrowHistory: [{ action: 'funded', by: payment.provider, at: now.toISOString() }],
           expiresAt: null,
-          timeline: appendJson(orders.timeline, [
-            entry('placed', 'Order placed', 'We received your order.', now),
-            entry('funded', 'Payment secured in escrow', 'Your payment is held safely until the item is delivered.', now),
-          ]),
-        })
-        .where(and(eq(orders.id, orderId), eq(orders.status, 'awaiting-payment')))
-        .returning();
+        },
+        $push: {
+          timeline: {
+            $each: [
+              entry('placed', 'Order placed', 'We received your order.', now),
+              entry('funded', 'Payment secured in escrow', 'Your payment is held safely until the item is delivered.', now),
+            ],
+          },
+        },
+      });
       if (!row) continue; // Already funded (webhook and verify both arrived).
       const [order] = await this.withItems([row]);
       await this.wallet.onFunded(order);
@@ -336,31 +306,26 @@ export class OrdersService implements OnModuleInit {
   /** The charge failed or lapsed: release the stock it was holding and close the orders. */
   async abandon(orderIds: string[], reason: string): Promise<void> {
     for (const orderId of orderIds) {
-      const [row] = await this.db
-        .update(orders)
-        .set({ status: 'cancelled', cancelledAt: new Date(), cancelledBy: 'system', cancellationReason: reason, paymentStatus: 'failed', expiresAt: null })
-        .where(and(eq(orders.id, orderId), eq(orders.status, 'awaiting-payment')))
-        .returning({ id: orders.id });
+      const row = await this.db.update(orders, and(eq(orders.id, orderId), eq(orders.status, 'awaiting-payment')), {
+        status: 'cancelled',
+        cancelledAt: new Date(),
+        cancelledBy: 'system',
+        cancellationReason: reason,
+        paymentStatus: 'failed',
+        expiresAt: null,
+      });
       if (!row) continue;
-      const items = await this.db.select().from(orderItems).where(eq(orderItems.orderId, orderId));
+      const items = await this.db.find(orderItems, eq(orderItems.orderId, orderId));
       for (const item of items) await this.products.releaseStock(item.productId, item.quantity);
     }
   }
 
   /** The provider finished (or failed) a refund for an order. */
   async applyRefundOutcome(orderId: string, refund: { status: 'pending' | 'processed' | 'failed'; processedAt?: Date | null; failureReason?: string | null }): Promise<void> {
-    const [row] = await this.db
-      .update(orders)
-      .set({
-        refundStatus: refund.status,
-        refundProcessedAt: refund.processedAt ?? new Date(),
-        refundFailureReason: refund.failureReason ?? null,
-        ...(refund.status === 'processed'
-          ? { timeline: appendJson(orders.timeline, [entry('refunded', 'Refund completed', 'Your money is back on your original payment method.')]) }
-          : {}),
-      })
-      .where(and(eq(orders.id, orderId), eq(orders.refundStatus, 'pending')))
-      .returning();
+    const row = await this.db.update(orders, and(eq(orders.id, orderId), eq(orders.refundStatus, 'pending')), {
+      $set: { refundStatus: refund.status, refundProcessedAt: refund.processedAt ?? new Date(), refundFailureReason: refund.failureReason ?? null },
+      ...(refund.status === 'processed' ? { $push: { timeline: entry('refunded', 'Refund completed', 'Your money is back on your original payment method.') } } : {}),
+    });
     if (!row) return;
     const [order] = await this.withItems([row]);
     this.announce(order, refund.status === 'processed' ? 'refund-processed' : 'refund-failed', 'system');
@@ -375,17 +340,14 @@ export class OrdersService implements OnModuleInit {
    */
   private async requestRefund(order: Order, reason: string): Promise<void> {
     const refund = await this.payments.refundOrder({ orderId: order.id, amount: order.total, reason });
-    await this.db
-      .update(orders)
-      .set({
-        refundStatus: refund.status,
-        refundAmount: refund.amount,
-        refundReference: refund.refundReference,
-        refundRequestedAt: refund.requestedAt,
-        refundProcessedAt: refund.processedAt,
-        refundFailureReason: refund.failureReason,
-      })
-      .where(eq(orders.id, order.id));
+    await this.db.update(orders, eq(orders.id, order.id), {
+      refundStatus: refund.status,
+      refundAmount: refund.amount,
+      refundReference: refund.refundReference,
+      refundRequestedAt: refund.requestedAt,
+      refundProcessedAt: refund.processedAt,
+      refundFailureReason: refund.failureReason,
+    });
   }
 
   /** Releases held funds to the seller. */
@@ -731,11 +693,7 @@ export class OrdersService implements OnModuleInit {
   /** Inspection windows that have run out release to the seller. */
   async autoRelease(now = new Date()): Promise<number> {
     const due = await this.withItems(
-      await this.db
-        .select()
-        .from(orders)
-        .where(and(eq(orders.escrowPhase, 'inspection'), lte(orders.escrowInspectionEndsAt, now)))
-        .limit(200),
+      await this.db.find(orders, and(eq(orders.escrowPhase, 'inspection'), lte(orders.escrowInspectionEndsAt, now)), { limit: 200 }),
     );
     let released = 0;
     for (const order of due) {
@@ -753,11 +711,7 @@ export class OrdersService implements OnModuleInit {
   async cancelOverdue(now = new Date(), graceHours = 72): Promise<number> {
     const cutoff = new Date(now.getTime() - graceHours * 3_600_000);
     const due = await this.withItems(
-      await this.db
-        .select()
-        .from(orders)
-        .where(and(inArray(orders.status, ['pending', 'confirmed']), eq(orders.escrowPhase, 'funded'), lte(orders.shipBy, cutoff)))
-        .limit(200),
+      await this.db.find(orders, and(inArray(orders.status, ['pending', 'confirmed']), eq(orders.escrowPhase, 'funded'), lte(orders.shipBy, cutoff)), { limit: 200 }),
     );
     let cancelled = 0;
     for (const order of due) {
@@ -790,14 +744,12 @@ export class OrdersService implements OnModuleInit {
 
   /* --- Dashboards -------------------------------------------------------------- */
 
-  private async countOrders(where: SQL | undefined): Promise<number> {
-    const [row] = await this.db.select({ total: count() }).from(orders).where(where);
-    return row.total;
+  private countOrders(where: Condition): Promise<number> {
+    return this.db.count(orders, where);
   }
 
-  private async countProducts(where: SQL | undefined): Promise<number> {
-    const [row] = await this.db.select({ total: count() }).from(products).where(where);
-    return row.total;
+  private countProducts(where: Condition): Promise<number> {
+    return this.db.count(products, where);
   }
 
   /** The seller dashboard's headline tiles, with week-on-week change. */
@@ -839,17 +791,17 @@ export class OrdersService implements OnModuleInit {
 
   /** What has been released to the seller, overall or within a window. */
   private async sumReleased(sellerId: string, from?: Date, to?: Date): Promise<number> {
-    const [row] = await this.db
-      .select({ total: sum(orders.sellerEarning).mapWith(Number) })
-      .from(orders)
-      .where(
-        and(
+    const [row] = await this.db.aggregate<{ total: number }>(orders, [
+      {
+        $match: and(
           eq(orders.sellerId, sellerId),
           eq(orders.escrowPhase, 'released'),
           from ? gte(orders.escrowReleasedAt, from) : undefined,
           to ? lt(orders.escrowReleasedAt, to) : undefined,
         ),
-      );
+      },
+      { $group: { _id: null, total: { $sum: '$sellerEarning' } } },
+    ]);
     return row?.total ?? 0;
   }
 }
