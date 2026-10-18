@@ -348,3 +348,8 @@ export function isUniqueViolation(error: unknown, index?: string): boolean {
   }
   return false;
 }
+
+/** The listed fields of a row, in the shape a column-picking select used to return. */
+export function pick<Row extends object, K extends keyof Row>(row: Row, fields: readonly K[]): Pick<Row, K> {
+  return Object.fromEntries(fields.map((field) => [field, row[field]])) as Pick<Row, K>;
+}

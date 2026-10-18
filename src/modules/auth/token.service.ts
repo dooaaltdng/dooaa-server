@@ -1,6 +1,5 @@
 import { Injectable } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { and, count, eq, gt, isNull } from 'drizzle-orm';
 import { createHash, randomBytes } from 'node:crypto';
 import { Errors } from '../../common/api/app-error';
 import type { AccessTokenPayload } from '../../common/auth/principal';
@@ -73,14 +72,14 @@ export class TokenService {
     const refreshToken = `${type === 'staff' ? 's' : 'u'}.${randomBytes(48).toString('base64url')}`;
     const days = type === 'staff' ? this.config.jwt.staffRefreshTtlDays : this.config.jwt.refreshTtlDays;
     const expiresAt = new Date(Date.now() + days * 86_400_000);
-    await this.db.insert(sessions).values({
+    await this.db.insert(sessions, {
       subjectId,
       subjectType: type,
       tokenHash: hashToken(refreshToken),
       family: family ?? randomBytes(12).toString('hex'),
       expiresAt,
-      ip: meta.ip,
-      userAgent: meta.userAgent,
+      ip: meta.ip ?? null,
+      userAgent: meta.userAgent ?? null,
     });
     return {
       accessToken: await this.signAccess(type, subjectId, version),
@@ -96,16 +95,10 @@ export class TokenService {
    */
   async rotate(type: SubjectType, refreshToken: string, meta: SessionMeta = {}): Promise<{ subjectId: string; family: string }> {
     const tokenHash = hashToken(refreshToken);
-    const [session] = await this.db
-      .select()
-      .from(sessions)
-      .where(and(eq(sessions.tokenHash, tokenHash), eq(sessions.subjectType, type)));
+    const session = await this.db.findOne(sessions, { tokenHash, subjectType: type });
     if (!session) throw Errors.unauthorized('Sign in again to continue.', 'INVALID_REFRESH_TOKEN');
     if (session.revokedAt) {
-      await this.db
-        .update(sessions)
-        .set({ revokedAt: new Date() })
-        .where(and(eq(sessions.family, session.family), isNull(sessions.revokedAt)));
+      await this.db.updateMany(sessions, { family: session.family, revokedAt: null }, { revokedAt: new Date() });
       throw Errors.unauthorized('Sign in again to continue.', 'REFRESH_TOKEN_REUSED');
     }
     if (session.expiresAt.getTime() < Date.now()) {
@@ -113,34 +106,20 @@ export class TokenService {
     }
     // Conditional update: two concurrent refreshes with one token cannot both win.
     const now = new Date();
-    const claimed = await this.db
-      .update(sessions)
-      .set({ revokedAt: now, replacedAt: now, ip: meta.ip ?? session.ip })
-      .where(and(eq(sessions.id, session.id), isNull(sessions.revokedAt)))
-      .returning({ id: sessions.id });
-    if (!claimed.length) throw Errors.unauthorized('Sign in again to continue.', 'REFRESH_TOKEN_REUSED');
+    const claimed = await this.db.update(sessions, { id: session.id, revokedAt: null }, { revokedAt: now, replacedAt: now, ip: meta.ip ?? session.ip });
+    if (!claimed) throw Errors.unauthorized('Sign in again to continue.', 'REFRESH_TOKEN_REUSED');
     return { subjectId: session.subjectId, family: session.family };
   }
 
   async revoke(type: SubjectType, refreshToken: string): Promise<void> {
-    await this.db
-      .update(sessions)
-      .set({ revokedAt: new Date() })
-      .where(and(eq(sessions.tokenHash, hashToken(refreshToken)), eq(sessions.subjectType, type), isNull(sessions.revokedAt)));
+    await this.db.updateMany(sessions, { tokenHash: hashToken(refreshToken), subjectType: type, revokedAt: null }, { revokedAt: new Date() });
   }
 
   async revokeAll(type: SubjectType, subjectId: string): Promise<void> {
-    await this.db
-      .update(sessions)
-      .set({ revokedAt: new Date() })
-      .where(and(eq(sessions.subjectId, subjectId), eq(sessions.subjectType, type), isNull(sessions.revokedAt)));
+    await this.db.updateMany(sessions, { subjectId, subjectType: type, revokedAt: null }, { revokedAt: new Date() });
   }
 
   async activeSessionCount(type: SubjectType, subjectId: string): Promise<number> {
-    const [row] = await this.db
-      .select({ total: count() })
-      .from(sessions)
-      .where(and(eq(sessions.subjectId, subjectId), eq(sessions.subjectType, type), isNull(sessions.revokedAt), gt(sessions.expiresAt, new Date())));
-    return row.total;
+    return this.db.count(sessions, { subjectId, subjectType: type, revokedAt: null, expiresAt: { $gt: new Date() } });
   }
 }

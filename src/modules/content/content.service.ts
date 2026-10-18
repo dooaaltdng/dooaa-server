@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import { and, asc, desc, eq } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff } from '../../common/auth/principal';
 import { dayKey } from '../../common/util/dates';
@@ -64,12 +63,11 @@ export class ContentService {
   }
 
   private async page(slug: string): Promise<ContentPage | null> {
-    const [page] = await this.db.select().from(contentPages).where(eq(contentPages.slug, this.resolve(slug)));
-    return page ?? null;
+    return this.db.findOne(contentPages, { slug: this.resolve(slug) });
   }
 
   async list(): Promise<ContentPageView[]> {
-    const rows = await this.db.select().from(contentPages).orderBy(asc(contentPages.order), asc(contentPages.title));
+    const rows = await this.db.find(contentPages, {}, { sort: { order: 1, title: 1 } });
     return rows.map((row) => this.view(row));
   }
 
@@ -81,7 +79,7 @@ export class ContentService {
 
   async history(slug: string): Promise<ContentVersionView[]> {
     const page = await this.get(slug);
-    const rows = await this.db.select().from(contentVersions).where(eq(contentVersions.slug, page.slug)).orderBy(desc(contentVersions.createdAt)).limit(50);
+    const rows = await this.db.find(contentVersions, { slug: page.slug }, { sort: { createdAt: -1 }, limit: 50 });
     return rows.map((row) => this.versionView(row));
   }
 
@@ -97,15 +95,19 @@ export class ContentService {
     if (!body.replace(/<[^>]*>/g, '').trim()) throw Errors.badRequest('The page cannot be empty.', 'EMPTY_PAGE');
     const author = `${staff.firstName} ${staff.lastName}`;
     const { page, version } = await this.db.transaction(async (tx) => {
-      const [updated] = await tx
-        .update(contentPages)
-        .set({ body, title: input.title?.trim() || current.title, summary: input.summary?.trim() ?? current.summary, updatedBy: author })
-        .where(eq(contentPages.id, current.id))
-        .returning();
-      const [saved] = await tx
-        .insert(contentVersions)
-        .values({ slug: current.slug, title: updated.title, body, author, authorId: staff.id, note: input.note?.trim() || 'Published from the console.' })
-        .returning();
+      const updated = (await tx.update(
+        contentPages,
+        { id: current.id },
+        { body, title: input.title?.trim() || current.title, summary: input.summary?.trim() ?? current.summary, updatedBy: author },
+      ))!;
+      const saved = await tx.insert(contentVersions, {
+        slug: current.slug,
+        title: updated.title,
+        body,
+        author,
+        authorId: staff.id,
+        note: input.note?.trim() || 'Published from the console.',
+      });
       return { page: updated, version: saved };
     });
     await this.audit.record(staff, { action: 'Published site content', target: page.title, targetType: 'content', targetId: current.slug });
@@ -114,21 +116,16 @@ export class ContentService {
 
   /** Republishes an earlier version as the current page. */
   async restore(staff: AuthStaff, slug: string, versionId: string) {
-    const [version] = isUuid(versionId)
-      ? await this.db
-          .select()
-          .from(contentVersions)
-          .where(and(eq(contentVersions.id, versionId), eq(contentVersions.slug, this.resolve(slug))))
-      : [];
+    const version = isUuid(versionId) ? await this.db.findOne(contentVersions, { id: versionId, slug: this.resolve(slug) }) : null;
     if (!version) throw Errors.notFound('That version no longer exists.', 'VERSION_NOT_FOUND');
     return this.publish(staff, slug, { body: version.body, title: version.title, note: `Restored the version from ${dayKey(version.createdAt)}.` });
   }
 
   /** Inserts any default page that does not exist yet. Never overwrites published copy. */
   async ensureDefaults(): Promise<void> {
-    await this.db
-      .insert(contentPages)
-      .values(defaultPages().map((page) => ({ ...page, body: sanitizeContent(page.body), updatedBy: 'DOOAA' })))
-      .onConflictDoNothing({ target: contentPages.slug });
+    await this.db.insertIgnoringDuplicates(
+      contentPages,
+      defaultPages().map((page) => ({ ...page, body: sanitizeContent(page.body), updatedBy: 'DOOAA' })),
+    );
   }
 }

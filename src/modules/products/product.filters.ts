@@ -1,10 +1,10 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, or, sql, type SQL } from 'drizzle-orm';
+import type { Sort } from 'mongodb';
 import { CONDITIONS, PRICE_BANDS, type Condition, type PriceBand, type SortKey } from '../../common/domain';
-import { products } from '../../database/schema';
-import { containsText, descNullsLast } from '../../database/sql';
+import { containsText, type Where } from '../../database/database';
+import type { ProductRow } from '../../database/schema';
 
 /** What a buyer can see: live, not deleted. */
-export const PUBLIC_PRODUCT_FILTER: SQL = and(eq(products.status, 'active'), isNull(products.deletedAt))!;
+export const PUBLIC_PRODUCT_FILTER = { status: 'active', deletedAt: null } as const satisfies Where<ProductRow>;
 
 export type CatalogQuery = {
   q?: string;
@@ -45,37 +45,37 @@ export function searchTerm(query: Pick<CatalogQuery, 'q'>): string | undefined {
   return query.q?.trim().slice(0, 80) || undefined;
 }
 
-function tsQuery(term: string): SQL {
-  return sql`websearch_to_tsquery('english', ${term})`;
-}
-
 /**
- * Builds the catalog's WHERE clause. Full-text mode matches whole words
- * through the weighted `search` document; partial mode catches word
- * fragments ("iph") when full-text finds nothing.
+ * Builds the catalog's filter. Full-text mode matches whole words through
+ * the weighted text index; partial mode catches word fragments ("iph") when
+ * full-text finds nothing.
  */
-export function buildCatalogFilter(query: CatalogQuery, mode: SearchMode = 'text'): SQL {
-  const conditions: SQL[] = [PUBLIC_PRODUCT_FILTER];
+export function buildCatalogFilter(query: CatalogQuery, mode: SearchMode = 'text'): Where<ProductRow> {
+  const filter: Where<ProductRow> = { ...PUBLIC_PRODUCT_FILTER };
+  const and: Where<ProductRow>[] = [];
 
   const term = searchTerm(query);
-  if (term && mode === 'text') conditions.push(sql`${products.search} @@ ${tsQuery(term)}`);
+  if (term && mode === 'text') filter.$text = { $search: term };
   if (term && mode === 'partial') {
-    conditions.push(or(containsText(products.title, term), containsText(products.brand, term), containsText(products.summary, term), containsText(products.location, term))!);
+    const match = containsText(term);
+    and.push({ $or: [{ title: match }, { brand: match }, { summary: match }, { location: match }] });
   }
 
-  if (query.category?.length) conditions.push(inArray(products.categoryId, query.category));
-  if (query.collection === 'featured') conditions.push(eq(products.featured, true));
-  if (query.collection === 'top-sellers') conditions.push(gt(products.statsUnitsSold, 0));
+  if (query.category?.length) filter.categoryId = { $in: query.category };
+  if (query.collection === 'featured') filter.featured = true;
+  if (query.collection === 'top-sellers') filter.statsUnitsSold = { $gt: 0 };
 
   if (query.condition?.length) {
     const conditionValues = query.condition.map(normalizeCondition).filter((value): value is Condition => Boolean(value));
-    conditions.push(conditionValues.length ? inArray(products.condition, conditionValues) : sql`false`);
+    filter.condition = { $in: conditionValues };
   }
 
-  if (query.brand?.length) conditions.push(inArray(sql`lower(${products.brand})`, query.brand.map((brand) => brand.trim().toLowerCase())));
+  if (query.brand?.length) {
+    and.push({ $or: query.brand.map((brand) => ({ brand: { $regex: `^${escapeForRegex(brand.trim())}$`, $options: 'i' } })) });
+  }
 
   const verified = sellerVerificationFilter(query.seller);
-  if (verified !== null) conditions.push(eq(products.sellerVerified, verified));
+  if (verified !== null) filter.sellerVerified = verified;
 
   let min = query.min;
   let max = query.max;
@@ -87,30 +87,37 @@ export function buildCatalogFilter(query: CatalogQuery, mode: SearchMode = 'text
       if (Number.isFinite(band.max)) below = band.max;
     }
   }
-  if (min !== undefined) conditions.push(gte(products.price, min));
-  if (max !== undefined) conditions.push(lte(products.price, max));
-  if (below !== undefined) conditions.push(lt(products.price, below));
-  if (query.inStock) conditions.push(gt(products.stock, 0));
+  const price: Record<string, number> = {};
+  if (min !== undefined) price.$gte = min;
+  if (max !== undefined) price.$lte = max;
+  if (below !== undefined) price.$lt = below;
+  if (Object.keys(price).length) filter.price = price;
+  if (query.inStock) filter.stock = { $gt: 0 };
 
-  return and(...conditions)!;
+  if (and.length) filter.$and = and;
+  return filter;
 }
 
-export function catalogSort(query: CatalogQuery, mode: SearchMode): SQL[] {
+function escapeForRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function catalogSort(query: CatalogQuery, mode: SearchMode): Sort {
   switch (query.sort) {
     case 'price-asc':
-      return [asc(products.price), asc(products.id)];
+      return { price: 1, _id: 1 };
     case 'price-desc':
-      return [desc(products.price), asc(products.id)];
+      return { price: -1, _id: 1 };
     case 'newest':
-      return [descNullsLast(products.publishedAt), desc(products.createdAt), desc(products.id)];
+      return { publishedAt: -1, createdAt: -1, _id: -1 };
     case 'oldest':
-      return [asc(products.publishedAt), asc(products.createdAt), asc(products.id)];
+      return { publishedAt: 1, createdAt: 1, _id: 1 };
     default:
       break;
   }
-  if (query.collection === 'top-sellers') return [desc(products.statsUnitsSold), desc(products.statsRatingAverage), desc(products.id)];
-  if (query.collection === 'popular') return [desc(products.statsViews), desc(products.statsWishlists), desc(products.id)];
+  if (query.collection === 'top-sellers') return { statsUnitsSold: -1, statsRatingAverage: -1, _id: -1 };
+  if (query.collection === 'popular') return { statsViews: -1, statsWishlists: -1, _id: -1 };
   const term = searchTerm(query);
-  if (mode === 'text' && term) return [sql`ts_rank(${products.search}, ${tsQuery(term)}) desc`, desc(products.id)];
-  return [desc(products.featured), descNullsLast(products.publishedAt), desc(products.createdAt), desc(products.id)];
+  if (mode === 'text' && term) return { score: { $meta: 'textScore' }, _id: -1 };
+  return { featured: -1, publishedAt: -1, createdAt: -1, _id: -1 };
 }

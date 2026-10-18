@@ -1,6 +1,5 @@
 import { Injectable } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { sql } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthUser } from '../../common/auth/principal';
 import { type OtpChannel, type UserRole } from '../../common/domain';
@@ -107,7 +106,7 @@ export class AuthService {
 
   /** Ends every session on every device, including access tokens already handed out. */
   async signOutEverywhere(user: AuthUser): Promise<void> {
-    await this.users.update(user.id, { tokenVersion: sql`${users.tokenVersion} + 1` });
+    await this.users.update(user.id, { $inc: { tokenVersion: 1 } });
     await this.tokens.revokeAll('user', user.id);
   }
 

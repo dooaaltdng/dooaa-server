@@ -1,6 +1,5 @@
 import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import { SchedulerRegistry } from '@nestjs/schedule';
-import { lt } from 'drizzle-orm';
 import { DAY } from '../../common/util/dates';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
@@ -22,8 +21,7 @@ const RETENTION = {
 /**
  * Background work. Every step is a conditional, idempotent transition, so
  * running on several instances at once (or twice in a row) is safe. The
- * housekeeping job stands in for the expiry indexes a document store would
- * have: PostgreSQL keeps rows until they are deleted.
+ * housekeeping job deletes what has expired.
  */
 @Injectable()
 export class JobsService implements OnApplicationBootstrap, OnModuleDestroy {
@@ -71,14 +69,13 @@ export class JobsService implements OnApplicationBootstrap, OnModuleDestroy {
   /** Deletes what has expired: sessions, codes and grants past their expiry, and old activity rows. */
   async housekeepingJob(now = new Date()): Promise<Record<string, number>> {
     const before = (ms: number) => new Date(now.getTime() - ms);
-    const removed = async (query: Promise<unknown[]>) => (await query).length;
     return {
-      sessions: await removed(this.db.delete(sessions).where(lt(sessions.expiresAt, now)).returning({ id: sessions.id })),
-      otps: await removed(this.db.delete(otps).where(lt(otps.expiresAt, now)).returning({ id: otps.id })),
-      oauthGrants: await removed(this.db.delete(oauthGrants).where(lt(oauthGrants.expiresAt, now)).returning({ id: oauthGrants.id })),
-      notifications: await removed(this.db.delete(notifications).where(lt(notifications.createdAt, before(RETENTION.notifications))).returning({ id: notifications.id })),
-      visitorDays: await removed(this.db.delete(visitorDays).where(lt(visitorDays.at, before(RETENTION.visitorDays))).returning({ day: visitorDays.day })),
-      providerEvents: await removed(this.db.delete(providerEvents).where(lt(providerEvents.receivedAt, before(RETENTION.providerEvents))).returning({ id: providerEvents.id })),
+      sessions: await this.db.deleteMany(sessions, { expiresAt: { $lt: now } }),
+      otps: await this.db.deleteMany(otps, { expiresAt: { $lt: now } }),
+      oauthGrants: await this.db.deleteMany(oauthGrants, { expiresAt: { $lt: now } }),
+      notifications: await this.db.deleteMany(notifications, { createdAt: { $lt: before(RETENTION.notifications) } }),
+      visitorDays: await this.db.deleteMany(visitorDays, { at: { $lt: before(RETENTION.visitorDays) } }),
+      providerEvents: await this.db.deleteMany(providerEvents, { receivedAt: { $lt: before(RETENTION.providerEvents) } }),
     };
   }
 

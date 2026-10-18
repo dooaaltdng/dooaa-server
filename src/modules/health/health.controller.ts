@@ -1,7 +1,6 @@
 import { Controller, Get } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { SkipThrottle } from '@nestjs/throttler';
-import { sql } from 'drizzle-orm';
 import { CacheService } from '../../cache/cache.service';
 import { Public } from '../../common/auth/decorators';
 import { InjectDb, type Database } from '../../database/database';
@@ -23,7 +22,7 @@ export class HealthController {
   ) {}
 
   /**
-   * Liveness and dependencies. PostgreSQL is required: without it the
+   * Liveness and dependencies. MongoDB is required: without it the
    * status is "degraded". Redis is a cache, so its outage is reported but
    * the API keeps serving from the database.
    */
@@ -32,7 +31,7 @@ export class HealthController {
   async health() {
     const [dbUp, cacheUp] = await Promise.all([
       within(
-        this.db.execute(sql`select 1`).then(() => true),
+        this.db.db.command({ ping: 1 }).then(() => true),
         3_000,
         false,
       ),

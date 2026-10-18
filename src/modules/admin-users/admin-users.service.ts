@@ -6,9 +6,8 @@ import type { AccountStatus, IdentityStatus, ModeratedStatus, OrderStatus, Verif
 import { dayKey } from '../../common/util/dates';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
 import { excerpt, normalizeEmail } from '../../common/util/text';
-import { InjectDb, type Database } from '../../database/database';
+import { containsText, InjectDb, isUniqueViolation, type Database } from '../../database/database';
 import { disputes, messages, orderItems, orders, products, users } from '../../database/schema';
-import { containsText, escapeLike, isUniqueViolation } from '../../database/sql';
 import { AuditService } from '../audit/audit.service';
 import { MailService } from '../mail/mail.service';
 import type { Order } from '../orders/order.model';

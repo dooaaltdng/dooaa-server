@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import { asc, count, eq } from 'drizzle-orm';
 import { CacheService } from '../../cache/cache.service';
 import { Errors } from '../../common/api/app-error';
 import { InjectDb, type Database } from '../../database/database';
@@ -34,13 +33,17 @@ export class CategoriesService {
   ) {}
 
   private all(): Promise<Category[]> {
-    return this.cache.wrap(ALL_KEY, ALL_TTL_MS, () => this.db.select().from(categories).orderBy(asc(categories.order), asc(categories.name)));
+    return this.cache.wrap(ALL_KEY, ALL_TTL_MS, () => this.db.find(categories, {}, { sort: { order: 1, name: 1 } }));
   }
 
   /** Live listings per category slug. */
   private async productCounts(): Promise<Map<string, number>> {
     const rows = await this.cache.wrap(COUNTS_KEY, COUNTS_TTL_MS, () =>
-      this.db.select({ slug: products.categoryId, count: count() }).from(products).where(PUBLIC_PRODUCT_FILTER).groupBy(products.categoryId),
+      this.db.aggregate<{ slug: string; count: number }>(products, [
+        { $match: PUBLIC_PRODUCT_FILTER },
+        { $group: { _id: '$categoryId', count: { $sum: 1 } } },
+        { $project: { _id: 0, slug: '$_id', count: 1 } },
+      ]),
     );
     return new Map(rows.map((row) => [row.slug, row.count]));
   }
@@ -97,7 +100,7 @@ export class CategoriesService {
   }
 
   async update(slug: string, patch: Partial<Pick<Category, 'name' | 'description' | 'image' | 'active' | 'order'>>): Promise<CategoryView> {
-    const [updated] = await this.db.update(categories).set(patch).where(eq(categories.slug, slug)).returning();
+    const updated = await this.db.update(categories, { slug }, patch);
     if (!updated) throw Errors.notFound('That category does not exist.', 'CATEGORY_NOT_FOUND');
     await this.invalidate();
     return this.view(updated, await this.productCounts());
@@ -105,12 +108,11 @@ export class CategoriesService {
 
   /** Seeds the default taxonomy into an empty table. Safe to run on every boot; the console's edits are kept. */
   async ensureDefaults(): Promise<void> {
-    const [{ total }] = await this.db.select({ total: count() }).from(categories);
-    if (total > 0) return;
-    await this.db
-      .insert(categories)
-      .values(DEFAULT_CATEGORIES.map((category, index) => ({ ...category, order: index + 1, active: true })))
-      .onConflictDoNothing({ target: categories.slug });
+    if ((await this.db.count(categories)) > 0) return;
+    await this.db.insertIgnoringDuplicates(
+      categories,
+      DEFAULT_CATEGORIES.map((category, index) => ({ ...category, order: index + 1, active: true })),
+    );
     await this.invalidate();
   }
 

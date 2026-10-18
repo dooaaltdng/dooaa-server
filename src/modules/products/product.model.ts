@@ -1,4 +1,3 @@
-import { getTableColumns } from 'drizzle-orm';
 import type { Condition, DeliveryType, ListedAs, ListingPaymentMethod, ListingStatus, PricingType } from '../../common/domain';
 import { products, type ProductVideo } from '../../database/schema';
 
@@ -61,12 +60,7 @@ export type Product = {
   updatedAt: Date;
 };
 
-const { search: _search, ...columns } = getTableColumns(products);
-
-/** Every product column except the full-text document — what reads select. */
-export const productColumns = columns;
-
-export type ProductRow = Omit<typeof products.$inferSelect, 'search'>;
+export type ProductRow = typeof products.$inferSelect;
 
 export function toProduct(row: ProductRow): Product {
   return {

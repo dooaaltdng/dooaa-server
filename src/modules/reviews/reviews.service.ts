@@ -5,9 +5,8 @@ import type { AuthStaff, AuthUser } from '../../common/auth/principal';
 import { REVIEW_ASPECTS, REVIEW_ASPECT_LABEL, type ReviewAspect } from '../../common/domain';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
 import { isUuid } from '../../common/util/uuid';
-import { InjectDb, type Database } from '../../database/database';
+import { InjectDb, isUniqueViolation, type Database } from '../../database/database';
 import { orderItems, orders, products, reviews, users } from '../../database/schema';
-import { isUniqueViolation } from '../../database/sql';
 import { AuditService } from '../audit/audit.service';
 import { NotificationsService } from '../notifications/notifications.service';
 

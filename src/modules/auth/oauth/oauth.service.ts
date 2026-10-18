@@ -1,6 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { and, eq, gt, sql } from 'drizzle-orm';
 import { randomBytes } from 'node:crypto';
 import { AppError, Errors } from '../../../common/api/app-error';
 import { OAUTH_PROVIDERS, type OAuthProviderId } from '../../../common/domain';
@@ -10,7 +9,7 @@ import { InjectDb, type Database } from '../../../database/database';
 import { oauthGrants, userOauthIdentities, users } from '../../../database/schema';
 import { MailService } from '../../mail/mail.service';
 import { PasswordService } from '../../users/password.service';
-import { toUser, userColumns, type User } from '../../users/user.model';
+import { toUser, userOmit, type User } from '../../users/user.model';
 import { toPublicUser } from '../../users/user.presenter';
 import { UsersService } from '../../users/users.service';
 import { AuthService, type AuthResult } from '../auth.service';
@@ -119,7 +118,7 @@ export class OAuthService {
 
     const { user, isNewUser } = await this.resolveUser(provider.id, profile);
     const code = randomBytes(32).toString('base64url');
-    await this.db.insert(oauthGrants).values({
+    await this.db.insert(oauthGrants, {
       codeHash: hashToken(code),
       userId: user.id,
       isNewUser,
@@ -132,10 +131,7 @@ export class OAuthService {
   /** Trades the one-time code for a session. A code works once, for two minutes. */
   async exchange(code: string, meta: SessionMeta): Promise<OAuthExchangeResult> {
     // Deleting the grant is the claim: a code works once even when two requests race.
-    const [grant] = await this.db
-      .delete(oauthGrants)
-      .where(and(eq(oauthGrants.codeHash, hashToken(code)), gt(oauthGrants.expiresAt, new Date())))
-      .returning();
+    const grant = await this.db.delete(oauthGrants, { codeHash: hashToken(code), expiresAt: { $gt: new Date() } });
     if (!grant) throw Errors.badRequest('That sign-in has expired. Try again.', 'OAUTH_CODE_INVALID');
     const user = await this.users.findById(grant.userId);
     if (!user) throw Errors.badRequest('That sign-in has expired. Try again.', 'OAUTH_CODE_INVALID');
@@ -151,11 +147,8 @@ export class OAuthService {
    * provider has verified.
    */
   async resolveUser(provider: OAuthProviderId, profile: OAuthProfile): Promise<{ user: User; isNewUser: boolean }> {
-    const [linkedRow] = await this.db
-      .select(userColumns)
-      .from(userOauthIdentities)
-      .innerJoin(users, eq(users.id, userOauthIdentities.userId))
-      .where(and(eq(userOauthIdentities.provider, provider), eq(userOauthIdentities.subject, profile.subject)));
+    const identity = await this.db.findOne(userOauthIdentities, { provider, subject: profile.subject });
+    const linkedRow = identity ? await this.db.findOne(users, { id: identity.userId }, { omit: userOmit }) : null;
     const linked = linkedRow ? toUser(linkedRow) : null;
     if (linked) {
       this.auth.assertCanSignIn(linked);
@@ -177,9 +170,8 @@ export class OAuthService {
         : // Nobody ever proved they own this address; the provider just did. Whoever
           // registered it (possibly someone squatting it) loses the password and sessions.
           await this.users.update(existing.id, {
-            emailVerified: true,
-            passwordHash: await this.randomPasswordHash(),
-            tokenVersion: sql`${users.tokenVersion} + 1`,
+            $set: { emailVerified: true, passwordHash: await this.randomPasswordHash() },
+            $inc: { tokenVersion: 1 },
           });
       if (!existing.emailVerified) await this.tokens.revokeAll('user', existing.id);
       void this.mail.send(user.email, {
@@ -217,10 +209,7 @@ export class OAuthService {
 
   /** Records that this provider account signs in to the user. A repeat of the same link is a no-op. */
   private async link(userId: string, provider: OAuthProviderId, profile: OAuthProfile): Promise<void> {
-    await this.db
-      .insert(userOauthIdentities)
-      .values({ userId, provider, subject: profile.subject, email: profile.email ?? null })
-      .onConflictDoNothing({ target: [userOauthIdentities.provider, userOauthIdentities.subject] });
+    await this.db.insertIgnoringDuplicates(userOauthIdentities, [{ userId, provider, subject: profile.subject, email: profile.email ?? null }]);
   }
 
   private label(provider: OAuthProviderId): string {

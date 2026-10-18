@@ -1,4 +1,3 @@
-import { getTableColumns } from 'drizzle-orm';
 import type { AccountStatus, Gender, IdentityStatus, NotificationPrefs, UserRole, VerificationLevel } from '../../common/domain';
 import { users } from '../../database/schema';
 
@@ -58,10 +57,8 @@ export type User = {
   updatedAt: Date;
 };
 
-const { passwordHash: _passwordHash, ...columns } = getTableColumns(users);
-
-/** Every user column except the password hash — what reads select. */
-export const userColumns = columns;
+/** Fields reads leave out: the password hash. */
+export const userOmit: ['passwordHash'] = ['passwordHash'];
 
 export type UserRow = Omit<typeof users.$inferSelect, 'passwordHash'>;
 

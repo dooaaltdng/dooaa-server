@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import { sql } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthUser } from '../../common/auth/principal';
 import { EventBus } from '../../common/events/event-bus';
@@ -72,7 +71,7 @@ export class MeService {
     const changes: Record<string, boolean> = {};
     for (const [key, value] of Object.entries(input)) if (typeof value === 'boolean') changes[key] = value;
     const updated = Object.keys(changes).length
-      ? await this.users.update(user.id, { notificationPrefs: sql`${users.notificationPrefs} || ${JSON.stringify(changes)}::jsonb` })
+      ? await this.users.update(user.id, { $set: Object.fromEntries(Object.entries(changes).map(([key, value]) => [`notificationPrefs.${key}`, value])) })
       : await this.users.getById(user.id);
     return toPublicUser(updated).notificationPrefs;
   }

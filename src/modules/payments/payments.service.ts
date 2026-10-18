@@ -7,9 +7,8 @@ import { paymentReference, refundReference } from '../../common/util/ids';
 import { formatNaira, sumMoney, toKobo } from '../../common/util/money';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
-import { InjectDb, type Database } from '../../database/database';
+import { InjectDb, isUniqueViolation, type Database } from '../../database/database';
 import { paymentOrders, paymentRefunds, payments, providerEvents } from '../../database/schema';
-import { isUniqueViolation } from '../../database/sql';
 import {
   PAYMENT_PROVIDER,
   type ChargeStatus,

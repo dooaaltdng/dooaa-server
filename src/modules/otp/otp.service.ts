@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import { and, desc, eq, gt, isNull, sql } from 'drizzle-orm';
 import { createHash, randomInt, timingSafeEqual } from 'node:crypto';
 import { Errors } from '../../common/api/app-error';
 import type { OtpChannel, OtpPurpose } from '../../common/domain';
@@ -58,12 +57,7 @@ export class OtpService {
     const now = Date.now();
     const cooldownMs = this.config.otp.resendCooldownSeconds * 1000;
 
-    const [latest] = await this.db
-      .select({ createdAt: otps.createdAt })
-      .from(otps)
-      .where(and(eq(otps.key, input.key), eq(otps.purpose, input.purpose), eq(otps.context, context)))
-      .orderBy(desc(otps.createdAt))
-      .limit(1);
+    const latest = await this.db.findOne(otps, { key: input.key, purpose: input.purpose, context }, { sort: { createdAt: -1 } });
     if (latest && now - latest.createdAt.getTime() < cooldownMs) {
       const retryAfter = Math.ceil((cooldownMs - (now - latest.createdAt.getTime())) / 1000);
       throw Errors.tooMany(`Please wait ${retryAfter}s before requesting another code.`, 'OTP_COOLDOWN', {
@@ -75,8 +69,8 @@ export class OtpService {
     const expiresAt = new Date(now + this.config.otp.ttlSeconds * 1000);
     // A new code replaces any earlier one for the same purpose.
     await this.db.transaction(async (tx) => {
-      await tx.delete(otps).where(and(eq(otps.key, input.key), eq(otps.purpose, input.purpose), eq(otps.context, context), isNull(otps.consumedAt)));
-      await tx.insert(otps).values({
+      await tx.deleteMany(otps, { key: input.key, purpose: input.purpose, context, consumedAt: null });
+      await tx.insert(otps, {
         key: input.key,
         purpose: input.purpose,
         context,
@@ -113,12 +107,11 @@ export class OtpService {
    */
   async verify(input: { key: string; purpose: OtpPurpose; code: string; context?: string; consume?: boolean }): Promise<OtpRecord> {
     const context = input.context ?? '';
-    const [record] = await this.db
-      .select()
-      .from(otps)
-      .where(and(eq(otps.key, input.key), eq(otps.purpose, input.purpose), eq(otps.context, context), isNull(otps.consumedAt), gt(otps.expiresAt, new Date())))
-      .orderBy(desc(otps.createdAt))
-      .limit(1);
+    const record = await this.db.findOne(
+      otps,
+      { key: input.key, purpose: input.purpose, context, consumedAt: null, expiresAt: { $gt: new Date() } },
+      { sort: { createdAt: -1 } },
+    );
     if (!record) {
       throw Errors.badRequest('That code has expired. Request a new one.', 'OTP_EXPIRED');
     }
@@ -133,11 +126,7 @@ export class OtpService {
     const matches = devMatch || (expected.length === actual.length && timingSafeEqual(expected, actual));
 
     if (!matches) {
-      const [updated] = await this.db
-        .update(otps)
-        .set({ attempts: sql`${otps.attempts} + 1` })
-        .where(eq(otps.id, record.id))
-        .returning({ attempts: otps.attempts });
+      const updated = await this.db.update(otps, { id: record.id }, { $inc: { attempts: 1 } });
       const left = Math.max(0, this.config.otp.maxAttempts - (updated?.attempts ?? record.attempts + 1));
       throw Errors.badRequest('Incorrect code. Check your messages and enter the code again.', 'OTP_INVALID', {
         attemptsLeft: left,
@@ -145,12 +134,8 @@ export class OtpService {
     }
 
     if (input.consume !== false) {
-      const consumed = await this.db
-        .update(otps)
-        .set({ consumedAt: new Date() })
-        .where(and(eq(otps.id, record.id), isNull(otps.consumedAt)))
-        .returning({ id: otps.id });
-      if (!consumed.length) throw Errors.badRequest('That code has already been used.', 'OTP_USED');
+      const consumed = await this.db.update(otps, { id: record.id, consumedAt: null }, { consumedAt: new Date() });
+      if (!consumed) throw Errors.badRequest('That code has already been used.', 'OTP_USED');
     }
     return record;
   }

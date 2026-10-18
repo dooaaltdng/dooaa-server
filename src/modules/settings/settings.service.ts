@@ -1,7 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
-import { eq, sql } from 'drizzle-orm';
 import { CacheService } from '../../cache/cache.service';
 import { Errors } from '../../common/api/app-error';
 import { flattenValidationErrors } from '../../common/api/validation';
@@ -73,7 +72,7 @@ export class SettingsService {
 
   get(): Promise<PlatformSettings> {
     return this.cache.wrap(CACHE_KEY, CACHE_TTL_MS, async () => {
-      const [record] = await this.db.select({ values: settingsTable.values }).from(settingsTable).where(eq(settingsTable.id, RECORD_ID));
+      const record = await this.db.findOne(settingsTable, { id: RECORD_ID });
       return mergeSettings(record?.values as Partial<Record<SettingsSection, unknown>> | undefined);
     });
   }
@@ -111,14 +110,7 @@ export class SettingsService {
     }
 
     const before = await this.section(key);
-    const section = JSON.stringify({ [key]: next });
-    await this.db
-      .insert(settingsTable)
-      .values({ id: RECORD_ID, values: { [key]: next }, updatedBy: actor.id })
-      .onConflictDoUpdate({
-        target: settingsTable.id,
-        set: { values: sql`${settingsTable.values} || ${section}::jsonb`, updatedBy: actor.id },
-      });
+    await this.db.upsert(settingsTable, { id: RECORD_ID }, { $set: { [`values.${key}`]: next, updatedBy: actor.id } });
     await this.cache.delete(CACHE_KEY);
 
     await this.audit.record(actor, {
@@ -134,7 +126,7 @@ export class SettingsService {
 
   /** Restores every section to its default. Used by seeding and tests. */
   async reset(): Promise<void> {
-    await this.db.delete(settingsTable).where(eq(settingsTable.id, RECORD_ID));
+    await this.db.delete(settingsTable, { id: RECORD_ID });
     await this.cache.delete(CACHE_KEY);
   }
 

@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import { count, desc, eq } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
 import type { SupportStatus } from '../../common/domain';
@@ -70,9 +69,7 @@ export class SupportService {
       await this.media.assertOwnedUrls(attachments, { id: user.id, type: 'user' }, ['support', 'evidence', 'message']);
     }
     const reference = `#SUP-${await this.sequences.next(supportNumberSeq)}`;
-    const [created] = await this.db
-      .insert(supportTickets)
-      .values({
+    const created = await this.db.insert(supportTickets, {
         reference,
         userId: user?.id ?? null,
         name,
@@ -81,8 +78,7 @@ export class SupportService {
         topic: input.topic,
         detail: input.detail,
         attachments,
-      })
-      .returning();
+      });
     void this.mail.send(
       this.config.mail.supportInbox,
       {
@@ -101,16 +97,10 @@ export class SupportService {
   }
 
   async list(query: { status?: SupportStatus; page?: number; limit?: number }): Promise<Page<TicketView>> {
-    const where = query.status ? eq(supportTickets.status, query.status) : undefined;
-    const [{ total }] = await this.db.select({ total: count() }).from(supportTickets).where(where);
+    const where = query.status ? { status: query.status } : {};
+    const total = await this.db.count(supportTickets, where);
     const window = pageWindow(total, query.page, query.limit ?? 20);
-    const rows = await this.db
-      .select()
-      .from(supportTickets)
-      .where(where)
-      .orderBy(desc(supportTickets.createdAt), desc(supportTickets.id))
-      .offset(window.skip)
-      .limit(window.size);
+    const rows = await this.db.find(supportTickets, where, { sort: { createdAt: -1, id: -1 }, skip: window.skip, limit: window.size });
     return toPage(
       rows.map((row) => this.view(row)),
       total,
@@ -120,11 +110,11 @@ export class SupportService {
 
   async setStatus(staff: AuthStaff, id: string, status: SupportStatus): Promise<TicketView> {
     if (!isUuid(id)) throw Errors.notFound('That ticket does not exist.', 'TICKET_NOT_FOUND');
-    const [updated] = await this.db
-      .update(supportTickets)
-      .set(status === 'resolved' ? { status, resolvedAt: new Date(), resolvedBy: staff.id } : { status, resolvedAt: null, resolvedBy: null })
-      .where(eq(supportTickets.id, id))
-      .returning();
+    const updated = await this.db.update(
+      supportTickets,
+      { id },
+      status === 'resolved' ? { status, resolvedAt: new Date(), resolvedBy: staff.id } : { status, resolvedAt: null, resolvedBy: null },
+    );
     if (!updated) throw Errors.notFound('That ticket does not exist.', 'TICKET_NOT_FOUND');
     await this.audit.record(staff, { action: status === 'resolved' ? 'Resolved a support ticket' : 'Reopened a support ticket', target: updated.reference, targetType: 'support', targetId: id });
     return this.view(updated);

@@ -1,10 +1,8 @@
 import { Injectable } from '@nestjs/common';
-import { and, count, desc, eq, or, type SQL } from 'drizzle-orm';
 import type { AuthStaff } from '../../common/auth/principal';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
-import { InjectDb, type Database } from '../../database/database';
+import { InjectDb, containsText, type Database, type Where } from '../../database/database';
 import { auditLog } from '../../database/schema';
-import { containsText } from '../../database/sql';
 
 export type AuditActor = AuthStaff | { kind: 'system'; name?: string };
 
@@ -26,41 +24,31 @@ export class AuditService {
   constructor(@InjectDb() private readonly db: Database) {}
 
   async record(actor: AuditActor, input: AuditRecordInput): Promise<AuditView> {
-    const [created] = await this.db
-      .insert(auditLog)
-      .values({
+    const created = await this.db.insert(auditLog, {
         actorId: actor.kind === 'staff' ? actor.id : null,
         actorName: actor.kind === 'staff' ? `${actor.firstName} ${actor.lastName}` : (actor.name ?? 'DOOAA System'),
         actorRole: actor.kind === 'staff' ? actor.role : 'system',
         action: input.action,
         target: input.target,
-        targetType: input.targetType,
-        targetId: input.targetId,
+        targetType: input.targetType ?? null,
+        targetId: input.targetId ?? null,
         elevated: input.elevated ?? false,
-        meta: input.meta,
-      })
-      .returning();
+        meta: input.meta ?? null,
+      });
     return this.toView(created);
   }
 
   async list(query: { page?: number; limit?: number; search?: string; actorId?: string; targetType?: string; targetId?: string }): Promise<Page<AuditView>> {
-    const conditions: SQL[] = [];
-    if (query.actorId) conditions.push(eq(auditLog.actorId, query.actorId));
-    if (query.targetType) conditions.push(eq(auditLog.targetType, query.targetType));
-    if (query.targetId) conditions.push(eq(auditLog.targetId, query.targetId));
+    const where: Where<AuditRow> = {};
+    if (query.actorId) where.actorId = query.actorId;
+    if (query.targetType) where.targetType = query.targetType;
+    if (query.targetId) where.targetId = query.targetId;
     if (query.search?.trim()) {
-      conditions.push(or(containsText(auditLog.action, query.search), containsText(auditLog.target, query.search), containsText(auditLog.actorName, query.search))!);
+      where.$or = [{ action: containsText(query.search) }, { target: containsText(query.search) }, { actorName: containsText(query.search) }];
     }
-    const where = and(...conditions);
-    const [{ total }] = await this.db.select({ total: count() }).from(auditLog).where(where);
+    const total = await this.db.count(auditLog, where);
     const window = pageWindow(total, query.page, query.limit ?? 20);
-    const rows = await this.db
-      .select()
-      .from(auditLog)
-      .where(where)
-      .orderBy(desc(auditLog.createdAt), desc(auditLog.id))
-      .offset(window.skip)
-      .limit(window.size);
+    const rows = await this.db.find(auditLog, where, { sort: { createdAt: -1, id: -1 }, skip: window.skip, limit: window.size });
     return toPage(
       rows.map((row) => this.toView(row)),
       total,

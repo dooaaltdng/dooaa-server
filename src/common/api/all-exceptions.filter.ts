@@ -1,6 +1,5 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import type { Response } from 'express';
-import { PG_ERRORS, pgError } from '../../database/sql';
 import { AppError } from './app-error';
 import type { ApiFailure } from './envelope';
 
@@ -30,9 +29,15 @@ const FRIENDLY: Record<number, string> = {
 type Failure = { status: number; body: ApiFailure };
 
 /** "users_email_key" on "users" → "email": unique constraints are named `<table>_<columns>_key`. */
-function fieldOf(constraint: string | undefined, table: string | undefined): string | undefined {
-  if (!constraint || !table || !constraint.startsWith(`${table}_`) || !constraint.endsWith('_key')) return undefined;
-  return constraint.slice(table.length + 1, -'_key'.length).replace(/_/g, ' ') || undefined;
+/** The duplicate-key index behind a MongoDB error ("users_email_key" → table "users", field "email"). */
+function duplicateKey(exception: unknown): { field?: string } | null {
+  const error = exception as { code?: unknown; errmsg?: unknown; message?: unknown; collection?: unknown } | null;
+  if (!error || (error.code !== 11000 && error.code !== 11001)) return null;
+  const message = String(error.errmsg ?? error.message ?? '');
+  const collection = /collection: [^.]+\.(\S+)/.exec(message)?.[1];
+  const index = /index: (\S+)/.exec(message)?.[1];
+  if (!collection || !index || !index.startsWith(`${collection}_`) || !index.endsWith('_key')) return {};
+  return { field: index.slice(collection.length + 1, -'_key'.length).replace(/_/g, ' ') || undefined };
 }
 
 function messageOf(response: unknown, fallback: string): string {
@@ -68,9 +73,9 @@ export function toFailure(exception: unknown): Failure {
     return { status, body: { ok: false, error: message, code: STATUS_CODE[status] ?? 'ERROR' } };
   }
 
-  const database = pgError(exception);
-  if (database?.code === PG_ERRORS.uniqueViolation) {
-    const field = fieldOf(database.constraint, database.table);
+  const duplicate = duplicateKey(exception);
+  if (duplicate) {
+    const field = duplicate.field;
     return {
       status: HttpStatus.CONFLICT,
       body: {
@@ -80,15 +85,6 @@ export function toFailure(exception: unknown): Failure {
         ...(field ? { details: { field } } : {}),
       },
     };
-  }
-  if (database?.code === PG_ERRORS.foreignKeyViolation) {
-    return { status: HttpStatus.CONFLICT, body: { ok: false, error: 'That refers to something that no longer exists.', code: 'REFERENCE_MISSING' } };
-  }
-  if (database?.code === PG_ERRORS.checkViolation) {
-    return { status: HttpStatus.BAD_REQUEST, body: { ok: false, error: 'That value is not allowed.', code: 'VALIDATION_FAILED' } };
-  }
-  if (database?.code === PG_ERRORS.invalidTextRepresentation) {
-    return { status: HttpStatus.BAD_REQUEST, body: { ok: false, error: 'Invalid value.', code: 'INVALID_ID' } };
   }
 
   const error = exception as { name?: string; code?: number | string };

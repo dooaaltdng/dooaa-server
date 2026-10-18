@@ -1,11 +1,9 @@
 import { Injectable } from '@nestjs/common';
-import { and, desc, eq, sql } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff } from '../../common/auth/principal';
 import type { CouponType } from '../../common/domain';
-import { InjectDb, type Database } from '../../database/database';
+import { InjectDb, isUniqueViolation, type Database } from '../../database/database';
 import { coupons } from '../../database/schema';
-import { isUniqueViolation } from '../../database/sql';
 import { AuditService } from '../audit/audit.service';
 import type { CouponTerms } from '../orders/pricing';
 
@@ -34,10 +32,7 @@ export class CouponsService {
   /** The coupon behind a code if it can be used right now, else null. */
   async usable(code: string | null | undefined, now = new Date()): Promise<CouponTerms | null> {
     if (!code) return null;
-    const [coupon] = await this.db
-      .select()
-      .from(coupons)
-      .where(and(eq(coupons.code, code.trim().toUpperCase()), eq(coupons.active, true)));
+    const coupon = await this.db.findOne(coupons, { code: code.trim().toUpperCase(), active: true });
     if (!coupon) return null;
     if (coupon.startsAt && coupon.startsAt > now) return null;
     if (coupon.expiresAt && coupon.expiresAt < now) return null;
@@ -59,23 +54,17 @@ export class CouponsService {
 
   /** Counts a use once a payment that applied it succeeds. */
   async redeem(code: string): Promise<void> {
-    await this.db
-      .update(coupons)
-      .set({ redemptions: sql`${coupons.redemptions} + 1` })
-      .where(eq(coupons.code, code.toUpperCase()));
+    await this.db.update(coupons, { code: code.toUpperCase() }, { $inc: { redemptions: 1 } });
   }
 
   async list(): Promise<Coupon[]> {
-    return this.db.select().from(coupons).orderBy(desc(coupons.createdAt));
+    return this.db.find(coupons, {}, { sort: { createdAt: -1 } });
   }
 
   async create(staff: AuthStaff, input: CouponInput): Promise<Coupon> {
     if (input.type === 'percent' && input.value > 100) throw Errors.badRequest('A percentage coupon cannot exceed 100%.', 'VALIDATION_FAILED');
     try {
-      const [created] = await this.db
-        .insert(coupons)
-        .values({ ...input, code: input.code.toUpperCase() })
-        .returning();
+      const created = await this.db.insert(coupons, { ...input, code: input.code.toUpperCase() });
       await this.audit.record(staff, { action: 'Created a coupon', target: created.code, targetType: 'coupon', targetId: created.id });
       return created;
     } catch (error) {
@@ -86,9 +75,9 @@ export class CouponsService {
 
   async update(staff: AuthStaff, code: string, patch: Partial<CouponInput>): Promise<Coupon> {
     const { code: _ignored, ...changes } = patch;
-    const [updated] = Object.keys(changes).length
-      ? await this.db.update(coupons).set(changes).where(eq(coupons.code, code.toUpperCase())).returning()
-      : await this.db.select().from(coupons).where(eq(coupons.code, code.toUpperCase()));
+    const updated = Object.keys(changes).length
+      ? await this.db.update(coupons, { code: code.toUpperCase() }, changes)
+      : await this.db.findOne(coupons, { code: code.toUpperCase() });
     if (!updated) throw Errors.notFound('That coupon does not exist.', 'COUPON_NOT_FOUND');
     await this.audit.record(staff, { action: 'Updated a coupon', target: updated.code, targetType: 'coupon', targetId: updated.id });
     return updated;
@@ -96,9 +85,6 @@ export class CouponsService {
 
   /** The demo code the cart frame advertises. */
   async ensureDefaults(): Promise<void> {
-    await this.db
-      .insert(coupons)
-      .values({ code: 'DOOAA10', description: '10% off your cart', type: 'percent', value: 10, active: true })
-      .onConflictDoNothing({ target: coupons.code });
+    await this.db.insertIgnoringDuplicates(coupons, [{ code: 'DOOAA10', description: '10% off your cart', type: 'percent', value: 10, active: true }]);
   }
 }
