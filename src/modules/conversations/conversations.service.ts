@@ -1,6 +1,4 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
-import { and, asc, count, desc, eq, gt, inArray, isNull, lt, or, sql, sum, type SQL } from 'drizzle-orm';
-import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
 import type { MessageKind, SenderRole, UserMessageKind } from '../../common/domain';
@@ -9,7 +7,8 @@ import { formatNaira } from '../../common/util/money';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
 import { excerpt } from '../../common/util/text';
 import { isUuid } from '../../common/util/uuid';
-import { containsText, InjectDb, type Database } from '../../database/database';
+import { InjectDb, type Database, type Patch } from '../../database/database';
+import { and, contains, eq, gt, inArray, isNull, lt, or, type Condition } from '../../database/query';
 import { conversations, messages, offers, orderItems, orders, users, type ConversationSubject, type MessageMeetup } from '../../database/schema';
 import { MediaService } from '../media/media.service';
 import { toOrder, type Order } from '../orders/order.model';
@@ -19,7 +18,7 @@ import { ProductsService } from '../products/products.service';
 import { SERVER_EVENTS } from '../realtime/realtime.events';
 import { RealtimeService } from '../realtime/realtime.service';
 import { UsersService } from '../users/users.service';
-import { toConversation, type Conversation, type Message, type Offer } from './conversation.model';
+import { toConversation, type Conversation, type ConversationRow, type Message, type Offer } from './conversation.model';
 import {
   ESCROW_LABEL,
   toConversationEscrow,
@@ -88,13 +87,13 @@ export class ConversationsService implements OnModuleInit {
 
   async findById(id: string): Promise<Conversation | null> {
     if (!isUuid(id)) return null;
-    const [row] = await this.db.select().from(conversations).where(eq(conversations.id, id));
+    const row = await this.db.findOne(conversations, eq(conversations.id, id));
     return row ? toConversation(row) : null;
   }
 
-  private async update(id: string, set: PgUpdateSetSource<typeof conversations>): Promise<Conversation> {
-    const [row] = await this.db.update(conversations).set(set).where(eq(conversations.id, id)).returning();
-    return toConversation(row);
+  private async update(id: string, set: Patch<ConversationRow>): Promise<Conversation> {
+    const row = await this.db.update(conversations, eq(conversations.id, id), set);
+    return toConversation(row!);
   }
 
   /* --- Access --------------------------------------------------------------------- */
@@ -109,11 +108,7 @@ export class ConversationsService implements OnModuleInit {
 
   async isParticipant(userId: string, conversationId: string): Promise<boolean> {
     if (!isUuid(conversationId) || !isUuid(userId)) return false;
-    const [row] = await this.db
-      .select({ id: conversations.id })
-      .from(conversations)
-      .where(and(eq(conversations.id, conversationId), or(eq(conversations.buyerId, userId), eq(conversations.sellerId, userId))));
-    return Boolean(row);
+    return this.db.exists(conversations, and(eq(conversations.id, conversationId), or(eq(conversations.buyerId, userId), eq(conversations.sellerId, userId))));
   }
 
   /* --- Views ---------------------------------------------------------------------- */
@@ -124,20 +119,18 @@ export class ConversationsService implements OnModuleInit {
     const orderIds = rows.map((row) => row.orderId).filter((id): id is string => Boolean(id));
     const [people, orderRows, openOffers] = await Promise.all([
       this.users.findByIds([...counterpartIds, ...rows.map((row) => row.buyerId)]),
-      orderIds.length ? this.db.select({ id: orders.id, reference: orders.reference, escrowPhase: orders.escrowPhase }).from(orders).where(inArray(orders.id, orderIds)) : [],
-      this.db
-        .select()
-        .from(offers)
-        .where(
-          and(
-            inArray(
-              offers.conversationId,
-              rows.map((row) => row.id),
-            ),
-            inArray(offers.status, ['pending', 'countered', 'accepted']),
+      orderIds.length ? this.db.find(orders, inArray(orders.id, orderIds)) : [],
+      this.db.find(
+        offers,
+        and(
+          inArray(
+            offers.conversationId,
+            rows.map((row) => row.id),
           ),
-        )
-        .orderBy(desc(offers.createdAt)),
+          inArray(offers.status, ['pending', 'countered', 'accepted']),
+        ),
+        { sort: { createdAt: -1 } },
+      ),
     ]);
     const personById = new Map(people.map((person) => [person.id, person]));
     const orderById = new Map(orderRows.map((order) => [order.id, order]));
@@ -178,36 +171,27 @@ export class ConversationsService implements OnModuleInit {
   }
 
   async list(user: AuthUser, query: { filter?: 'all' | 'unread'; q?: string; page?: number; limit?: number }): Promise<Page<ConversationSummary>> {
-    const conditions: SQL[] = [
+    const conditions: Condition[] = [
       query.filter === 'unread'
-        ? or(and(eq(conversations.buyerId, user.id), gt(conversations.buyerUnread, 0)), and(eq(conversations.sellerId, user.id), gt(conversations.sellerUnread, 0)))!
-        : or(eq(conversations.buyerId, user.id), eq(conversations.sellerId, user.id))!,
+        ? or(and(eq(conversations.buyerId, user.id), gt(conversations.buyerUnread, 0)), and(eq(conversations.sellerId, user.id), gt(conversations.sellerUnread, 0)))
+        : or(eq(conversations.buyerId, user.id), eq(conversations.sellerId, user.id)),
     ];
     const term = query.q?.trim();
     if (term) {
-      const people = this.db
-        .select({ id: users.id })
-        .from(users)
-        .where(or(containsText(users.firstName, term), containsText(users.lastName, term), containsText(users.sellerStoreName, term)));
+      const people = await this.db.distinct(users, 'id', or(contains(users.firstName, term), contains(users.lastName, term), contains(users.sellerStoreName, term)));
       conditions.push(
         or(
-          containsText(sql`${conversations.subject}->>'title'`, term),
-          containsText(conversations.lastMessagePreview, term),
+          contains({ field: 'subject.title' }, term),
+          contains(conversations.lastMessagePreview, term),
           inArray(conversations.buyerId, people),
           inArray(conversations.sellerId, people),
-        )!,
+        ),
       );
     }
     const where = and(...conditions);
-    const [{ total }] = await this.db.select({ total: count() }).from(conversations).where(where);
+    const total = await this.db.count(conversations, where);
     const window = pageWindow(total, query.page, query.limit ?? 30);
-    const rows = await this.db
-      .select()
-      .from(conversations)
-      .where(where)
-      .orderBy(descNullsLast(conversations.lastMessageAt), desc(conversations.updatedAt))
-      .offset(window.skip)
-      .limit(window.size);
+    const rows = await this.db.find(conversations, where, { sort: { lastMessageAt: -1, updatedAt: -1 }, skip: window.skip, limit: window.size });
     return toPage(await this.summaries(rows.map(toConversation), user.id), total, window);
   }
 
@@ -234,25 +218,20 @@ export class ConversationsService implements OnModuleInit {
 
   /** The order a thread follows, with its items, for the escrow panel. */
   private async orderOf(orderId: string): Promise<Order | null> {
-    const [row] = await this.db.select().from(orders).where(eq(orders.id, orderId));
+    const row = await this.db.findOne(orders, eq(orders.id, orderId));
     if (!row) return null;
-    const items = await this.db.select().from(orderItems).where(eq(orderItems.orderId, orderId));
+    const items = await this.db.find(orderItems, eq(orderItems.orderId, orderId), { sort: { position: 1 } });
     return toOrder(row, items);
   }
 
   private async page(conversationId: string, viewerId: string, query: { before?: string; limit?: number }): Promise<{ messages: MessageView[]; hasMore: boolean }> {
     const limit = Math.min(query.limit ?? 50, 100);
-    const conditions: SQL[] = [eq(messages.conversationId, conversationId)];
+    const conditions: Condition[] = [eq(messages.conversationId, conversationId)];
     if (query.before && isUuid(query.before)) {
-      const [pivot] = await this.db.select({ id: messages.id, createdAt: messages.createdAt }).from(messages).where(eq(messages.id, query.before));
-      if (pivot) conditions.push(or(lt(messages.createdAt, pivot.createdAt), and(eq(messages.createdAt, pivot.createdAt), lt(messages.id, pivot.id)))!);
+      const pivot = await this.db.findOne(messages, eq(messages.id, query.before));
+      if (pivot) conditions.push(or(lt(messages.createdAt, pivot.createdAt), and(eq(messages.createdAt, pivot.createdAt), lt(messages.id, pivot.id))));
     }
-    const rows = await this.db
-      .select()
-      .from(messages)
-      .where(and(...conditions))
-      .orderBy(desc(messages.createdAt), desc(messages.id))
-      .limit(limit + 1);
+    const rows = await this.db.find(messages, and(...conditions), { sort: { createdAt: -1, id: -1 }, limit: limit + 1 });
     const hasMore = rows.length > limit;
     return {
       messages: rows
@@ -269,20 +248,18 @@ export class ConversationsService implements OnModuleInit {
   }
 
   async unreadCount(userId: string): Promise<{ threads: number; messages: number }> {
-    const [[asBuyer], [asSeller]] = await Promise.all([
-      this.db
-        .select({ threads: count(), messages: sum(conversations.buyerUnread).mapWith(Number) })
-        .from(conversations)
-        .where(and(eq(conversations.buyerId, userId), gt(conversations.buyerUnread, 0))),
-      this.db
-        .select({ threads: count(), messages: sum(conversations.sellerUnread).mapWith(Number) })
-        .from(conversations)
-        .where(and(eq(conversations.sellerId, userId), gt(conversations.sellerUnread, 0))),
-    ]);
-    return {
-      threads: asBuyer.threads + asSeller.threads,
-      messages: (asBuyer.messages ?? 0) + (asSeller.messages ?? 0),
+    const tally = async (match: Condition, field: 'buyerUnread' | 'sellerUnread') => {
+      const [row] = await this.db.aggregate<{ threads: number; messages: number }>(conversations, [
+        { $match: match },
+        { $group: { _id: null, threads: { $sum: 1 }, messages: { $sum: `$${field}` } } },
+      ]);
+      return { threads: row?.threads ?? 0, messages: row?.messages ?? 0 };
     };
+    const [asBuyer, asSeller] = await Promise.all([
+      tally(and(eq(conversations.buyerId, userId), gt(conversations.buyerUnread, 0)), 'buyerUnread'),
+      tally(and(eq(conversations.sellerId, userId), gt(conversations.sellerUnread, 0)), 'sellerUnread'),
+    ]);
+    return { threads: asBuyer.threads + asSeller.threads, messages: asBuyer.messages + asSeller.messages };
   }
 
   /* --- Starting threads ---------------------------------------------------------------- */
@@ -311,25 +288,19 @@ export class ConversationsService implements OnModuleInit {
     }
     if (sellerId === user.id) throw Errors.forbidden('You cannot message yourself.', 'OWN_LISTING');
 
-    const [existing] = await this.db
-      .select()
-      .from(conversations)
-      .where(
-        and(
-          eq(conversations.buyerId, user.id),
-          eq(conversations.sellerId, sellerId),
-          productId ? eq(conversations.productId, productId) : isNull(conversations.productId),
-          isNull(conversations.orderId),
-        ),
-      )
-      .orderBy(desc(conversations.createdAt))
-      .limit(1);
+    const existing = await this.db.findOne(
+      conversations,
+      and(
+        eq(conversations.buyerId, user.id),
+        eq(conversations.sellerId, sellerId),
+        productId ? eq(conversations.productId, productId) : isNull(conversations.productId),
+        isNull(conversations.orderId),
+      ),
+      { sort: { createdAt: -1 } },
+    );
     let conversation = existing ? toConversation(existing) : null;
     if (!conversation) {
-      const [created] = await this.db
-        .insert(conversations)
-        .values({ buyerId: user.id, sellerId, productId, subject, lastMessageAt: new Date() })
-        .returning();
+      const created = await this.db.insert(conversations, { buyerId: user.id, sellerId, productId, subject, lastMessageAt: new Date() });
       conversation = toConversation(created);
       if (productId) await this.products.incrementInquiries(productId);
     }
@@ -357,46 +328,32 @@ export class ConversationsService implements OnModuleInit {
     let conversation: Conversation | null = null;
     if (item) {
       // Adopt the buyer's latest open enquiry about the item.
-      const [linked] = await this.db
-        .update(conversations)
-        .set({ orderId: order.id })
-        .where(
-          inArray(
-            conversations.id,
-            this.db
-              .select({ id: conversations.id })
-              .from(conversations)
-              .where(
-                and(
-                  eq(conversations.buyerId, order.buyerId),
-                  eq(conversations.sellerId, order.sellerId),
-                  eq(conversations.productId, item.productId),
-                  isNull(conversations.orderId),
-                ),
-              )
-              .orderBy(desc(conversations.createdAt))
-              .limit(1),
-          ),
-        )
-        .returning();
+      const linked = await this.db.update(
+        conversations,
+        and(
+          eq(conversations.buyerId, order.buyerId),
+          eq(conversations.sellerId, order.sellerId),
+          eq(conversations.productId, item.productId),
+          isNull(conversations.orderId),
+        ),
+        { orderId: order.id },
+        { sort: { createdAt: -1 } },
+      );
       conversation = linked ? toConversation(linked) : null;
     }
     if (!conversation) {
       const product = item ? await this.products.findById(item.productId) : null;
-      const [created] = await this.db
-        .insert(conversations)
-        .values({
+      const created = await this.db.insert(conversations, {
           buyerId: order.buyerId,
           sellerId: order.sellerId,
           productId: item?.productId ?? null,
           orderId: order.id,
           subject: item ? { title: item.title, summary: product?.summary ?? '', image: item.image, price: item.price } : null,
           lastMessageAt: new Date(),
-        })
-        .returning();
+        });
       conversation = toConversation(created);
     }
-    await this.db.update(orders).set({ conversationId: conversation.id }).where(eq(orders.id, order.id));
+    await this.db.update(orders, eq(orders.id, order.id), { conversationId: conversation.id });
     return conversation;
   }
 
@@ -404,9 +361,7 @@ export class ConversationsService implements OnModuleInit {
 
   /** Writes a message, bumps unread for whoever did not send it, and pushes it live. */
   private async post(conversation: Conversation, input: NewMessage): Promise<Message> {
-    const [message] = await this.db
-      .insert(messages)
-      .values({
+    const message = await this.db.insert(messages, {
         conversationId: conversation.id,
         senderId: input.senderId ?? null,
         senderRole: input.senderRole,
@@ -418,17 +373,17 @@ export class ConversationsService implements OnModuleInit {
         offerId: input.offerId ?? null,
         meetup: input.meetup ?? null,
         dispute: input.dispute ?? null,
-      })
-      .returning();
+      });
     const fromBuyer = input.senderRole === 'buyer';
     const fromSeller = input.senderRole === 'seller';
     const updated = await this.update(conversation.id, {
-      lastMessagePreview: this.previewOf(message),
-      lastMessageKind: message.kind,
-      lastMessageAt: message.createdAt,
-      lastMessageSenderId: input.senderId ?? null,
-      buyerUnread: sql`${conversations.buyerUnread} + ${fromBuyer ? 0 : 1}`,
-      sellerUnread: sql`${conversations.sellerUnread} + ${fromSeller ? 0 : 1}`,
+      $set: {
+        lastMessagePreview: this.previewOf(message),
+        lastMessageKind: message.kind,
+        lastMessageAt: message.createdAt,
+        lastMessageSenderId: input.senderId ?? null,
+      },
+      $inc: { buyerUnread: fromBuyer ? 0 : 1, sellerUnread: fromSeller ? 0 : 1 },
     });
 
     const { buyerId, sellerId } = conversation;
@@ -541,12 +496,12 @@ export class ConversationsService implements OnModuleInit {
   }
 
   async linkDispute(conversationId: string, disputeId: string): Promise<void> {
-    await this.db.update(conversations).set({ disputeId }).where(eq(conversations.id, conversationId));
+    await this.db.update(conversations, eq(conversations.id, conversationId), { disputeId });
   }
 
   /** Raw thread for the console's dispute pane. */
   async threadFor(conversationId: string): Promise<Message[]> {
-    return this.db.select().from(messages).where(eq(messages.conversationId, conversationId)).orderBy(asc(messages.createdAt), asc(messages.id)).limit(500);
+    return this.db.find(messages, eq(messages.conversationId, conversationId), { sort: { createdAt: 1, id: 1 }, limit: 500 });
   }
 
   /* --- Offers ---------------------------------------------------------------------- */
@@ -559,13 +514,12 @@ export class ConversationsService implements OnModuleInit {
     const product = await this.products.findPublic(conversation.productId);
     if (product.pricing !== 'negotiable') throw Errors.conflict('This item has a fixed price.', 'FIXED_PRICE');
     const offer = await this.db.transaction(async (tx) => {
-      await tx
-        .update(offers)
-        .set({ status: 'withdrawn', respondedAt: new Date() })
-        .where(and(eq(offers.conversationId, conversation.id), eq(offers.buyerId, user.id), inArray(offers.status, ['pending', 'countered'])));
-      const [created] = await tx
-        .insert(offers)
-        .values({
+      await tx.updateMany(
+        offers,
+        and(eq(offers.conversationId, conversation.id), eq(offers.buyerId, user.id), inArray(offers.status, ['pending', 'countered'])),
+        { status: 'withdrawn', respondedAt: new Date() },
+      );
+      const created = await tx.insert(offers, {
           conversationId: conversation.id,
           productId: product.id,
           buyerId: user.id,
@@ -574,8 +528,7 @@ export class ConversationsService implements OnModuleInit {
           listed: product.price,
           note: input.note ?? '',
           status: 'pending',
-        })
-        .returning();
+        });
       return created;
     });
     await this.post(conversation, {
@@ -592,19 +545,15 @@ export class ConversationsService implements OnModuleInit {
   }
 
   private async offerFor(user: AuthUser, offerId: string): Promise<{ offer: Offer; conversation: Conversation; role: 'buyer' | 'seller' }> {
-    const [offer] = isUuid(offerId) ? await this.db.select().from(offers).where(eq(offers.id, offerId)) : [];
+    const offer = isUuid(offerId) ? await this.db.findOne(offers, eq(offers.id, offerId)) : null;
     if (!offer) throw Errors.notFound('That offer does not exist.', 'OFFER_NOT_FOUND');
     const { role, conversation } = await this.participant(user, offer.conversationId);
     return { offer, conversation, role };
   }
 
   /** Moves an offer on only if nobody answered it in the meantime. */
-  private async answerOffer(offer: Offer, set: PgUpdateSetSource<typeof offers>): Promise<Offer> {
-    const [updated] = await this.db
-      .update(offers)
-      .set(set)
-      .where(and(eq(offers.id, offer.id), eq(offers.status, offer.status)))
-      .returning();
+  private async answerOffer(offer: Offer, set: Patch<Offer>): Promise<Offer> {
+    const updated = await this.db.update(offers, and(eq(offers.id, offer.id), eq(offers.status, offer.status)), set);
     if (!updated) throw Errors.conflict('This offer has already been answered.', 'OFFER_NOT_PENDING');
     return updated;
   }
@@ -669,7 +618,7 @@ export class ConversationsService implements OnModuleInit {
   async withdrawOffer(user: AuthUser, offerId: string): Promise<ConversationDetail> {
     const { offer, conversation, role } = await this.offerFor(user, offerId);
     if (role !== 'buyer' || !['pending', 'countered'].includes(offer.status)) throw Errors.conflict('This offer cannot be withdrawn.', 'OFFER_NOT_PENDING');
-    await this.db.update(offers).set({ status: 'withdrawn', respondedAt: new Date() }).where(eq(offers.id, offer.id));
+    await this.db.update(offers, eq(offers.id, offer.id), { status: 'withdrawn', respondedAt: new Date() });
     await this.post(conversation, { senderId: user.id, senderRole: 'buyer', senderName: user.firstName, kind: 'system', systemLead: 'Offer withdrawn.', body: 'The buyer withdrew their offer.' });
     return this.detail(user, conversation.id);
   }
@@ -695,19 +644,14 @@ export class ConversationsService implements OnModuleInit {
 
   async respondToMeetup(user: AuthUser, conversationId: string, messageId: string, status: 'accepted' | 'declined'): Promise<MessageView> {
     const { role, conversation } = await this.participant(user, conversationId);
-    const [proposal] = isUuid(messageId)
-      ? await this.db
-          .select()
-          .from(messages)
-          .where(and(eq(messages.id, messageId), eq(messages.conversationId, conversation.id), eq(messages.kind, 'meetup')))
-      : [];
+    const proposal = isUuid(messageId)
+      ? await this.db.findOne(messages, and(eq(messages.id, messageId), eq(messages.conversationId, conversation.id), eq(messages.kind, 'meetup')))
+      : null;
     if (!proposal?.meetup) throw Errors.notFound('That meetup does not exist.', 'MEETUP_NOT_FOUND');
     if (proposal.senderId && proposal.senderId === user.id) throw Errors.forbidden('The other side answers your proposal.', 'OWN_PROPOSAL');
-    const [updated] = await this.db
-      .update(messages)
-      .set({ meetup: { ...proposal.meetup, status, respondedAt: new Date().toISOString() } })
-      .where(and(eq(messages.id, proposal.id), sql`${messages.meetup}->>'status' = 'proposed'`))
-      .returning();
+    const updated = await this.db.update(messages, and(eq(messages.id, proposal.id), eq({ field: 'meetup.status' }, 'proposed')), {
+      meetup: { ...proposal.meetup, status, respondedAt: new Date().toISOString() },
+    });
     if (!updated) throw Errors.conflict('This meetup has already been answered.', 'MEETUP_ANSWERED');
     const view = toMessageView(updated, user.id);
     for (const viewer of [conversation.buyerId, conversation.sellerId]) {
@@ -731,7 +675,7 @@ export class ConversationsService implements OnModuleInit {
     let conversationId = event.order.conversationId;
     if (event.event === 'paid') conversationId = (await this.ensureForOrder(event.order)).id;
     if (!conversationId) {
-      const [conversation] = await this.db.select({ id: conversations.id }).from(conversations).where(eq(conversations.orderId, event.order.id)).limit(1);
+      const conversation = await this.db.findOne(conversations, eq(conversations.orderId, event.order.id));
       conversationId = conversation?.id ?? null;
     }
     if (!conversationId) return;
