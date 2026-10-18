@@ -1,22 +1,26 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, QueryFilter, Types } from 'mongoose';
+import { and, asc, count, desc, eq, gt, gte, inArray, isNull, lte, max, min, ne, notInArray, or, sql, type SQL } from 'drizzle-orm';
+import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
+import { CacheService } from '../../cache/cache.service';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
-import { EventBus } from '../../common/events/event-bus';
 import type { ListingStatus } from '../../common/domain';
-import { TtlCache } from '../../common/util/cache';
-import type { Lean } from '../../common/util/mongo';
+import { EventBus } from '../../common/events/event-bus';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
-import { containsRegex, excerpt } from '../../common/util/text';
+import { excerpt } from '../../common/util/text';
+import { isUuid } from '../../common/util/uuid';
+import { InjectDb, type Database, type Executor } from '../../database/database';
+import { products, users, wishlistItems } from '../../database/schema';
+import { containsText, descNullsLast, escapeLike, isUniqueViolation } from '../../database/sql';
 import { AuditService } from '../audit/audit.service';
 import { CategoriesService } from '../categories/categories.service';
 import { MediaService } from '../media/media.service';
 import { SettingsService } from '../settings/settings.service';
-import { User } from '../users/schemas/user.schema';
-import { WishlistItem } from '../wishlist/wishlist.schema';
+import type { User } from '../users/user.model';
+import { UsersService } from '../users/users.service';
 import type { CreateProductDto, SellerStatusFilter, UpdateProductDto } from './dto/product.dto';
-import { PUBLIC_PRODUCT_FILTER, buildCatalogFilter, catalogSort, type CatalogQuery } from './product.filters';
+import { PUBLIC_PRODUCT_FILTER, buildCatalogFilter, catalogSort, searchTerm, type CatalogQuery, type SearchMode } from './product.filters';
+import { productColumns, toProduct, type Product } from './product.model';
 import {
   toAdminListing,
   toProductCard,
@@ -27,7 +31,6 @@ import {
   type ProductDetail,
   type SellerProductView,
 } from './product.presenter';
-import { Product } from './schemas/product.schema';
 
 export const PRODUCT_EVENTS = {
   restocked: 'product.restocked',
@@ -50,68 +53,94 @@ export type CatalogFacets = {
 
 export type SellerTabCounts = { all: number; active: number; inactive: number; draft: number };
 
+type ProductPatch = PgUpdateSetSource<typeof products>;
+type HomeRails = { topSellers: Product[]; featured: Product[]; popular: Product[] };
+
 const OFFICIAL_STORE_EMAIL = 'store@dooaa.ng';
 const MIN_LISTINGS_FOR_OUTLIER = 5;
+const HOME_KEY = 'catalog:home';
+const HOME_TTL_MS = 60_000;
+const MEDIAN_TTL_MS = 5 * 60_000;
 
 type Viewer = { id: string } | undefined;
+
+const medianKey = (categoryId: string) => `catalog:median:${categoryId}`;
 
 @Injectable()
 export class ProductsService {
   private readonly logger = new Logger(ProductsService.name);
-  private readonly medians = new TtlCache<number | null>(5 * 60_000);
-  private readonly home = new TtlCache<{ topSellers: Lean<Product>[]; featured: Lean<Product>[]; popular: Lean<Product>[] }>(60_000, 1);
 
   constructor(
-    @InjectModel(Product.name) private readonly products: Model<Product>,
-    @InjectModel(User.name) private readonly users: Model<User>,
-    @InjectModel(WishlistItem.name) private readonly wishlist: Model<WishlistItem>,
+    @InjectDb() private readonly db: Database,
+    private readonly users: UsersService,
     private readonly categories: CategoriesService,
     private readonly settings: SettingsService,
     private readonly media: MediaService,
     private readonly audit: AuditService,
+    private readonly cache: CacheService,
     private readonly events: EventBus,
   ) {}
 
-  get model(): Model<Product> {
-    return this.products;
-  }
-
   /* --- Lookups ----------------------------------------------------------------- */
 
-  async findById(id: string | Types.ObjectId): Promise<Lean<Product> | null> {
-    if (!Types.ObjectId.isValid(String(id))) return null;
-    return this.products.findOne({ _id: id, deletedAt: null }).lean<Lean<Product>>();
+  private async select(where: SQL | undefined, orderBy: SQL[] = [], limit?: number, offset?: number): Promise<Product[]> {
+    let query = this.db.select(productColumns).from(products).where(where).$dynamic();
+    if (orderBy.length) query = query.orderBy(...orderBy);
+    if (limit !== undefined) query = query.limit(limit);
+    if (offset !== undefined) query = query.offset(offset);
+    return (await query).map(toProduct);
   }
 
-  async findPublic(id: string): Promise<Lean<Product>> {
-    if (!Types.ObjectId.isValid(id)) throw Errors.notFound('This item is no longer listed.', 'PRODUCT_NOT_FOUND');
-    const product = await this.products.findOne({ _id: id, ...PUBLIC_PRODUCT_FILTER }).lean<Lean<Product>>();
+  private async countWhere(where: SQL | undefined): Promise<number> {
+    const [row] = await this.db.select({ total: count() }).from(products).where(where);
+    return row.total;
+  }
+
+  async findById(id: string): Promise<Product | null> {
+    if (!isUuid(id)) return null;
+    const [product] = await this.select(and(eq(products.id, id), isNull(products.deletedAt)), [], 1);
+    return product ?? null;
+  }
+
+  async findPublic(id: string): Promise<Product> {
+    const [product] = isUuid(id) ? await this.select(and(eq(products.id, id), PUBLIC_PRODUCT_FILTER), [], 1) : [];
     if (!product) throw Errors.notFound('This item is no longer listed.', 'PRODUCT_NOT_FOUND');
     return product;
   }
 
-  private async wishlistedSet(viewer: Viewer, ids: Types.ObjectId[]): Promise<Set<string>> {
-    if (!viewer || !ids.length) return new Set();
-    const rows = await this.wishlist.find({ userId: new Types.ObjectId(viewer.id), productId: { $in: ids } }).select('productId').lean();
-    return new Set(rows.map((row) => String(row.productId)));
+  /** Every listing in the list, including unavailable ones, by id. */
+  async byIds(ids: string[]): Promise<Product[]> {
+    const valid = [...new Set(ids.filter(isUuid))];
+    return valid.length ? this.select(inArray(products.id, valid)) : [];
   }
 
-  async toCards(products: Lean<Product>[], viewer?: Viewer): Promise<ProductCard[]> {
+  private async wishlistedSet(viewer: Viewer, ids: string[]): Promise<Set<string>> {
+    if (!viewer || !ids.length) return new Set();
+    const rows = await this.db
+      .select({ productId: wishlistItems.productId })
+      .from(wishlistItems)
+      .where(and(eq(wishlistItems.userId, viewer.id), inArray(wishlistItems.productId, ids)));
+    return new Set(rows.map((row) => row.productId));
+  }
+
+  async toCards(list: Product[], viewer?: Viewer): Promise<ProductCard[]> {
     const [categoryNames, wishlisted] = await Promise.all([
       this.categories.names(),
-      this.wishlistedSet(viewer, products.map((product) => product._id)),
+      this.wishlistedSet(
+        viewer,
+        list.map((product) => product.id),
+      ),
     ]);
-    return products.map((product) => toProductCard(product, { categoryNames, wishlisted }));
+    return list.map((product) => toProductCard(product, { categoryNames, wishlisted }));
   }
 
   /** Cards for a list of ids, in the order given; ids that no longer resolve are dropped. */
-  async cardsByIds(ids: (string | Types.ObjectId)[], viewer?: Viewer, includeUnavailable = false): Promise<ProductCard[]> {
-    const objectIds = ids.filter((id) => Types.ObjectId.isValid(String(id))).map((id) => new Types.ObjectId(String(id)));
-    const filter: Record<string, unknown> = { _id: { $in: objectIds }, deletedAt: null };
-    if (!includeUnavailable) filter.status = 'active';
-    const rows = await this.products.find(filter).lean<Lean<Product>[]>();
-    const byId = new Map(rows.map((row) => [String(row._id), row]));
-    const ordered = objectIds.map((id) => byId.get(String(id))).filter((row): row is Lean<Product> => Boolean(row));
+  async cardsByIds(ids: string[], viewer?: Viewer, includeUnavailable = false): Promise<ProductCard[]> {
+    const valid = ids.filter(isUuid);
+    if (!valid.length) return [];
+    const rows = await this.select(and(inArray(products.id, valid), isNull(products.deletedAt), includeUnavailable ? undefined : eq(products.status, 'active')));
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const ordered = valid.map((id) => byId.get(id)).filter((row): row is Product => Boolean(row));
     return this.toCards(ordered, viewer);
   }
 
@@ -119,123 +148,103 @@ export class ProductsService {
 
   async search(query: CatalogQuery & { page?: number; limit?: number }, viewer?: Viewer): Promise<Page<ProductCard> & { facets: CatalogFacets }> {
     const size = query.limit ?? 24;
-    let mode: 'text' | 'regex' | 'none' = query.q?.trim() ? 'text' : 'none';
-    let filter = buildCatalogFilter(query, mode);
-    let total = await this.products.countDocuments(filter).catch((error: { code?: number }) => {
-      // No text index (e.g. a fresh database mid-build): search by substring instead of failing.
-      if (error?.code === 27) return -1;
-      throw error;
-    });
-    if (total === -1) {
-      mode = 'regex';
-      filter = buildCatalogFilter(query, mode);
-      total = await this.products.countDocuments(filter);
-    }
+    let mode: SearchMode = searchTerm(query) ? 'text' : 'none';
+    let total = await this.countWhere(buildCatalogFilter(query, mode));
     if (total === 0 && mode === 'text') {
       // Full-text matches whole words only; fall back to a substring match for partial words.
-      mode = 'regex';
-      filter = buildCatalogFilter(query, mode);
-      total = await this.products.countDocuments(filter);
+      mode = 'partial';
+      total = await this.countWhere(buildCatalogFilter(query, mode));
     }
     const window = pageWindow(total, query.page, size);
-    const projection = mode === 'text' ? { score: { $meta: 'textScore' } } : {};
     const [rows, facets] = await Promise.all([
-      this.products
-        .find(filter, projection)
-        .sort(catalogSort(query, mode) as never)
-        .skip(window.skip)
-        .limit(window.size)
-        .lean<Lean<Product>[]>(),
+      this.select(buildCatalogFilter(query, mode), catalogSort(query, mode), window.size, window.skip),
       this.facets(buildCatalogFilter({ q: query.q, category: query.category, price: query.price, min: query.min, max: query.max, collection: query.collection }, mode)),
     ]);
     return { ...toPage(await this.toCards(rows, viewer), total, window), facets };
   }
 
-  private async facets(filter: QueryFilter<Product>): Promise<CatalogFacets> {
-    const [result] = await this.products.aggregate<{
-      brands: { _id: string; count: number }[];
-      conditions: { _id: string; count: number }[];
-      sellers: { _id: boolean; count: number }[];
-      price: { min: number; max: number }[];
-    }>([
-      { $match: filter },
-      {
-        $facet: {
-          brands: [{ $match: { brand: { $nin: [null, ''] } } }, { $group: { _id: '$brand', count: { $sum: 1 } } }, { $sort: { count: -1, _id: 1 } }, { $limit: 20 }],
-          conditions: [{ $group: { _id: '$condition', count: { $sum: 1 } } }, { $sort: { _id: 1 } }],
-          sellers: [{ $group: { _id: '$sellerVerified', count: { $sum: 1 } } }],
-          price: [{ $group: { _id: null, min: { $min: '$price' }, max: { $max: '$price' } } }],
-        },
-      },
+  private async facets(filter: SQL): Promise<CatalogFacets> {
+    const [brands, conditions, sellers, [price]] = await Promise.all([
+      this.db
+        .select({ value: products.brand, count: count() })
+        .from(products)
+        .where(and(filter, sql`coalesce(${products.brand}, '') <> ''`))
+        .groupBy(products.brand)
+        .orderBy(desc(count()), asc(products.brand))
+        .limit(20),
+      this.db.select({ value: products.condition, count: count() }).from(products).where(filter).groupBy(products.condition).orderBy(asc(products.condition)),
+      this.db.select({ verified: products.sellerVerified, count: count() }).from(products).where(filter).groupBy(products.sellerVerified),
+      this.db.select({ min: min(products.price), max: max(products.price) }).from(products).where(filter),
     ]);
     return {
-      brands: (result?.brands ?? []).map((row) => ({ value: row._id, count: row.count })),
-      conditions: (result?.conditions ?? []).map((row) => ({ value: row._id, count: row.count })),
+      brands: brands.map((row) => ({ value: row.value!, count: row.count })),
+      conditions: conditions.map((row) => ({ value: row.value, count: row.count })),
       sellers: {
-        verified: result?.sellers.find((row) => row._id === true)?.count ?? 0,
-        unverified: result?.sellers.find((row) => row._id !== true)?.count ?? 0,
+        verified: sellers.find((row) => row.verified)?.count ?? 0,
+        unverified: sellers.find((row) => !row.verified)?.count ?? 0,
       },
-      price: { min: result?.price[0]?.min ?? 0, max: result?.price[0]?.max ?? 0 },
+      price: { min: price?.min ?? 0, max: price?.max ?? 0 },
     };
   }
 
-  /** Header search-as-you-type: prefix matches on titles and brands. */
+  /** Header search-as-you-type: words in titles and brands that start with what was typed. */
   async suggest(q: string): Promise<{ id: string; title: string; categoryId: string; image: string | null }[]> {
-    const pattern = new RegExp(`(^|\\s)${q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i');
-    const rows = await this.products
-      .find({ ...PUBLIC_PRODUCT_FILTER, $or: [{ title: pattern }, { brand: pattern }] })
-      .sort({ 'stats.views': -1, _id: -1 })
-      .limit(8)
-      .select('title categoryId images')
-      .lean<Lean<Product>[]>();
-    return rows.map((row) => ({ id: String(row._id), title: row.title, categoryId: row.categoryId, image: row.images[0] ?? null }));
+    const term = escapeLike(q.trim());
+    const startsWord = (column: typeof products.title | typeof products.brand) => or(sql`${column} ilike ${`${term}%`}`, sql`${column} ilike ${`% ${term}%`}`)!;
+    const rows = await this.db
+      .select({ id: products.id, title: products.title, categoryId: products.categoryId, images: products.images })
+      .from(products)
+      .where(and(PUBLIC_PRODUCT_FILTER, or(startsWord(products.title), startsWord(products.brand))))
+      .orderBy(desc(products.statsViews), desc(products.id))
+      .limit(8);
+    return rows.map((row) => ({ id: row.id, title: row.title, categoryId: row.categoryId, image: row.images[0] ?? null }));
   }
 
   /** The landing page: category tiles and the three rails. */
   async homepage(viewer?: Viewer) {
-    const rails = await this.home.wrap('home', async () => {
-      const base = { ...PUBLIC_PRODUCT_FILTER, stock: { $gt: 0 } };
+    const rails = await this.cache.wrap<HomeRails>(HOME_KEY, HOME_TTL_MS, async () => {
+      const base = and(PUBLIC_PRODUCT_FILTER, gt(products.stock, 0))!;
       const [topSellers, featuredFlagged, popular] = await Promise.all([
-        this.products.find(base).sort({ 'stats.unitsSold': -1, 'stats.ratingAverage': -1, publishedAt: -1 }).limit(8).lean<Lean<Product>[]>(),
-        this.products.find({ ...base, featured: true }).sort({ publishedAt: -1 }).limit(8).lean<Lean<Product>[]>(),
-        this.products.find(base).sort({ 'stats.views': -1, 'stats.wishlists': -1, publishedAt: -1 }).limit(8).lean<Lean<Product>[]>(),
+        this.select(base, [desc(products.statsUnitsSold), desc(products.statsRatingAverage), descNullsLast(products.publishedAt)], 8),
+        this.select(and(base, eq(products.featured, true)), [descNullsLast(products.publishedAt)], 8),
+        this.select(base, [desc(products.statsViews), desc(products.statsWishlists), descNullsLast(products.publishedAt)], 8),
       ]);
       // Until enough listings are curated, the Featured rail tops up with the newest verified ones.
       let featured = featuredFlagged;
       if (featured.length < 8) {
-        const extra = await this.products
-          .find({ ...base, sellerVerified: true, _id: { $nin: featured.map((row) => row._id) } })
-          .sort({ publishedAt: -1, createdAt: -1 })
-          .limit(8 - featured.length)
-          .lean<Lean<Product>[]>();
+        const extra = await this.select(
+          and(base, eq(products.sellerVerified, true), featured.length ? notInArray(products.id, featured.map((row) => row.id)) : undefined),
+          [descNullsLast(products.publishedAt), desc(products.createdAt)],
+          8 - featured.length,
+        );
         featured = [...featured, ...extra];
       }
       return { topSellers, featured, popular };
     });
-    const [categories, topSellers, featured, popular] = await Promise.all([
+    const [categoryTiles, topSellers, featured, popular] = await Promise.all([
       this.categories.homeTiles(),
       this.toCards(rails.topSellers, viewer),
       this.toCards(rails.featured, viewer),
       this.toCards(rails.popular, viewer),
     ]);
-    return { categories, topSellers, featured, popular };
+    return { categories: categoryTiles, topSellers, featured, popular };
   }
 
   async detail(id: string, viewer?: Viewer): Promise<ProductDetail & { alsoViewed: ProductCard[] }> {
     const product = await this.findPublic(id);
     const [seller, categoryNames, wishlisted, related] = await Promise.all([
-      this.users.findById(product.sellerId).lean<Lean<User>>(),
+      this.users.findById(product.sellerId),
       this.categories.names(),
-      this.wishlistedSet(viewer, [product._id]),
-      this.products
-        .find({ ...PUBLIC_PRODUCT_FILTER, categoryId: product.categoryId, _id: { $ne: product._id } })
-        .sort({ 'stats.views': -1, publishedAt: -1 })
-        .limit(3)
-        .lean<Lean<Product>[]>(),
+      this.wishlistedSet(viewer, [product.id]),
+      this.select(and(PUBLIC_PRODUCT_FILTER, eq(products.categoryId, product.categoryId), ne(products.id, product.id)), [desc(products.statsViews), descNullsLast(products.publishedAt)], 3),
     ]);
-    if (!viewer || viewer.id !== String(product.sellerId)) {
-      void this.products.updateOne({ _id: product._id }, { $inc: { 'stats.views': 1 } }).catch(() => undefined);
-      this.events.publish<ProductViewed>(PRODUCT_EVENTS.viewed, { productId: String(product._id), sellerId: String(product.sellerId) });
+    if (!viewer || viewer.id !== product.sellerId) {
+      void this.db
+        .update(products)
+        .set({ statsViews: sql`${products.statsViews} + 1` })
+        .where(eq(products.id, product.id))
+        .catch(() => undefined);
+      this.events.publish<ProductViewed>(PRODUCT_EVENTS.viewed, { productId: product.id, sellerId: product.sellerId });
     }
     return {
       ...toProductDetail(product, seller, { categoryNames, wishlisted }),
@@ -245,11 +254,11 @@ export class ProductsService {
 
   /** A seller's public storefront listings. */
   async bySeller(sellerId: string, page = 1, limit = 24, viewer?: Viewer): Promise<Page<ProductCard>> {
-    if (!Types.ObjectId.isValid(sellerId)) throw Errors.notFound('That seller is not on DOOAA.', 'SELLER_NOT_FOUND');
-    const filter = { ...PUBLIC_PRODUCT_FILTER, sellerId: new Types.ObjectId(sellerId) };
-    const total = await this.products.countDocuments(filter);
+    if (!isUuid(sellerId)) throw Errors.notFound('That seller is not on DOOAA.', 'SELLER_NOT_FOUND');
+    const where = and(PUBLIC_PRODUCT_FILTER, eq(products.sellerId, sellerId));
+    const total = await this.countWhere(where);
     const window = pageWindow(total, page, limit);
-    const rows = await this.products.find(filter).sort({ publishedAt: -1, _id: -1 }).skip(window.skip).limit(window.size).lean<Lean<Product>[]>();
+    const rows = await this.select(where, [descNullsLast(products.publishedAt), desc(products.id)], window.size, window.skip);
     return toPage(await this.toCards(rows, viewer), total, window);
   }
 
@@ -257,11 +266,17 @@ export class ProductsService {
 
   /** Median live price in a category, for the "Suspicious" price check. Null when there are too few listings to judge. */
   private categoryMedian(categoryId: string): Promise<number | null> {
-    return this.medians.wrap(categoryId, async () => {
-      const filter = { ...PUBLIC_PRODUCT_FILTER, categoryId };
-      const count = await this.products.countDocuments(filter);
-      if (count < MIN_LISTINGS_FOR_OUTLIER) return null;
-      const [middle] = await this.products.find(filter).sort({ price: 1 }).skip(Math.floor(count / 2)).limit(1).select('price').lean();
+    return this.cache.wrap(medianKey(categoryId), MEDIAN_TTL_MS, async () => {
+      const where = and(PUBLIC_PRODUCT_FILTER, eq(products.categoryId, categoryId));
+      const total = await this.countWhere(where);
+      if (total < MIN_LISTINGS_FOR_OUTLIER) return null;
+      const [middle] = await this.db
+        .select({ price: products.price })
+        .from(products)
+        .where(where)
+        .orderBy(asc(products.price))
+        .offset(Math.floor(total / 2))
+        .limit(1);
       return middle?.price ?? null;
     });
   }
@@ -297,47 +312,56 @@ export class ProductsService {
     }
   }
 
-  async recountActiveListings(sellerId: string | Types.ObjectId): Promise<void> {
-    const count = await this.products.countDocuments({ sellerId: new Types.ObjectId(String(sellerId)), status: 'active', deletedAt: null });
-    await this.users.updateOne({ _id: sellerId }, { $set: { 'stats.activeListings': count } });
+  async recountActiveListings(sellerId: string): Promise<void> {
+    const total = await this.countWhere(and(eq(products.sellerId, sellerId), eq(products.status, 'active'), isNull(products.deletedAt)));
+    await this.users.setStats(sellerId, { activeListings: total });
   }
 
-  private afterChange(product: Pick<Product, 'categoryId'> & { sellerId: Types.ObjectId }): void {
-    this.categories.invalidateCounts();
-    this.home.clear();
-    this.medians.delete(product.categoryId);
+  private async afterChange(product: Pick<Product, 'categoryId' | 'sellerId'>): Promise<void> {
+    await Promise.all([this.categories.invalidateCounts(), this.cache.delete(HOME_KEY, medianKey(product.categoryId))]);
     void this.recountActiveListings(product.sellerId).catch(() => undefined);
   }
 
-  private flagIfSuspicious(product: Lean<Product>): void {
+  private flagIfSuspicious(product: Product): void {
     if (product.status === 'suspicious') {
       this.events.publish<ProductFlagged>(PRODUCT_EVENTS.flagged, {
-        productId: String(product._id),
+        productId: product.id,
         title: product.title,
-        reasons: product.moderation?.flags ?? [],
+        reasons: product.moderation.flags,
         price: product.price,
       });
     }
   }
 
+  private async patch(id: string, set: ProductPatch, condition?: SQL): Promise<Product | null> {
+    const [row] = await this.db
+      .update(products)
+      .set(set)
+      .where(and(eq(products.id, id), condition))
+      .returning(productColumns);
+    return row ? toProduct(row) : null;
+  }
+
   /* --- Seller tools ------------------------------------------------------------ */
 
-  private async sellerRecord(seller: AuthUser): Promise<Lean<User>> {
-    const record = await this.users.findById(seller.id).lean<Lean<User>>();
+  private async sellerRecord(seller: AuthUser): Promise<User> {
+    const record = await this.users.findById(seller.id);
     if (!record) throw Errors.unauthorized();
     return record;
   }
 
   /** The console can cap how many listings a seller has live or in review at once. */
-  private async assertUnderListingLimit(record: Lean<User>, excludeId?: Types.ObjectId): Promise<void> {
-    const limit = record.seller?.listingLimit;
-    if (limit === null || limit === undefined) return;
-    const live = await this.products.countDocuments({
-      sellerId: record._id,
-      deletedAt: null,
-      status: { $in: ['active', 'pending', 'suspicious'] },
-      ...(excludeId ? { _id: { $ne: excludeId } } : {}),
-    });
+  private async assertUnderListingLimit(record: User, excludeId?: string): Promise<void> {
+    const limit = record.seller.listingLimit;
+    if (limit === null) return;
+    const live = await this.countWhere(
+      and(
+        eq(products.sellerId, record.id),
+        isNull(products.deletedAt),
+        inArray(products.status, ['active', 'pending', 'suspicious']),
+        excludeId ? ne(products.id, excludeId) : undefined,
+      ),
+    );
     if (live >= limit) {
       throw Errors.forbidden(
         limit === 0
@@ -348,9 +372,8 @@ export class ProductsService {
     }
   }
 
-  private async ownProduct(seller: AuthUser, id: string): Promise<Lean<Product>> {
-    if (!Types.ObjectId.isValid(id)) throw Errors.notFound('That product is not in your store.', 'PRODUCT_NOT_FOUND');
-    const product = await this.products.findOne({ _id: id, sellerId: new Types.ObjectId(seller.id), deletedAt: null }).lean<Lean<Product>>();
+  private async ownProduct(seller: AuthUser, id: string): Promise<Product> {
+    const [product] = isUuid(id) ? await this.select(and(eq(products.id, id), eq(products.sellerId, seller.id), isNull(products.deletedAt)), [], 1) : [];
     if (!product) throw Errors.notFound('That product is not in your store.', 'PRODUCT_NOT_FOUND');
     return product;
   }
@@ -359,38 +382,42 @@ export class ProductsService {
     seller: AuthUser,
     query: { tab?: 'all' | 'active' | 'inactive' | 'draft'; q?: string; status?: SellerStatusFilter; page?: number; limit?: number },
   ): Promise<Page<SellerProductView> & { counts: SellerTabCounts }> {
-    const base: Record<string, unknown> = { sellerId: new Types.ObjectId(seller.id), deletedAt: null };
-    if (query.q?.trim()) base.title = containsRegex(query.q);
-    const tabs: Record<string, Record<string, unknown>> = {
-      all: {},
-      active: { status: 'active', stock: { $gt: 0 } },
+    const base = and(eq(products.sellerId, seller.id), isNull(products.deletedAt), query.q?.trim() ? containsText(products.title, query.q) : undefined)!;
+    const tabs: Record<'all' | 'active' | 'inactive' | 'draft', SQL | undefined> = {
+      all: undefined,
+      active: and(eq(products.status, 'active'), gt(products.stock, 0)),
       // "Inactive Products" gathers everything a buyer cannot purchase right now.
-      inactive: { $or: [{ status: { $in: ['pending', 'inactive', 'suspicious', 'rejected'] } }, { status: 'active', stock: { $lte: 0 } }] },
-      draft: { status: 'draft' },
+      inactive: or(inArray(products.status, ['pending', 'inactive', 'suspicious', 'rejected']), and(eq(products.status, 'active'), lte(products.stock, 0))),
+      draft: eq(products.status, 'draft'),
     };
     // The pill a listing shows: flagged listings wait on review like new ones.
-    const statuses: Record<SellerStatusFilter, Record<string, unknown>> = {
-      active: { status: 'active', stock: { $gt: 0 } },
-      'out-of-stock': { status: 'active', stock: { $lte: 0 } },
-      pending: { status: { $in: ['pending', 'suspicious'] } },
-      draft: { status: 'draft' },
-      inactive: { status: 'inactive' },
-      rejected: { status: 'rejected' },
+    const statuses: Record<SellerStatusFilter, SQL | undefined> = {
+      active: and(eq(products.status, 'active'), gt(products.stock, 0)),
+      'out-of-stock': and(eq(products.status, 'active'), lte(products.stock, 0)),
+      pending: inArray(products.status, ['pending', 'suspicious']),
+      draft: eq(products.status, 'draft'),
+      inactive: eq(products.status, 'inactive'),
+      rejected: eq(products.status, 'rejected'),
     };
-    const filter = query.status
-      ? { ...base, $and: [tabs[query.tab ?? 'all'], statuses[query.status]] }
-      : { ...base, ...tabs[query.tab ?? 'all'] };
+    const where = and(base, tabs[query.tab ?? 'all'], query.status ? statuses[query.status] : undefined);
     const [total, all, active, inactive, draft] = await Promise.all([
-      this.products.countDocuments(filter),
-      this.products.countDocuments({ ...base }),
-      this.products.countDocuments({ ...base, ...tabs.active }),
-      this.products.countDocuments({ ...base, ...tabs.inactive }),
-      this.products.countDocuments({ ...base, ...tabs.draft }),
+      this.countWhere(where),
+      this.countWhere(base),
+      this.countWhere(and(base, tabs.active)),
+      this.countWhere(and(base, tabs.inactive)),
+      this.countWhere(and(base, tabs.draft)),
     ]);
     const window = pageWindow(total, query.page, query.limit ?? 20);
-    const rows = await this.products.find(filter).sort({ createdAt: -1, _id: -1 }).skip(window.skip).limit(window.size).lean<Lean<Product>[]>();
+    const rows = await this.select(where, [desc(products.createdAt), desc(products.id)], window.size, window.skip);
     const names = await this.categories.names();
-    return { ...toPage(rows.map((row) => toSellerProduct(row, names)), total, window), counts: { all, active, inactive, draft } };
+    return {
+      ...toPage(
+        rows.map((row) => toSellerProduct(row, names)),
+        total,
+        window,
+      ),
+      counts: { all, active, inactive, draft },
+    };
   }
 
   async sellerGet(seller: AuthUser, id: string): Promise<SellerProductView> {
@@ -410,32 +437,34 @@ export class ProductsService {
     }
 
     const decision = input.publish ? await this.moderationDecision(record, input) : { status: 'draft' as ListingStatus, flags: [] };
-    const now = new Date();
-    const created = await this.products.create({
-      sellerId: new Types.ObjectId(seller.id),
-      title: input.title,
-      description: input.description,
-      summary: excerpt(input.description, 120),
-      highlights: input.highlights ?? [],
-      categoryId: input.categoryId,
-      brand: input.brand,
-      condition: input.condition,
-      price: input.price,
-      pricing: input.pricing,
-      paymentMethod: input.paymentMethod,
-      delivery: input.delivery,
-      stock: input.stock,
-      location: input.location ?? (record.location ? `${record.location}` : 'Lagos'),
-      images,
-      videos: await this.videoEntries(videos),
-      status: decision.status,
-      moderation: { flags: decision.flags },
-      sellerVerified: record.identity === 'verified',
-      listedAs: 'seller',
-      publishedAt: decision.status === 'active' ? now : undefined,
-    });
-    const product = created.toObject() as Lean<Product>;
-    this.afterChange(product);
+    const [row] = await this.db
+      .insert(products)
+      .values({
+        sellerId: seller.id,
+        title: input.title,
+        description: input.description,
+        summary: excerpt(input.description, 120),
+        highlights: input.highlights ?? [],
+        categoryId: input.categoryId,
+        brand: input.brand ?? null,
+        condition: input.condition,
+        price: input.price,
+        pricing: input.pricing,
+        paymentMethod: input.paymentMethod,
+        delivery: input.delivery,
+        stock: input.stock,
+        location: input.location ?? record.location ?? 'Lagos',
+        images,
+        videos: await this.videoEntries(videos),
+        status: decision.status,
+        moderationFlags: decision.flags,
+        sellerVerified: record.identity === 'verified',
+        listedAs: 'seller',
+        publishedAt: decision.status === 'active' ? new Date() : null,
+      })
+      .returning(productColumns);
+    const product = toProduct(row);
+    await this.afterChange(product);
     this.flagIfSuspicious(product);
     return toSellerProduct(product, await this.categories.names());
   }
@@ -444,7 +473,7 @@ export class ProductsService {
     return Promise.all(
       urls.map(async (url) => {
         const media = await this.media.byUrl(url);
-        return { url, posterUrl: media?.posterUrl };
+        return { url, ...(media?.posterUrl ? { posterUrl: media.posterUrl } : {}) };
       }),
     );
   }
@@ -452,17 +481,28 @@ export class ProductsService {
   async update(seller: AuthUser, id: string, input: UpdateProductDto): Promise<SellerProductView> {
     const product = await this.ownProduct(seller, id);
     await this.assertListable({ categoryId: input.categoryId, paymentMethod: input.paymentMethod });
-    const keepImages = product.images;
     const keepVideos = product.videos.map((video) => video.url);
-    await this.media.assertOwnedUrls([...(input.images ?? []), ...(input.videos ?? [])], { id: seller.id, type: 'user' }, ['product'], [...keepImages, ...keepVideos]);
+    await this.media.assertOwnedUrls([...(input.images ?? []), ...(input.videos ?? [])], { id: seller.id, type: 'user' }, ['product'], [...product.images, ...keepVideos]);
 
-    const set: Record<string, unknown> = {};
-    for (const key of ['title', 'description', 'highlights', 'categoryId', 'brand', 'condition', 'pricing', 'paymentMethod', 'delivery', 'stock', 'location', 'images'] as const) {
-      if (input[key] !== undefined) set[key] = input[key];
+    const set: ProductPatch = {};
+    if (input.title !== undefined) set.title = input.title;
+    if (input.description !== undefined) {
+      set.description = input.description;
+      set.summary = excerpt(input.description, 120);
     }
-    if (input.description !== undefined) set.summary = excerpt(input.description, 120);
+    if (input.highlights !== undefined) set.highlights = input.highlights;
+    if (input.categoryId !== undefined) set.categoryId = input.categoryId;
+    if (input.brand !== undefined) set.brand = input.brand;
+    if (input.condition !== undefined) set.condition = input.condition;
+    if (input.pricing !== undefined) set.pricing = input.pricing;
+    if (input.paymentMethod !== undefined) set.paymentMethod = input.paymentMethod;
+    if (input.delivery !== undefined) set.delivery = input.delivery;
+    if (input.stock !== undefined) set.stock = input.stock;
+    if (input.location !== undefined) set.location = input.location;
+    if (input.images !== undefined) set.images = input.images;
     if (input.videos !== undefined) set.videos = await this.videoEntries(input.videos);
-    if (input.price !== undefined && input.price !== product.price) {
+    const priceChanged = input.price !== undefined && input.price !== product.price;
+    if (priceChanged) {
       set.price = input.price;
       set.previousPrice = product.price;
       set.previousPriceSince = product.priceChangedAt ?? product.publishedAt ?? product.createdAt;
@@ -470,54 +510,52 @@ export class ProductsService {
     }
 
     // A live listing whose price or category changed is re-checked; a rejected or flagged one is resubmitted.
-    const material = set.price !== undefined || set.categoryId !== undefined;
+    const material = priceChanged || input.categoryId !== undefined;
     const resubmit = ['rejected', 'suspicious'].includes(product.status) || (product.status === 'active' && material) || (product.status === 'pending' && material);
     if (resubmit) {
       const record = await this.sellerRecord(seller);
       const decision = await this.moderationDecision(record, {
-        categoryId: (set.categoryId as string) ?? product.categoryId,
-        price: (set.price as number) ?? product.price,
+        categoryId: input.categoryId ?? product.categoryId,
+        price: priceChanged ? input.price! : product.price,
       });
       set.status = decision.status;
-      set['moderation.flags'] = decision.flags;
-      set['moderation.note'] = undefined;
+      set.moderationFlags = decision.flags;
+      set.moderationNote = null;
       if (decision.status === 'active' && !product.publishedAt) set.publishedAt = new Date();
     }
 
-    const updated = await this.products.findByIdAndUpdate(product._id, { $set: set }, { returnDocument: 'after', runValidators: true }).lean<Lean<Product>>();
-    this.afterChange(updated!);
-    this.flagIfSuspicious(updated!);
-    if (product.stock <= 0 && updated!.stock > 0 && updated!.status === 'active') {
-      this.events.publish<ProductRestocked>(PRODUCT_EVENTS.restocked, { productId: String(product._id), title: updated!.title });
+    const updated = (await this.patch(product.id, set))!;
+    await this.afterChange(updated);
+    if (updated.categoryId !== product.categoryId) await this.cache.delete(medianKey(product.categoryId));
+    this.flagIfSuspicious(updated);
+    if (product.stock <= 0 && updated.stock > 0 && updated.status === 'active') {
+      this.events.publish<ProductRestocked>(PRODUCT_EVENTS.restocked, { productId: product.id, title: updated.title });
     }
-    if (set.status && set.status !== product.status) {
+    if (updated.status !== product.status) {
       this.events.publish<ProductStatusChanged>(PRODUCT_EVENTS.statusChanged, {
-        productId: String(product._id),
+        productId: product.id,
         sellerId: seller.id,
-        title: updated!.title,
+        title: updated.title,
         from: product.status,
-        to: updated!.status,
+        to: updated.status,
         by: 'system',
       });
     }
-    return toSellerProduct(updated!, await this.categories.names());
+    return toSellerProduct(updated, await this.categories.names());
   }
 
   /** Publish (active), unpublish (inactive) or move back to draft. */
   async setSellerStatus(seller: AuthUser, id: string, status: 'active' | 'draft' | 'inactive'): Promise<SellerProductView> {
     const product = await this.ownProduct(seller, id);
     let next: ListingStatus = status;
-    let flags = product.moderation?.flags ?? [];
+    let flags = product.moderation.flags;
     if (status === 'active') {
       if (['active', 'pending', 'suspicious'].includes(product.status)) return toSellerProduct(product, await this.categories.names());
-      if (product.status === 'rejected' && product.moderation?.reviewedBy) {
-        // A rejected listing goes back to review rather than straight live.
-      }
       if (!seller.emailVerified) throw Errors.forbidden('Verify your email address before publishing.', 'EMAIL_NOT_VERIFIED');
       if (!product.images.length) throw Errors.badRequest('Add at least one photo before publishing.', 'IMAGES_REQUIRED');
       await this.assertListable({ categoryId: product.categoryId, paymentMethod: product.paymentMethod });
       const record = await this.sellerRecord(seller);
-      await this.assertUnderListingLimit(record, product._id);
+      await this.assertUnderListingLimit(record, product.id);
       const decision = await this.moderationDecision(record, product);
       next = decision.status;
       flags = decision.flags;
@@ -525,22 +563,20 @@ export class ProductsService {
     if (status === 'inactive' && product.status === 'draft') {
       throw Errors.conflict('A draft is not live; publish it or keep it as a draft.', 'INVALID_STATUS_CHANGE');
     }
-    const updated = await this.products
-      .findByIdAndUpdate(
-        product._id,
-        { $set: { status: next, 'moderation.flags': flags, ...(next === 'active' && !product.publishedAt ? { publishedAt: new Date() } : {}) } },
-        { returnDocument: 'after' },
-      )
-      .lean<Lean<Product>>();
-    this.afterChange(updated!);
-    this.flagIfSuspicious(updated!);
-    return toSellerProduct(updated!, await this.categories.names());
+    const updated = (await this.patch(product.id, {
+      status: next,
+      moderationFlags: flags,
+      ...(next === 'active' && !product.publishedAt ? { publishedAt: new Date() } : {}),
+    }))!;
+    await this.afterChange(updated);
+    this.flagIfSuspicious(updated);
+    return toSellerProduct(updated, await this.categories.names());
   }
 
   async remove(seller: AuthUser, id: string): Promise<{ deleted: true }> {
     const product = await this.ownProduct(seller, id);
-    await this.products.updateOne({ _id: product._id }, { $set: { deletedAt: new Date(), status: 'inactive' } });
-    this.afterChange(product);
+    await this.patch(product.id, { deletedAt: new Date(), status: 'inactive' });
+    await this.afterChange(product);
     return { deleted: true };
   }
 
@@ -558,41 +594,39 @@ export class ProductsService {
     maxStock?: number;
     sellerId?: string;
   }): Promise<Page<AdminListingView>> {
-    const filter: Record<string, unknown> = { deletedAt: null };
-    if (query.statuses?.length) filter.status = { $in: query.statuses };
-    if (query.categories?.length) filter.categoryId = { $in: query.categories };
-    if (query.sellerId && Types.ObjectId.isValid(query.sellerId)) filter.sellerId = new Types.ObjectId(query.sellerId);
-    const price: Record<string, number> = {};
-    if (query.minPrice !== undefined) price.$gte = query.minPrice;
-    if (query.maxPrice !== undefined) price.$lte = query.maxPrice;
-    if (Object.keys(price).length) filter.price = price;
-    const stock: Record<string, number> = {};
-    if (query.minStock !== undefined) stock.$gte = query.minStock;
-    if (query.maxStock !== undefined) stock.$lte = query.maxStock;
-    if (Object.keys(stock).length) filter.stock = stock;
-    if (query.search?.trim()) {
-      const pattern = containsRegex(query.search);
-      const sellers = await this.users
-        .find({ $or: [{ firstName: pattern }, { lastName: pattern }, { email: pattern }, { 'seller.storeName': pattern }] })
-        .select('_id')
-        .limit(200)
-        .lean();
-      filter.$or = [{ title: pattern }, { sellerId: { $in: sellers.map((row) => row._id) } }];
-    }
-    const total = await this.products.countDocuments(filter);
+    const search = query.search?.trim();
+    const where = and(
+      isNull(products.deletedAt),
+      query.statuses?.length ? inArray(products.status, query.statuses) : undefined,
+      query.categories?.length ? inArray(products.categoryId, query.categories) : undefined,
+      query.sellerId && isUuid(query.sellerId) ? eq(products.sellerId, query.sellerId) : undefined,
+      query.minPrice !== undefined ? gte(products.price, query.minPrice) : undefined,
+      query.maxPrice !== undefined ? lte(products.price, query.maxPrice) : undefined,
+      query.minStock !== undefined ? gte(products.stock, query.minStock) : undefined,
+      query.maxStock !== undefined ? lte(products.stock, query.maxStock) : undefined,
+      search
+        ? or(
+            containsText(products.title, search),
+            inArray(
+              products.sellerId,
+              this.db
+                .select({ id: users.id })
+                .from(users)
+                .where(or(containsText(users.firstName, search), containsText(users.lastName, search), containsText(users.email, search), containsText(users.sellerStoreName, search))),
+            ),
+          )
+        : undefined,
+    );
+    const total = await this.countWhere(where);
     const window = pageWindow(total, query.page, query.limit ?? 7);
-    const rows = await this.products.find(filter).sort({ createdAt: -1, _id: -1 }).skip(window.skip).limit(window.size).lean<Lean<Product>[]>();
+    const rows = await this.select(where, [desc(products.createdAt), desc(products.id)], window.size, window.skip);
     return toPage(await this.adminViews(rows), total, window);
   }
 
-  private async adminViews(rows: Lean<Product>[]): Promise<AdminListingView[]> {
-    const sellerIds = [...new Set(rows.map((row) => String(row.sellerId)))];
-    const [sellers, names] = await Promise.all([
-      this.users.find({ _id: { $in: sellerIds } }).lean<Lean<User>[]>(),
-      this.categories.names(),
-    ]);
-    const byId = new Map(sellers.map((seller) => [String(seller._id), seller]));
-    return rows.map((row) => toAdminListing(row, byId.get(String(row.sellerId)) ?? null, names));
+  private async adminViews(rows: Product[]): Promise<AdminListingView[]> {
+    const [sellers, names] = await Promise.all([this.users.findByIds(rows.map((row) => row.sellerId)), this.categories.names()]);
+    const byId = new Map(sellers.map((seller) => [seller.id, seller]));
+    return rows.map((row) => toAdminListing(row, byId.get(row.sellerId) ?? null, names));
   }
 
   async adminGet(id: string): Promise<AdminListingView> {
@@ -607,23 +641,15 @@ export class ProductsService {
     if (!product) throw Errors.notFound('That item is no longer listed.', 'PRODUCT_NOT_FOUND');
     if (status === 'draft') throw Errors.badRequest('Only the seller can move a listing back to draft.', 'INVALID_STATUS_CHANGE');
     if (status === 'active' && !product.images.length) throw Errors.badRequest('A listing needs at least one photo to go live.', 'IMAGES_REQUIRED');
-    const updated = await this.products
-      .findByIdAndUpdate(
-        id,
-        {
-          $set: {
-            status,
-            'moderation.note': note,
-            'moderation.reviewedBy': staff.id,
-            'moderation.reviewedAt': new Date(),
-            ...(status === 'active' ? { 'moderation.flags': [] } : {}),
-            ...(status === 'active' && !product.publishedAt ? { publishedAt: new Date() } : {}),
-          },
-        },
-        { returnDocument: 'after' },
-      )
-      .lean<Lean<Product>>();
-    this.afterChange(updated!);
+    const updated = (await this.patch(id, {
+      status,
+      moderationNote: note ?? null,
+      moderationReviewedBy: staff.id,
+      moderationReviewedAt: new Date(),
+      ...(status === 'active' ? { moderationFlags: [] } : {}),
+      ...(status === 'active' && !product.publishedAt ? { publishedAt: new Date() } : {}),
+    }))!;
+    await this.afterChange(updated);
     const verb: Record<string, string> = {
       active: 'Approved a listing',
       suspicious: 'Flagged a listing for review',
@@ -635,7 +661,7 @@ export class ProductsService {
     if (product.status !== status) {
       this.events.publish<ProductStatusChanged>(PRODUCT_EVENTS.statusChanged, {
         productId: id,
-        sellerId: String(product.sellerId),
+        sellerId: product.sellerId,
         title: product.title,
         from: product.status,
         to: status,
@@ -643,13 +669,13 @@ export class ProductsService {
         by: 'staff',
       });
     }
-    return (await this.adminViews([updated!]))[0];
+    return (await this.adminViews([updated]))[0];
   }
 
   async setFeatured(staff: AuthStaff, id: string, featured: boolean): Promise<AdminListingView> {
-    const updated = await this.products.findOneAndUpdate({ _id: id, deletedAt: null }, { $set: { featured } }, { returnDocument: 'after' }).lean<Lean<Product>>();
+    const updated = isUuid(id) ? await this.patch(id, { featured }, isNull(products.deletedAt)) : null;
     if (!updated) throw Errors.notFound('That item is no longer listed.', 'PRODUCT_NOT_FOUND');
-    this.home.clear();
+    await this.cache.delete(HOME_KEY);
     await this.audit.record(staff, { action: featured ? 'Featured a listing' : 'Removed a listing from Featured', target: updated.title, targetType: 'listing', targetId: id });
     return (await this.adminViews([updated]))[0];
   }
@@ -657,36 +683,39 @@ export class ProductsService {
   async adminRemove(staff: AuthStaff, id: string): Promise<{ id: string }> {
     const product = await this.findById(id);
     if (!product) throw Errors.notFound('That item is no longer listed.', 'PRODUCT_NOT_FOUND');
-    await this.products.updateOne({ _id: id }, { $set: { deletedAt: new Date(), status: 'inactive', 'moderation.reviewedBy': staff.id, 'moderation.reviewedAt': new Date() } });
-    this.afterChange(product);
+    await this.patch(id, { deletedAt: new Date(), status: 'inactive', moderationReviewedBy: staff.id, moderationReviewedAt: new Date() });
+    await this.afterChange(product);
     await this.audit.record(staff, { action: 'Deleted a listing', target: product.title, targetType: 'listing', targetId: id });
     return { id };
   }
 
   /** The console's own store, which official and admin listings are published under. */
-  async officialStore(): Promise<Lean<User>> {
-    const existing = await this.users.findOne({ email: OFFICIAL_STORE_EMAIL }).lean<Lean<User>>();
+  async officialStore(): Promise<User> {
+    const existing = await this.users.findByEmail(OFFICIAL_STORE_EMAIL);
     if (existing) return existing;
     try {
-      await this.users.create({
+      await this.db.insert(users).values({
         firstName: 'DOOAA',
         lastName: 'Official Store',
         email: OFFICIAL_STORE_EMAIL,
         phone: '',
         // Not a usable password: the store account never signs in.
-        passwordHash: `!disabled-${new Types.ObjectId().toHexString()}`,
+        passwordHash: '!disabled',
         role: 'seller',
         emailVerified: true,
         identity: 'verified',
         verificationLevel: 'high-value',
         location: 'Lagos',
         region: 'Lagos',
-        seller: { storeName: 'DOOAA Official Store', dispatchDays: 2, responseLabel: 'Typically responds within an hour', deliveryLabel: 'Nationwide Delivery (1-3 business days within Lagos)' },
+        sellerStoreName: 'DOOAA Official Store',
+        sellerDispatchDays: 2,
+        sellerResponseLabel: 'Typically responds within an hour',
+        sellerDeliveryLabel: 'Nationwide Delivery (1-3 business days within Lagos)',
       });
     } catch (error) {
-      if ((error as { code?: number }).code !== 11000) throw error;
+      if (!isUniqueViolation(error, 'users_email_key')) throw error;
     }
-    return (await this.users.findOne({ email: OFFICIAL_STORE_EMAIL }).lean<Lean<User>>())!;
+    return (await this.users.findByEmail(OFFICIAL_STORE_EMAIL))!;
   }
 
   /** "Add New Product" in the console. Staff listings skip the seller moderation queue. */
@@ -701,107 +730,140 @@ export class ProductsService {
     const status = input.status ?? 'active';
     if ((status === 'active' || status === 'pending') && !images.length) throw Errors.badRequest('Add at least one photo before publishing.', 'IMAGES_REQUIRED');
     const store = await this.officialStore();
-    const created = await this.products.create({
-      sellerId: store._id,
-      title: input.title,
-      description: input.description,
-      summary: excerpt(input.description, 120),
-      highlights: input.highlights ?? [],
-      categoryId: input.categoryId,
-      brand: input.brand,
-      condition: input.condition ?? 'new',
-      price: input.price,
-      pricing: input.pricing,
-      paymentMethod: input.paymentMethod,
-      delivery: input.delivery,
-      stock: input.stock,
-      location: input.location ?? 'Lagos',
-      images,
-      videos: await this.videoEntries(videos),
-      status,
-      listedAs: input.listedAs ?? 'official',
-      sellerVerified: true,
-      moderation: { flags: [], reviewedBy: staff.id, reviewedAt: new Date() },
-      publishedAt: status === 'active' ? new Date() : undefined,
-    });
-    const product = created.toObject() as Lean<Product>;
-    this.afterChange(product);
-    await this.audit.record(staff, { action: 'Created a listing', target: product.title, targetType: 'listing', targetId: String(product._id) });
+    const now = new Date();
+    const [row] = await this.db
+      .insert(products)
+      .values({
+        sellerId: store.id,
+        title: input.title,
+        description: input.description,
+        summary: excerpt(input.description, 120),
+        highlights: input.highlights ?? [],
+        categoryId: input.categoryId,
+        brand: input.brand ?? null,
+        condition: input.condition ?? 'new',
+        price: input.price,
+        pricing: input.pricing,
+        paymentMethod: input.paymentMethod,
+        delivery: input.delivery,
+        stock: input.stock,
+        location: input.location ?? 'Lagos',
+        images,
+        videos: await this.videoEntries(videos),
+        status,
+        listedAs: input.listedAs ?? 'official',
+        sellerVerified: true,
+        moderationFlags: [],
+        moderationReviewedBy: staff.id,
+        moderationReviewedAt: now,
+        publishedAt: status === 'active' ? now : null,
+      })
+      .returning(productColumns);
+    const product = toProduct(row);
+    await this.afterChange(product);
+    await this.audit.record(staff, { action: 'Created a listing', target: product.title, targetType: 'listing', targetId: product.id });
     return (await this.adminViews([product]))[0];
   }
 
   /* --- Hooks used by other modules ---------------------------------------------- */
 
-  /** Holds stock for a checkout. Null when there is not enough (or the listing went away). */
-  async reserveStock(productId: Types.ObjectId | string, quantity: number): Promise<Lean<Product> | null> {
-    const updated = await this.products
-      .findOneAndUpdate(
-        { _id: productId, status: 'active', deletedAt: null, stock: { $gte: quantity } },
-        { $inc: { stock: -quantity } },
-        { returnDocument: 'after' },
-      )
-      .lean<Lean<Product>>();
-    if (updated && updated.stock === 0) this.home.clear();
-    return updated;
+  /**
+   * Holds stock for a checkout, in one conditional statement. Null when there
+   * is not enough (or the listing went away). Pass the checkout's transaction
+   * so a failed checkout gives the stock back on rollback.
+   */
+  async reserveStock(productId: string, quantity: number, executor: Executor = this.db): Promise<Product | null> {
+    const [row] = await executor
+      .update(products)
+      .set({ stock: sql`${products.stock} - ${quantity}` })
+      .where(and(eq(products.id, productId), eq(products.status, 'active'), isNull(products.deletedAt), gte(products.stock, quantity)))
+      .returning(productColumns);
+    if (row && row.stock === 0) await this.cache.delete(HOME_KEY);
+    return row ? toProduct(row) : null;
   }
 
-  async releaseStock(productId: Types.ObjectId | string, quantity: number): Promise<void> {
-    const before = await this.products.findOneAndUpdate({ _id: productId }, { $inc: { stock: quantity } }, { returnDocument: 'before' }).lean<Lean<Product>>();
-    if (before && before.stock <= 0 && before.status === 'active' && !before.deletedAt) {
-      this.events.publish<ProductRestocked>(PRODUCT_EVENTS.restocked, { productId: String(before._id), title: before.title });
+  async releaseStock(productId: string, quantity: number): Promise<void> {
+    const [row] = await this.db
+      .update(products)
+      .set({ stock: sql`${products.stock} + ${quantity}` })
+      .where(eq(products.id, productId))
+      .returning({ id: products.id, title: products.title, stock: products.stock, status: products.status, deletedAt: products.deletedAt });
+    // Back from nothing: anyone waiting on a restock hears about it.
+    if (row && row.stock - quantity <= 0 && row.status === 'active' && !row.deletedAt) {
+      this.events.publish<ProductRestocked>(PRODUCT_EVENTS.restocked, { productId: row.id, title: row.title });
     }
   }
 
-  async recordSale(productId: Types.ObjectId | string, quantity: number, revenue: number, at: Date): Promise<void> {
-    await this.products.updateOne(
-      { _id: productId },
-      { $inc: { 'stats.unitsSold': quantity, 'stats.revenue': revenue }, $max: { 'stats.lastSaleAt': at } },
-    );
-    this.home.clear();
+  async recordSale(productId: string, quantity: number, revenue: number, at: Date): Promise<void> {
+    await this.db
+      .update(products)
+      .set({
+        statsUnitsSold: sql`${products.statsUnitsSold} + ${quantity}`,
+        statsRevenue: sql`${products.statsRevenue} + ${revenue}`,
+        statsLastSaleAt: sql`greatest(${products.statsLastSaleAt}, ${at.toISOString()}::timestamptz)`,
+      })
+      .where(eq(products.id, productId));
+    await this.cache.delete(HOME_KEY);
   }
 
-  async reverseSale(productId: Types.ObjectId | string, quantity: number, revenue: number): Promise<void> {
-    await this.products.updateOne({ _id: productId }, { $inc: { 'stats.unitsSold': -quantity, 'stats.revenue': -revenue } });
+  async reverseSale(productId: string, quantity: number, revenue: number): Promise<void> {
+    await this.db
+      .update(products)
+      .set({ statsUnitsSold: sql`${products.statsUnitsSold} - ${quantity}`, statsRevenue: sql`${products.statsRevenue} - ${revenue}` })
+      .where(eq(products.id, productId));
   }
 
-  async incrementInquiries(productId: Types.ObjectId | string): Promise<void> {
-    await this.products.updateOne({ _id: productId }, { $inc: { 'stats.inquiries': 1 } });
+  async incrementInquiries(productId: string): Promise<void> {
+    await this.db
+      .update(products)
+      .set({ statsInquiries: sql`${products.statsInquiries} + 1` })
+      .where(eq(products.id, productId));
   }
 
-  async setRating(productId: Types.ObjectId | string, average: number, count: number): Promise<void> {
-    await this.products.updateOne({ _id: productId }, { $set: { 'stats.ratingAverage': average, 'stats.ratingCount': count } });
+  async setRating(productId: string, average: number, total: number): Promise<void> {
+    await this.db.update(products).set({ statsRatingAverage: average, statsRatingCount: total }).where(eq(products.id, productId));
   }
 
-  async adjustWishlistCount(productId: Types.ObjectId | string, delta: number): Promise<void> {
-    await this.products.updateOne({ _id: productId }, { $inc: { 'stats.wishlists': delta } });
+  async adjustWishlistCount(productId: string, delta: number): Promise<void> {
+    await this.db
+      .update(products)
+      .set({ statsWishlists: sql`${products.statsWishlists} + ${delta}` })
+      .where(eq(products.id, productId));
   }
 
   /** Keeps the "Verified sellers" facet true to the seller's identity check. */
   async syncSellerVerified(sellerId: string, verified: boolean): Promise<void> {
-    await this.products.updateMany({ sellerId: new Types.ObjectId(sellerId) }, { $set: { sellerVerified: verified } });
-    this.home.clear();
+    await this.db.update(products).set({ sellerVerified: verified }).where(eq(products.sellerId, sellerId));
+    await this.cache.delete(HOME_KEY);
   }
 
   /** Takes a banned or suspended seller's listings off the storefront, remembering which to bring back. */
   async restrictSeller(sellerId: string): Promise<number> {
-    const result = await this.products.updateMany(
-      { sellerId: new Types.ObjectId(sellerId), status: 'active', deletedAt: null },
-      { $set: { status: 'inactive' }, $addToSet: { 'moderation.flags': 'seller-restricted' } },
-    );
-    this.categories.invalidateCounts();
-    this.home.clear();
+    const changed = await this.db
+      .update(products)
+      .set({ status: 'inactive', moderationFlags: sql`array_append(array_remove(${products.moderationFlags}, 'seller-restricted'), 'seller-restricted')` })
+      .where(and(eq(products.sellerId, sellerId), eq(products.status, 'active'), isNull(products.deletedAt)))
+      .returning({ id: products.id });
+    await Promise.all([this.categories.invalidateCounts(), this.cache.delete(HOME_KEY)]);
     await this.recountActiveListings(sellerId);
-    return result.modifiedCount;
+    return changed.length;
   }
 
   async unrestrictSeller(sellerId: string): Promise<number> {
-    const result = await this.products.updateMany(
-      { sellerId: new Types.ObjectId(sellerId), status: 'inactive', 'moderation.flags': 'seller-restricted', deletedAt: null },
-      { $set: { status: 'active' }, $pull: { 'moderation.flags': 'seller-restricted' } },
-    );
-    this.categories.invalidateCounts();
-    this.home.clear();
+    const changed = await this.db
+      .update(products)
+      .set({ status: 'active', moderationFlags: sql`array_remove(${products.moderationFlags}, 'seller-restricted')` })
+      .where(
+        and(
+          eq(products.sellerId, sellerId),
+          eq(products.status, 'inactive'),
+          sql`'seller-restricted' = any(${products.moderationFlags})`,
+          isNull(products.deletedAt),
+        ),
+      )
+      .returning({ id: products.id });
+    await Promise.all([this.categories.invalidateCounts(), this.cache.delete(HOME_KEY)]);
     await this.recountActiveListings(sellerId);
-    return result.modifiedCount;
+    return changed.length;
   }
 }

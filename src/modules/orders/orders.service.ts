@@ -1,28 +1,29 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, QueryFilter, Types, UpdateQuery } from 'mongoose';
+import { and, count, desc, eq, exists, gte, inArray, isNotNull, isNull, lt, lte, ne, or, sql, sum, type SQL } from 'drizzle-orm';
+import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
 import { Errors } from '../../common/api/app-error';
 import type { AuthUser } from '../../common/auth/principal';
+import type { EscrowPhase, OrderActor, OrderKind, OrderStatus, OtpChannel, Settlement } from '../../common/domain';
 import { EventBus } from '../../common/events/event-bus';
-import type { EscrowPhase, OrderKind, OrderStatus, Settlement } from '../../common/domain';
 import { addDays, addHours, DAY } from '../../common/util/dates';
 import { escrowReference } from '../../common/util/ids';
-import type { Lean } from '../../common/util/mongo';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
-import { containsRegex } from '../../common/util/text';
+import { isUuid } from '../../common/util/uuid';
+import { InjectDb, type Database } from '../../database/database';
+import { orderItems, orders, products, type EscrowHistoryEntry, type TimelineEntry } from '../../database/schema';
+import { appendJson, containsText } from '../../database/sql';
 import { OtpService, type IssuedOtp } from '../otp/otp.service';
-import type { OtpChannel } from '../otp/otp.schema';
 import { PaymentsService } from '../payments/payments.service';
 import { ProductsService } from '../products/products.service';
 import { SettingsService } from '../settings/settings.service';
 import { ACCOUNT_EVENTS, type AccountClosing } from '../users/account.events';
-import { User } from '../users/schemas/user.schema';
+import type { User } from '../users/user.model';
 import { UsersService } from '../users/users.service';
 import { WalletService } from '../wallet/wallet.service';
 import type { EscrowState } from './dto/orders.dto';
+import { toOrder, type Order, type OrderRow } from './order.model';
 import { HELD_PHASES, phasesLeadingTo } from './order-state';
 import { toBuyerOrderView, toSellerOrderView, type BuyerOrderView, type SellerOrderView } from './order.presenter';
-import { Order, type TimelineEntry } from './schemas/order.schema';
 
 export const ORDER_EVENTS = { updated: 'order.updated' } as const;
 
@@ -42,18 +43,20 @@ export type OrderEventName =
   | 'reversed';
 
 export type OrderUpdated = {
-  order: Lean<Order>;
+  order: Order;
   event: OrderEventName;
-  actor: 'buyer' | 'seller' | 'system' | 'staff';
+  actor: OrderActor;
   note?: string;
 };
 
-export type Actor = { kind: 'buyer' | 'seller' | 'system' | 'staff'; id?: string; name: string };
+export type Actor = { kind: OrderActor; id?: string; name: string };
+
+type OrderPatch = PgUpdateSetSource<typeof orders>;
 
 const ACTIVE_FOR_CLOSURE: OrderStatus[] = ['pending', 'confirmed', 'shipped'];
 
 function entry(code: string, label: string, description: string, at = new Date()): TimelineEntry {
-  return { code, label, description, at };
+  return { code, label, description, at: at.toISOString() };
 }
 
 type OrderListQuery = { status?: OrderStatus; q?: string; kind?: OrderKind; escrow?: EscrowState };
@@ -70,9 +73,8 @@ export class OrdersService implements OnModuleInit {
   private readonly logger = new Logger(OrdersService.name);
 
   constructor(
-    @InjectModel(Order.name) private readonly orders: Model<Order>,
-    @InjectModel(User.name) private readonly users: Model<User>,
-    private readonly userService: UsersService,
+    @InjectDb() private readonly db: Database,
+    private readonly users: UsersService,
     private readonly products: ProductsService,
     private readonly payments: PaymentsService,
     private readonly wallet: WalletService,
@@ -85,84 +87,123 @@ export class OrdersService implements OnModuleInit {
     this.events.on<AccountClosing>(ACCOUNT_EVENTS.closing, (event) => this.vetoClosure(event.userId));
   }
 
-  get model(): Model<Order> {
-    return this.orders;
-  }
-
   private async deliveryEstimateDays(): Promise<number> {
     return (await this.settings.section('commerce')).deliveryEstimateDays;
   }
 
+  /* --- Loading ------------------------------------------------------------------ */
+
+  /** Orders with their items, in the order the rows were given. */
+  async withItems(rows: OrderRow[]): Promise<Order[]> {
+    if (!rows.length) return [];
+    const items = await this.db
+      .select()
+      .from(orderItems)
+      .where(
+        inArray(
+          orderItems.orderId,
+          rows.map((row) => row.id),
+        ),
+      );
+    const byOrder = new Map<string, (typeof items)[number][]>();
+    for (const item of items) byOrder.set(item.orderId, [...(byOrder.get(item.orderId) ?? []), item]);
+    return rows.map((row) => toOrder(row, byOrder.get(row.id) ?? []));
+  }
+
+  private async one(where: SQL | undefined): Promise<Order | null> {
+    const [row] = await this.db.select().from(orders).where(where).limit(1);
+    return row ? (await this.withItems([row]))[0] : null;
+  }
+
+  async findById(id: string): Promise<Order | null> {
+    return isUuid(id) ? this.one(eq(orders.id, id)) : null;
+  }
+
+  async findMany(ids: string[]): Promise<Order[]> {
+    const valid = ids.filter(isUuid);
+    if (!valid.length) return [];
+    return this.withItems(await this.db.select().from(orders).where(inArray(orders.id, valid)).orderBy(orders.createdAt));
+  }
+
   /* --- Lookups ------------------------------------------------------------------ */
 
-  /** Routes accept the Mongo id or the "123-47128390" reference (with or without "#"). */
-  private idFilter(idOrReference: string): QueryFilter<Order> {
+  /** Routes accept the order id or the "123-47128390" reference (with or without "#"). */
+  private idFilter(idOrReference: string): SQL {
     const reference = idOrReference.replace(/^#/, '');
-    return Types.ObjectId.isValid(reference) && /^[a-f\d]{24}$/i.test(reference) ? { _id: new Types.ObjectId(reference) } : { reference };
+    return isUuid(reference) ? eq(orders.id, reference) : eq(orders.reference, reference);
   }
 
-  async findById(id: string | Types.ObjectId): Promise<Lean<Order> | null> {
-    return this.orders.findById(id).lean<Lean<Order>>();
-  }
-
-  private async forBuyer(user: AuthUser, idOrReference: string): Promise<Lean<Order>> {
-    const order = await this.orders.findOne({ ...this.idFilter(idOrReference), buyerId: new Types.ObjectId(user.id) }).lean<Lean<Order>>();
+  private async forBuyer(user: AuthUser, idOrReference: string): Promise<Order> {
+    const order = await this.one(and(this.idFilter(idOrReference), eq(orders.buyerId, user.id)));
     if (!order) throw Errors.notFound("We couldn't find that order.", 'ORDER_NOT_FOUND');
     return order;
   }
 
-  private async forSeller(user: AuthUser, idOrReference: string): Promise<Lean<Order>> {
-    const order = await this.orders
-      .findOne({ ...this.idFilter(idOrReference), sellerId: new Types.ObjectId(user.id), status: { $ne: 'awaiting-payment' } })
-      .lean<Lean<Order>>();
+  private async forSeller(user: AuthUser, idOrReference: string): Promise<Order> {
+    const order = await this.one(and(this.idFilter(idOrReference), eq(orders.sellerId, user.id), ne(orders.status, 'awaiting-payment')));
     if (!order) throw Errors.notFound("We couldn't find that order.", 'ORDER_NOT_FOUND');
     return order;
   }
 
-  private async people(ids: Types.ObjectId[]): Promise<Map<string, Lean<User>>> {
-    const rows = await this.users.find({ _id: { $in: ids } }).lean<Lean<User>[]>();
-    return new Map(rows.map((row) => [String(row._id), row]));
+  private async people(ids: string[]): Promise<Map<string, User>> {
+    const rows = await this.users.findByIds(ids);
+    return new Map(rows.map((row) => [row.id, row]));
   }
 
-  async buyerViews(rows: Lean<Order>[]): Promise<BuyerOrderView[]> {
+  async buyerViews(rows: Order[]): Promise<BuyerOrderView[]> {
     const [people, days] = await Promise.all([this.people(rows.map((row) => row.sellerId)), this.deliveryEstimateDays()]);
-    return rows.map((row) => toBuyerOrderView(row, people.get(String(row.sellerId)) ?? null, days));
+    return rows.map((row) => toBuyerOrderView(row, people.get(row.sellerId) ?? null, days));
   }
 
-  async sellerViews(rows: Lean<Order>[]): Promise<SellerOrderView[]> {
+  async sellerViews(rows: Order[]): Promise<SellerOrderView[]> {
     const [people, days] = await Promise.all([this.people(rows.flatMap((row) => [row.buyerId, row.sellerId])), this.deliveryEstimateDays()]);
-    return rows.map((row) => toSellerOrderView(row, people.get(String(row.buyerId)) ?? null, people.get(String(row.sellerId)) ?? null, days));
+    return rows.map((row) => toSellerOrderView(row, people.get(row.buyerId) ?? null, people.get(row.sellerId) ?? null, days));
   }
 
   /* --- Reads ----------------------------------------------------------------------- */
 
-  private listFilter(owner: 'buyerId' | 'sellerId', userId: string, query: OrderListQuery): QueryFilter<Order> {
-    const filter: Record<string, unknown> = { [owner]: new Types.ObjectId(userId) };
-    filter.status = query.status ?? { $ne: 'awaiting-payment' };
-    if (query.kind) filter.kind = query.kind;
-    if (query.escrow) filter['escrow.phase'] = { $in: ESCROW_STATE_PHASES[query.escrow] };
-    if (query.q?.trim()) {
-      const pattern = containsRegex(query.q.replace(/^#/, ''));
-      filter.$or = [{ reference: pattern }, { 'items.title': pattern }];
+  private listFilter(owner: 'buyer' | 'seller', userId: string, query: OrderListQuery): SQL {
+    const conditions: SQL[] = [eq(owner === 'buyer' ? orders.buyerId : orders.sellerId, userId)];
+    conditions.push(query.status ? eq(orders.status, query.status) : ne(orders.status, 'awaiting-payment'));
+    if (query.kind) conditions.push(eq(orders.kind, query.kind));
+    if (query.escrow) conditions.push(inArray(orders.escrowPhase, ESCROW_STATE_PHASES[query.escrow]));
+    const term = query.q?.trim().replace(/^#/, '');
+    if (term) {
+      conditions.push(
+        or(
+          containsText(orders.reference, term),
+          exists(
+            this.db
+              .select({ one: sql`1` })
+              .from(orderItems)
+              .where(and(eq(orderItems.orderId, orders.id), containsText(orderItems.title, term))),
+          ),
+        )!,
+      );
     }
-    return filter as QueryFilter<Order>;
+    return and(...conditions)!;
+  }
+
+  private async pageOf(where: SQL, page: number | undefined, limit: number): Promise<{ rows: Order[]; total: number; window: ReturnType<typeof pageWindow> }> {
+    const [{ total }] = await this.db.select({ total: count() }).from(orders).where(where);
+    const window = pageWindow(total, page, limit);
+    const rows = await this.db.select().from(orders).where(where).orderBy(desc(orders.createdAt), desc(orders.id)).offset(window.skip).limit(window.size);
+    return { rows: await this.withItems(rows), total, window };
   }
 
   async list(user: AuthUser, query: OrderListQuery & { page?: number; limit?: number }): Promise<Page<BuyerOrderView>> {
-    const filter = this.listFilter('buyerId', user.id, query);
-    const total = await this.orders.countDocuments(filter);
-    const window = pageWindow(total, query.page, query.limit ?? 10);
-    const rows = await this.orders.find(filter).sort({ createdAt: -1, _id: -1 }).skip(window.skip).limit(window.size).lean<Lean<Order>[]>();
+    const { rows, total, window } = await this.pageOf(this.listFilter('buyer', user.id, query), query.page, query.limit ?? 10);
     return toPage(await this.buyerViews(rows), total, window);
   }
 
   async recent(user: AuthUser, limit = 4): Promise<BuyerOrderView[]> {
-    const rows = await this.orders
-      .find({ buyerId: new Types.ObjectId(user.id), status: { $ne: 'awaiting-payment' } })
-      .sort({ createdAt: -1 })
-      .limit(Math.min(limit, 20))
-      .lean<Lean<Order>[]>();
-    return this.buyerViews(rows);
+    const rows = await this.db
+      .select()
+      .from(orders)
+      .where(and(eq(orders.buyerId, user.id), ne(orders.status, 'awaiting-payment')))
+      .orderBy(desc(orders.createdAt))
+      .limit(Math.min(limit, 20));
+    return this.buyerViews(await this.withItems(rows));
   }
 
   async get(user: AuthUser, idOrReference: string): Promise<BuyerOrderView> {
@@ -170,24 +211,22 @@ export class OrdersService implements OnModuleInit {
   }
 
   async countForBuyer(userId: string): Promise<number> {
-    return this.orders.countDocuments({ buyerId: new Types.ObjectId(userId), status: { $ne: 'awaiting-payment' } });
+    return this.countOrders(and(eq(orders.buyerId, userId), ne(orders.status, 'awaiting-payment')));
   }
 
   async sellerList(user: AuthUser, query: OrderListQuery & { page?: number; limit?: number }): Promise<Page<SellerOrderView>> {
-    const filter = this.listFilter('sellerId', user.id, query);
-    const total = await this.orders.countDocuments(filter);
-    const window = pageWindow(total, query.page, query.limit ?? 10);
-    const rows = await this.orders.find(filter).sort({ createdAt: -1, _id: -1 }).skip(window.skip).limit(window.size).lean<Lean<Order>[]>();
+    const { rows, total, window } = await this.pageOf(this.listFilter('seller', user.id, query), query.page, query.limit ?? 10);
     return toPage(await this.sellerViews(rows), total, window);
   }
 
   async sellerRecent(user: AuthUser, limit = 6): Promise<SellerOrderView[]> {
-    const rows = await this.orders
-      .find({ sellerId: new Types.ObjectId(user.id), status: { $ne: 'awaiting-payment' } })
-      .sort({ createdAt: -1 })
-      .limit(Math.min(limit, 20))
-      .lean<Lean<Order>[]>();
-    return this.sellerViews(rows);
+    const rows = await this.db
+      .select()
+      .from(orders)
+      .where(and(eq(orders.sellerId, user.id), ne(orders.status, 'awaiting-payment')))
+      .orderBy(desc(orders.createdAt))
+      .limit(Math.min(limit, 20));
+    return this.sellerViews(await this.withItems(rows));
   }
 
   async sellerGet(user: AuthUser, idOrReference: string): Promise<SellerOrderView> {
@@ -199,25 +238,39 @@ export class OrdersService implements OnModuleInit {
    * was released to the seller and what went back to buyers, over every sale.
    */
   async sellerEscrowSummary(user: AuthUser): Promise<{ held: number; released: number; refunded: number; orders: number }> {
-    const rows = await this.orders.aggregate<{ _id: EscrowPhase; total: number; count: number }>([
-      { $match: { sellerId: new Types.ObjectId(user.id), 'escrow.phase': { $exists: true, $ne: null } } },
-      { $group: { _id: '$escrow.phase', total: { $sum: '$total' }, count: { $sum: 1 } } },
-    ]);
-    const sum = (state: EscrowState) =>
-      Math.round(rows.filter((row) => ESCROW_STATE_PHASES[state].includes(row._id)).reduce((total, row) => total + row.total, 0) * 100) / 100;
-    return { held: sum('held'), released: sum('released'), refunded: sum('refunded'), orders: rows.reduce((count, row) => count + row.count, 0) };
+    const rows = await this.db
+      .select({ phase: orders.escrowPhase, total: sum(orders.total).mapWith(Number), count: count() })
+      .from(orders)
+      .where(and(eq(orders.sellerId, user.id), isNotNull(orders.escrowPhase)))
+      .groupBy(orders.escrowPhase);
+    const total = (state: EscrowState) =>
+      Math.round(rows.filter((row) => row.phase && ESCROW_STATE_PHASES[state].includes(row.phase)).reduce((running, row) => running + row.total, 0) * 100) / 100;
+    return { held: total('held'), released: total('released'), refunded: total('refunded'), orders: rows.reduce((running, row) => running + row.count, 0) };
   }
 
   /* --- The atomic step every transition goes through --------------------------------- */
 
   /**
    * Applies an update only if the order is still where the caller thinks it
-   * is. Two people pressing buttons at once cannot both win.
+   * is, in one statement. Two people pressing buttons at once cannot both win.
    */
-  private async transition(filter: QueryFilter<Order>, update: UpdateQuery<Order>, verb: string): Promise<Lean<Order>> {
-    const updated = await this.orders.findOneAndUpdate(filter, update, { returnDocument: 'after' }).lean<Lean<Order>>();
-    if (updated) return updated;
-    const current = await this.orders.findOne({ _id: (filter as { _id?: unknown })._id }).lean<Lean<Order>>();
+  private async transition(
+    id: string,
+    condition: SQL | undefined,
+    set: OrderPatch,
+    append: { timeline?: TimelineEntry[]; history?: EscrowHistoryEntry[] },
+    verb: string,
+  ): Promise<Order> {
+    const patch: OrderPatch = { ...set };
+    if (append.timeline?.length) patch.timeline = appendJson(orders.timeline, append.timeline);
+    if (append.history?.length) patch.escrowHistory = appendJson(orders.escrowHistory, append.history);
+    const [row] = await this.db
+      .update(orders)
+      .set(patch)
+      .where(and(eq(orders.id, id), condition))
+      .returning();
+    if (row) return (await this.withItems([row]))[0];
+    const current = await this.findById(id);
     if (!current) throw Errors.notFound("We couldn't find that order.", 'ORDER_NOT_FOUND');
     throw Errors.conflict(`This order is ${current.status.replace('-', ' ')} and cannot be ${verb} now.`, 'ORDER_STATE_CHANGED', {
       status: current.status,
@@ -225,62 +278,56 @@ export class OrdersService implements OnModuleInit {
     });
   }
 
-  private announce(order: Lean<Order>, event: OrderEventName, actor: OrderUpdated['actor'], note?: string): void {
+  private announce(order: Order, event: OrderEventName, actor: OrderActor, note?: string): void {
     this.events.publish<OrderUpdated>(ORDER_EVENTS.updated, { order, event, actor, note });
   }
 
-  private historyEntry(action: string, by: Actor, note?: string) {
-    return { action, by: by.id ? `${by.kind}:${by.id}` : by.kind, at: new Date(), ...(note ? { note } : {}) };
+  private historyEntry(action: string, by: Actor, note?: string): EscrowHistoryEntry {
+    return { action, by: by.id ? `${by.kind}:${by.id}` : by.kind, at: new Date().toISOString(), ...(note ? { note } : {}) };
   }
 
   /* --- Payment outcome --------------------------------------------------------------- */
 
   /** The provider confirmed the charge: every order it paid for is funded and handed to its seller. */
-  async fund(orderIds: Types.ObjectId[], payment: { reference: string; provider: string; paidAt?: Date; card?: { brand?: string; last4?: string }; channel?: string }): Promise<Lean<Order>[]> {
+  async fund(
+    orderIds: string[],
+    payment: { provider: string; paidAt?: Date | null; card?: { brand?: string | null; last4?: string | null } | null; channel?: string | null },
+  ): Promise<Order[]> {
     const commerce = await this.settings.section('commerce');
-    const funded: Lean<Order>[] = [];
+    const funded: Order[] = [];
     for (const orderId of orderIds) {
       const now = new Date();
-      const order = await this.orders
-        .findOneAndUpdate(
-          { _id: orderId, status: 'awaiting-payment' },
-          {
-            $set: {
-              status: 'pending',
-              'payment.status': 'paid',
-              'payment.paidAt': payment.paidAt ?? now,
-              'payment.brand': payment.card?.brand,
-              'payment.last4': payment.card?.last4,
-              'payment.channel': payment.channel,
-              shipBy: addHours(now, commerce.shipWithinHours),
-              escrow: {
-                reference: escrowReference(),
-                phase: 'funded',
-                status: 'pending',
-                settlement: null,
-                phaseBeforeDispute: null,
-                fundedAt: now,
-                history: [{ action: 'funded', by: payment.provider, at: now }],
-              },
-            },
-            $unset: { expiresAt: 1 },
-            $push: {
-              timeline: {
-                $each: [
-                  entry('placed', 'Order placed', 'We received your order.', now),
-                  entry('funded', 'Payment secured in escrow', 'Your payment is held safely until the item is delivered.', now),
-                ],
-              },
-            },
-          },
-          { returnDocument: 'after' },
-        )
-        .lean<Lean<Order>>();
-      if (!order) continue; // Already funded (webhook and verify both arrived).
+      const [row] = await this.db
+        .update(orders)
+        .set({
+          status: 'pending',
+          paymentStatus: 'paid',
+          paymentPaidAt: payment.paidAt ?? now,
+          paymentBrand: payment.card?.brand ?? null,
+          paymentLast4: payment.card?.last4 ?? null,
+          paymentChannel: payment.channel ?? null,
+          shipBy: addHours(now, commerce.shipWithinHours),
+          escrowReference: escrowReference(),
+          escrowPhase: 'funded',
+          escrowStatus: 'pending',
+          escrowSettlement: null,
+          escrowPhaseBeforeDispute: null,
+          escrowFundedAt: now,
+          escrowHistory: [{ action: 'funded', by: payment.provider, at: now.toISOString() }],
+          expiresAt: null,
+          timeline: appendJson(orders.timeline, [
+            entry('placed', 'Order placed', 'We received your order.', now),
+            entry('funded', 'Payment secured in escrow', 'Your payment is held safely until the item is delivered.', now),
+          ]),
+        })
+        .where(and(eq(orders.id, orderId), eq(orders.status, 'awaiting-payment')))
+        .returning();
+      if (!row) continue; // Already funded (webhook and verify both arrived).
+      const [order] = await this.withItems([row]);
       await this.wallet.onFunded(order);
       for (const item of order.items) await this.products.recordSale(item.productId, item.quantity, item.price * item.quantity, now);
-      await this.userService.incrementStats(order.buyerId, { purchases: 1 });
-      await this.userService.incrementStats(order.sellerId, { sales: 1 });
+      await this.users.incrementStats(order.buyerId, { purchases: 1 });
+      await this.users.incrementStats(order.sellerId, { sales: 1 });
       funded.push(order);
       this.announce(order, 'paid', 'system');
     }
@@ -288,36 +335,35 @@ export class OrdersService implements OnModuleInit {
   }
 
   /** The charge failed or lapsed: release the stock it was holding and close the orders. */
-  async abandon(orderIds: Types.ObjectId[], reason: string): Promise<void> {
+  async abandon(orderIds: string[], reason: string): Promise<void> {
     for (const orderId of orderIds) {
-      const order = await this.orders
-        .findOneAndUpdate(
-          { _id: orderId, status: 'awaiting-payment' },
-          {
-            $set: { status: 'cancelled', cancelledAt: new Date(), cancelledBy: 'system', cancellationReason: reason, 'payment.status': 'failed' },
-            $unset: { expiresAt: 1 },
-          },
-          { returnDocument: 'after' },
-        )
-        .lean<Lean<Order>>();
-      if (!order) continue;
-      for (const item of order.items) await this.products.releaseStock(item.productId, item.quantity);
+      const [row] = await this.db
+        .update(orders)
+        .set({ status: 'cancelled', cancelledAt: new Date(), cancelledBy: 'system', cancellationReason: reason, paymentStatus: 'failed', expiresAt: null })
+        .where(and(eq(orders.id, orderId), eq(orders.status, 'awaiting-payment')))
+        .returning({ id: orders.id });
+      if (!row) continue;
+      const items = await this.db.select().from(orderItems).where(eq(orderItems.orderId, orderId));
+      for (const item of items) await this.products.releaseStock(item.productId, item.quantity);
     }
   }
 
   /** The provider finished (or failed) a refund for an order. */
-  async applyRefundOutcome(orderId: Types.ObjectId, refund: { status: 'pending' | 'processed' | 'failed'; processedAt?: Date; failureReason?: string }): Promise<void> {
-    const order = await this.orders
-      .findOneAndUpdate(
-        { _id: orderId, 'refund.status': 'pending' },
-        { $set: { 'refund.status': refund.status, 'refund.processedAt': refund.processedAt ?? new Date(), 'refund.failureReason': refund.failureReason } },
-        { returnDocument: 'after' },
-      )
-      .lean<Lean<Order>>();
-    if (!order) return;
-    if (refund.status === 'processed') {
-      await this.orders.updateOne({ _id: orderId }, { $push: { timeline: entry('refunded', 'Refund completed', 'Your money is back on your original payment method.') } });
-    }
+  async applyRefundOutcome(orderId: string, refund: { status: 'pending' | 'processed' | 'failed'; processedAt?: Date | null; failureReason?: string | null }): Promise<void> {
+    const [row] = await this.db
+      .update(orders)
+      .set({
+        refundStatus: refund.status,
+        refundProcessedAt: refund.processedAt ?? new Date(),
+        refundFailureReason: refund.failureReason ?? null,
+        ...(refund.status === 'processed'
+          ? { timeline: appendJson(orders.timeline, [entry('refunded', 'Refund completed', 'Your money is back on your original payment method.')]) }
+          : {}),
+      })
+      .where(and(eq(orders.id, orderId), eq(orders.refundStatus, 'pending')))
+      .returning();
+    if (!row) return;
+    const [order] = await this.withItems([row]);
     this.announce(order, refund.status === 'processed' ? 'refund-processed' : 'refund-failed', 'system');
   }
 
@@ -328,56 +374,53 @@ export class OrdersService implements OnModuleInit {
    * records the request. A provider failure leaves the refund marked
    * failed for the console to retry; the order is cancelled either way.
    */
-  private async requestRefund(order: Lean<Order>, reason: string): Promise<void> {
-    const refund = await this.payments.refundOrder({ orderId: order._id, amount: order.total, reason });
-    await this.orders.updateOne(
-      { _id: order._id },
-      {
-        $set: {
-          refund: {
-            status: refund.status,
-            amount: refund.amount,
-            refundReference: refund.refundReference,
-            requestedAt: refund.requestedAt,
-            processedAt: refund.processedAt,
-            failureReason: refund.failureReason,
-          },
-        },
-      },
-    );
+  private async requestRefund(order: Order, reason: string): Promise<void> {
+    const refund = await this.payments.refundOrder({ orderId: order.id, amount: order.total, reason });
+    await this.db
+      .update(orders)
+      .set({
+        refundStatus: refund.status,
+        refundAmount: refund.amount,
+        refundReference: refund.refundReference,
+        refundRequestedAt: refund.requestedAt,
+        refundProcessedAt: refund.processedAt,
+        refundFailureReason: refund.failureReason,
+      })
+      .where(eq(orders.id, order.id));
   }
 
   /** Releases held funds to the seller. */
   async releaseEscrow(
-    order: Lean<Order>,
+    order: Order,
     by: Actor,
     settlement: Extract<Settlement, 'released' | 'force-released'> = 'released',
     note?: string,
     options: { fromDispute?: boolean } = {},
-  ): Promise<Lean<Order>> {
+  ): Promise<Order> {
     const now = new Date();
     const fromPhases: EscrowPhase[] =
       settlement === 'force-released' || options.fromDispute ? ['disputed'] : phasesLeadingTo('released').filter((phase) => phase !== 'disputed');
     const deliveredNow = order.status !== 'delivered';
     const released = await this.transition(
-      { _id: order._id, 'escrow.phase': { $in: fromPhases }, status: { $in: ['pending', 'confirmed', 'shipped', 'delivered'] } },
+      order.id,
+      and(inArray(orders.escrowPhase, fromPhases), inArray(orders.status, ['pending', 'confirmed', 'shipped', 'delivered'])),
       {
-        $set: {
-          status: 'delivered',
-          completedAt: now,
-          ...(deliveredNow ? { deliveredAt: order.deliveredAt ?? now } : {}),
-          'escrow.phase': 'released',
-          'escrow.status': 'completed',
-          'escrow.settlement': settlement,
-          'escrow.releasedAt': now,
-          'escrow.settledBy': by.id ? `${by.kind}:${by.id}` : by.kind,
-          'escrow.settledAt': now,
-          ...(order.escrow?.receivedAt ? {} : { 'escrow.receivedAt': now }),
-        },
-        $push: {
-          'escrow.history': this.historyEntry(settlement, by, note),
-          timeline: entry('released', 'Order completed', by.kind === 'buyer' ? 'You confirmed the item and payment was released to the seller.' : 'Payment was released to the seller.', now),
-        },
+        status: 'delivered',
+        completedAt: now,
+        ...(deliveredNow ? { deliveredAt: order.deliveredAt ?? now } : {}),
+        escrowPhase: 'released',
+        escrowStatus: 'completed',
+        escrowSettlement: settlement,
+        escrowReleasedAt: now,
+        escrowSettledBy: by.id ? `${by.kind}:${by.id}` : by.kind,
+        escrowSettledAt: now,
+        ...(order.escrow?.receivedAt ? {} : { escrowReceivedAt: now }),
+      },
+      {
+        history: [this.historyEntry(settlement, by, note)],
+        timeline: [
+          entry('released', 'Order completed', by.kind === 'buyer' ? 'You confirmed the item and payment was released to the seller.' : 'Payment was released to the seller.', now),
+        ],
       },
       'released',
     );
@@ -387,28 +430,28 @@ export class OrdersService implements OnModuleInit {
   }
 
   /** Cancels a paid order and refunds the buyer in full. */
-  async refundEscrow(order: Lean<Order>, by: Actor, reason: string, allowFrom: EscrowPhase[] = ['funded', 'shipped', 'inspection']): Promise<Lean<Order>> {
+  async refundEscrow(order: Order, by: Actor, reason: string, allowFrom: EscrowPhase[] = ['funded', 'shipped', 'inspection']): Promise<Order> {
     const now = new Date();
     const cancelled = await this.transition(
-      { _id: order._id, 'escrow.phase': { $in: allowFrom } },
+      order.id,
+      inArray(orders.escrowPhase, allowFrom),
       {
-        $set: {
-          status: 'cancelled',
-          cancelledAt: now,
-          cancelledBy: by.kind,
-          cancellationReason: reason,
-          'escrow.phase': 'refunded',
-          'escrow.status': 'completed',
-          'escrow.settlement': 'refunded',
-          'escrow.refundedAt': now,
-          'escrow.settledBy': by.id ? `${by.kind}:${by.id}` : by.kind,
-          'escrow.settledAt': now,
-        },
-        $unset: { cancellationRequest: 1 },
-        $push: {
-          'escrow.history': this.historyEntry('refunded', by, reason),
-          timeline: entry('cancelled', 'Order cancelled', `${reason} A full refund has been requested to your original payment method.`, now),
-        },
+        status: 'cancelled',
+        cancelledAt: now,
+        cancelledBy: by.kind,
+        cancellationReason: reason,
+        escrowPhase: 'refunded',
+        escrowStatus: 'completed',
+        escrowSettlement: 'refunded',
+        escrowRefundedAt: now,
+        escrowSettledBy: by.id ? `${by.kind}:${by.id}` : by.kind,
+        escrowSettledAt: now,
+        cancellationRequestReason: null,
+        cancellationRequestedAt: null,
+      },
+      {
+        history: [this.historyEntry('refunded', by, reason)],
+        timeline: [entry('cancelled', 'Order cancelled', `${reason} A full refund has been requested to your original payment method.`, now)],
       },
       'cancelled',
     );
@@ -419,7 +462,7 @@ export class OrdersService implements OnModuleInit {
       for (const item of cancelled.items) await this.products.releaseStock(item.productId, item.quantity);
     }
     for (const item of cancelled.items) await this.products.reverseSale(item.productId, item.quantity, item.price * item.quantity);
-    const latest = (await this.findById(cancelled._id))!;
+    const latest = (await this.findById(cancelled.id))!;
     this.announce(latest, 'cancelled', by.kind, reason);
     return latest;
   }
@@ -444,11 +487,10 @@ export class OrdersService implements OnModuleInit {
   async requestCancellation(user: AuthUser, idOrReference: string, reason: string): Promise<BuyerOrderView> {
     const order = await this.forBuyer(user, idOrReference);
     const updated = await this.transition(
-      { _id: order._id, status: 'confirmed', cancellationRequest: null },
-      {
-        $set: { cancellationRequest: { reason, requestedAt: new Date() } },
-        $push: { timeline: entry('cancellation-requested', 'Cancellation requested', reason) },
-      },
+      order.id,
+      and(eq(orders.status, 'confirmed'), isNull(orders.cancellationRequestedAt)),
+      { cancellationRequestReason: reason, cancellationRequestedAt: new Date() },
+      { timeline: [entry('cancellation-requested', 'Cancellation requested', reason)] },
       'changed',
     );
     this.announce(updated, 'cancellation-requested', 'buyer', reason);
@@ -462,31 +504,32 @@ export class OrdersService implements OnModuleInit {
     return (await this.buyerViews([updated]))[0];
   }
 
-  private async startInspection(order: Lean<Order>, by: Actor, proofUrl?: string, note?: string): Promise<Lean<Order>> {
+  private async startInspection(order: Order, by: Actor, proofUrl?: string, note?: string): Promise<Order> {
     const settings = await this.settings.get();
     const now = new Date();
     const fromStatuses: OrderStatus[] = by.kind === 'seller' ? ['confirmed', 'shipped'] : ['shipped'];
     const updated = await this.transition(
-      { _id: order._id, status: { $in: fromStatuses }, 'escrow.phase': { $in: ['funded', 'shipped'] } },
+      order.id,
+      and(inArray(orders.status, fromStatuses), inArray(orders.escrowPhase, ['funded', 'shipped'])),
       {
-        $set: {
-          status: 'delivered',
-          deliveredAt: now,
-          returnBy: addDays(now, settings.disputes.returnWindowDays),
-          'escrow.phase': 'inspection',
-          'escrow.receivedAt': now,
-          'escrow.inspectionEndsAt': addDays(now, settings.escrow.autoReleaseDays),
-          ...(proofUrl ? { 'shipment.proofUrl': proofUrl } : {}),
-        },
-        $push: {
-          'escrow.history': this.historyEntry('received', by, note),
-          timeline: entry(
+        status: 'delivered',
+        deliveredAt: now,
+        returnBy: addDays(now, settings.disputes.returnWindowDays),
+        escrowPhase: 'inspection',
+        escrowReceivedAt: now,
+        escrowInspectionEndsAt: addDays(now, settings.escrow.autoReleaseDays),
+        ...(proofUrl ? { shipmentProofUrl: proofUrl } : {}),
+      },
+      {
+        history: [this.historyEntry('received', by, note)],
+        timeline: [
+          entry(
             'delivered',
             'Delivered',
             by.kind === 'buyer' ? 'You marked the item as received. The inspection period has started.' : 'The seller marked the order as delivered. The inspection period has started.',
             now,
           ),
-        },
+        ],
       },
       'marked as delivered',
     );
@@ -502,7 +545,7 @@ export class OrdersService implements OnModuleInit {
     }
     const to = channel === 'email' ? user.email : user.phone;
     if (!to) throw Errors.badRequest('There is no phone number on this account. Use email instead.', 'NO_PHONE');
-    return this.otp.issue({ key: `user:${user.id}`, purpose: 'confirm-release', channel, to, userId: user.id, context: String(order._id) });
+    return this.otp.issue({ key: `user:${user.id}`, purpose: 'confirm-release', channel, to, userId: user.id, context: order.id });
   }
 
   /** The buyer confirms the item is as described: payment goes to the seller. */
@@ -511,7 +554,7 @@ export class OrdersService implements OnModuleInit {
     if (!order.escrow || !['shipped', 'inspection'].includes(order.escrow.phase)) {
       throw Errors.conflict('There is nothing to release on this order right now.', 'ORDER_STATE_CHANGED', { status: order.status });
     }
-    await this.otp.verify({ key: `user:${user.id}`, purpose: 'confirm-release', code, context: String(order._id) });
+    await this.otp.verify({ key: `user:${user.id}`, purpose: 'confirm-release', code, context: order.id });
     const released = await this.releaseEscrow(order, { kind: 'buyer', id: user.id, name: user.firstName });
     return (await this.buyerViews([released]))[0];
   }
@@ -521,11 +564,10 @@ export class OrdersService implements OnModuleInit {
   async confirm(user: AuthUser, idOrReference: string): Promise<SellerOrderView> {
     const order = await this.forSeller(user, idOrReference);
     const updated = await this.transition(
-      { _id: order._id, status: 'pending' },
-      {
-        $set: { status: 'confirmed', confirmedAt: new Date() },
-        $push: { timeline: entry('confirmed', 'Order confirmed', 'The seller confirmed your order and is preparing it for dispatch.') },
-      },
+      order.id,
+      eq(orders.status, 'pending'),
+      { status: 'confirmed', confirmedAt: new Date() },
+      { timeline: [entry('confirmed', 'Order confirmed', 'The seller confirmed your order and is preparing it for dispatch.')] },
       'confirmed',
     );
     this.announce(updated, 'confirmed', 'seller');
@@ -536,20 +578,24 @@ export class OrdersService implements OnModuleInit {
     const order = await this.forSeller(user, idOrReference);
     const now = new Date();
     const updated = await this.transition(
-      { _id: order._id, status: { $in: ['pending', 'confirmed'] }, 'escrow.phase': 'funded' },
+      order.id,
+      and(inArray(orders.status, ['pending', 'confirmed']), eq(orders.escrowPhase, 'funded')),
       {
-        $set: {
-          status: 'shipped',
-          confirmedAt: order.confirmedAt ?? now,
-          shipment: { carrier: input.carrier, trackingNumber: input.trackingNumber, proofUrl: input.proofUrl, note: input.note, shippedAt: now },
-          'escrow.phase': 'shipped',
-          'escrow.shippedAt': now,
-        },
-        $unset: { cancellationRequest: 1 },
-        $push: {
-          'escrow.history': this.historyEntry('shipped', { kind: 'seller', id: user.id, name: user.firstName }),
-          timeline: entry('shipped', 'Shipped', `Package handed to ${input.carrier}. Tracking number ${input.trackingNumber}.`, now),
-        },
+        status: 'shipped',
+        confirmedAt: order.confirmedAt ?? now,
+        shipmentCarrier: input.carrier,
+        shipmentTrackingNumber: input.trackingNumber,
+        shipmentProofUrl: input.proofUrl ?? null,
+        shipmentNote: input.note ?? null,
+        shippedAt: now,
+        escrowPhase: 'shipped',
+        escrowShippedAt: now,
+        cancellationRequestReason: null,
+        cancellationRequestedAt: null,
+      },
+      {
+        history: [this.historyEntry('shipped', { kind: 'seller', id: user.id, name: user.firstName })],
+        timeline: [entry('shipped', 'Shipped', `Package handed to ${input.carrier}. Tracking number ${input.trackingNumber}.`, now)],
       },
       'shipped',
     );
@@ -576,23 +622,22 @@ export class OrdersService implements OnModuleInit {
   /* --- Disputes ------------------------------------------------------------------- */
 
   /** Freezes the money while a dispute is open. */
-  async markDisputed(orderId: Types.ObjectId, disputeId: Types.ObjectId, by: Actor, reason: string): Promise<Lean<Order>> {
+  async markDisputed(orderId: string, disputeId: string, by: Actor, reason: string): Promise<Order> {
     const order = await this.findById(orderId);
     if (!order) throw Errors.notFound("We couldn't find that order.", 'ORDER_NOT_FOUND');
     const updated = await this.transition(
-      { _id: orderId, 'escrow.phase': { $in: ['shipped', 'inspection'] }, disputeId: null },
+      orderId,
+      and(inArray(orders.escrowPhase, ['shipped', 'inspection']), isNull(orders.disputeId)),
       {
-        $set: {
-          disputeId,
-          'escrow.phaseBeforeDispute': order.escrow?.phase,
-          'escrow.phase': 'disputed',
-          'escrow.status': 'dispute',
-          'escrow.disputedAt': new Date(),
-        },
-        $push: {
-          'escrow.history': this.historyEntry('disputed', by, reason),
-          timeline: entry('disputed', 'Dispute opened', 'Payment is on hold while DOOAA reviews the dispute.'),
-        },
+        disputeId,
+        escrowPhaseBeforeDispute: order.escrow?.phase ?? null,
+        escrowPhase: 'disputed',
+        escrowStatus: 'dispute',
+        escrowDisputedAt: new Date(),
+      },
+      {
+        history: [this.historyEntry('disputed', by, reason)],
+        timeline: [entry('disputed', 'Dispute opened', 'Payment is on hold while DOOAA reviews the dispute.')],
       },
       'disputed',
     );
@@ -601,22 +646,21 @@ export class OrdersService implements OnModuleInit {
   }
 
   /** DOOAA reopened a dispute it had closed without action: the payment goes back on hold under it. */
-  async reopenDispute(orderId: Types.ObjectId, disputeId: Types.ObjectId, by: Actor, reason: string): Promise<Lean<Order>> {
+  async reopenDispute(orderId: string, disputeId: string, by: Actor, reason: string): Promise<Order> {
     const order = await this.findById(orderId);
     if (!order?.escrow) throw Errors.notFound("We couldn't find that order.", 'ORDER_NOT_FOUND');
     const updated = await this.transition(
-      { _id: orderId, disputeId, 'escrow.phase': { $in: ['shipped', 'inspection'] } },
+      orderId,
+      and(eq(orders.disputeId, disputeId), inArray(orders.escrowPhase, ['shipped', 'inspection'])),
       {
-        $set: {
-          'escrow.phaseBeforeDispute': order.escrow.phase,
-          'escrow.phase': 'disputed',
-          'escrow.status': 'dispute',
-          'escrow.disputedAt': new Date(),
-        },
-        $push: {
-          'escrow.history': this.historyEntry('disputed', by, reason),
-          timeline: entry('disputed', 'Dispute reopened', 'Payment is on hold again while DOOAA takes another look.'),
-        },
+        escrowPhaseBeforeDispute: order.escrow.phase,
+        escrowPhase: 'disputed',
+        escrowStatus: 'dispute',
+        escrowDisputedAt: new Date(),
+      },
+      {
+        history: [this.historyEntry('disputed', by, reason)],
+        timeline: [entry('disputed', 'Dispute reopened', 'Payment is on hold again while DOOAA takes another look.')],
       },
       'disputed',
     );
@@ -625,7 +669,7 @@ export class OrdersService implements OnModuleInit {
   }
 
   /** A dispute closed without a ruling: the money goes back to where it was. */
-  async restoreFromDispute(orderId: Types.ObjectId, by: Actor, note?: string): Promise<Lean<Order>> {
+  async restoreFromDispute(orderId: string, by: Actor, note?: string): Promise<Order> {
     const order = await this.findById(orderId);
     if (!order?.escrow || order.escrow.phase !== 'disputed') {
       throw Errors.conflict('This order is not under dispute.', 'ORDER_STATE_CHANGED');
@@ -633,16 +677,18 @@ export class OrdersService implements OnModuleInit {
     const back = order.escrow.phaseBeforeDispute ?? 'inspection';
     const settings = await this.settings.get();
     const updated = await this.transition(
-      { _id: orderId, 'escrow.phase': 'disputed' },
+      orderId,
+      eq(orders.escrowPhase, 'disputed'),
       {
-        $set: {
-          'escrow.phase': back,
-          'escrow.status': 'pending',
-          'escrow.phaseBeforeDispute': null,
-          // A fresh inspection window, so the auto-release does not fire the moment the dispute closes.
-          ...(back === 'inspection' ? { 'escrow.inspectionEndsAt': addDays(new Date(), settings.escrow.autoReleaseDays) } : {}),
-        },
-        $push: { 'escrow.history': this.historyEntry('dispute-closed', by, note), timeline: entry('dispute-closed', 'Dispute closed', note ?? 'The dispute was closed and the order continues.') },
+        escrowPhase: back,
+        escrowStatus: 'pending',
+        escrowPhaseBeforeDispute: null,
+        // A fresh inspection window, so the auto-release does not fire the moment the dispute closes.
+        ...(back === 'inspection' ? { escrowInspectionEndsAt: addDays(new Date(), settings.escrow.autoReleaseDays) } : {}),
+      },
+      {
+        history: [this.historyEntry('dispute-closed', by, note)],
+        timeline: [entry('dispute-closed', 'Dispute closed', note ?? 'The dispute was closed and the order continues.')],
       },
       'restored',
     );
@@ -651,26 +697,29 @@ export class OrdersService implements OnModuleInit {
   }
 
   /** Reverses a release: the funds go back on hold under a dispute. */
-  async reverseRelease(order: Lean<Order>, by: Actor, note?: string): Promise<Lean<Order>> {
+  async reverseRelease(order: Order, by: Actor, note?: string): Promise<Order> {
     if (order.escrow?.settlement === 'refunded') {
       throw Errors.conflict('The refund has already been paid back to the buyer and cannot be reversed from the console.', 'REFUND_IRREVERSIBLE');
     }
     // Take the money back off the seller's balance first; refuse if it has been withdrawn.
     await this.wallet.onReversed(order);
+    const now = new Date();
     const updated = await this.transition(
-      { _id: order._id, 'escrow.phase': 'released' },
+      order.id,
+      eq(orders.escrowPhase, 'released'),
       {
-        $set: {
-          'escrow.phase': 'disputed',
-          'escrow.status': 'dispute',
-          'escrow.settlement': 'reversed',
-          'escrow.phaseBeforeDispute': 'inspection',
-          'escrow.disputedAt': new Date(),
-          'escrow.settledBy': by.id ? `${by.kind}:${by.id}` : by.kind,
-          'escrow.settledAt': new Date(),
-        },
-        $unset: { completedAt: 1 },
-        $push: { 'escrow.history': this.historyEntry('reversed', by, note), timeline: entry('reversed', 'Release reversed', 'DOOAA put the payment back on hold for review.') },
+        escrowPhase: 'disputed',
+        escrowStatus: 'dispute',
+        escrowSettlement: 'reversed',
+        escrowPhaseBeforeDispute: 'inspection',
+        escrowDisputedAt: now,
+        escrowSettledBy: by.id ? `${by.kind}:${by.id}` : by.kind,
+        escrowSettledAt: now,
+        completedAt: null,
+      },
+      {
+        history: [this.historyEntry('reversed', by, note)],
+        timeline: [entry('reversed', 'Release reversed', 'DOOAA put the payment back on hold for review.')],
       },
       'reversed',
     );
@@ -682,7 +731,13 @@ export class OrdersService implements OnModuleInit {
 
   /** Inspection windows that have run out release to the seller. */
   async autoRelease(now = new Date()): Promise<number> {
-    const due = await this.orders.find({ 'escrow.phase': 'inspection', 'escrow.inspectionEndsAt': { $lte: now } }).limit(200).lean<Lean<Order>[]>();
+    const due = await this.withItems(
+      await this.db
+        .select()
+        .from(orders)
+        .where(and(eq(orders.escrowPhase, 'inspection'), lte(orders.escrowInspectionEndsAt, now)))
+        .limit(200),
+    );
     let released = 0;
     for (const order of due) {
       try {
@@ -698,7 +753,13 @@ export class OrdersService implements OnModuleInit {
   /** Orders the seller never shipped are cancelled and refunded after a grace period. */
   async cancelOverdue(now = new Date(), graceHours = 72): Promise<number> {
     const cutoff = new Date(now.getTime() - graceHours * 3_600_000);
-    const due = await this.orders.find({ status: { $in: ['pending', 'confirmed'] }, 'escrow.phase': 'funded', shipBy: { $lte: cutoff } }).limit(200).lean<Lean<Order>[]>();
+    const due = await this.withItems(
+      await this.db
+        .select()
+        .from(orders)
+        .where(and(inArray(orders.status, ['pending', 'confirmed']), eq(orders.escrowPhase, 'funded'), lte(orders.shipBy, cutoff)))
+        .limit(200),
+    );
     let cancelled = 0;
     for (const order of due) {
       try {
@@ -714,11 +775,12 @@ export class OrdersService implements OnModuleInit {
   /* --- Account closure ----------------------------------------------------------- */
 
   private async vetoClosure(userId: string): Promise<void> {
-    const id = new Types.ObjectId(userId);
-    const open = await this.orders.countDocuments({
-      $or: [{ buyerId: id }, { sellerId: id }],
-      $and: [{ $or: [{ status: { $in: ACTIVE_FOR_CLOSURE } }, { 'escrow.phase': { $in: [...HELD_PHASES, 'disputed'] } }] }],
-    });
+    const open = await this.countOrders(
+      and(
+        or(eq(orders.buyerId, userId), eq(orders.sellerId, userId)),
+        or(inArray(orders.status, ACTIVE_FOR_CLOSURE), inArray(orders.escrowPhase, [...HELD_PHASES, 'disputed'])),
+      ),
+    );
     if (open > 0) {
       throw Errors.conflict('You have orders in progress. Close your account once they are completed.', 'OPEN_ORDERS', { open });
     }
@@ -729,30 +791,41 @@ export class OrdersService implements OnModuleInit {
 
   /* --- Dashboards -------------------------------------------------------------- */
 
+  private async countOrders(where: SQL | undefined): Promise<number> {
+    const [row] = await this.db.select({ total: count() }).from(orders).where(where);
+    return row.total;
+  }
+
+  private async countProducts(where: SQL | undefined): Promise<number> {
+    const [row] = await this.db.select({ total: count() }).from(products).where(where);
+    return row.total;
+  }
+
   /** The seller dashboard's headline tiles, with week-on-week change. */
   async sellerSummary(user: AuthUser) {
-    const sellerId = new Types.ObjectId(user.id);
     const now = Date.now();
     const thisWeek = new Date(now - 7 * DAY);
     const lastWeek = new Date(now - 14 * DAY);
-    const [revenueRows, totalOrders, pendingOrders, activeProducts, ordersThis, ordersLast, revenueThis, revenueLast, listedThis, listedLast, pendingThis, pendingLast] =
+    const mine = eq(orders.sellerId, user.id);
+    const listed = and(eq(products.sellerId, user.id), isNull(products.deletedAt));
+    const [revenue, totalOrders, pendingOrders, activeProducts, ordersThis, ordersLast, revenueThis, revenueLast, listedThis, listedLast, pendingThis, pendingLast] =
       await Promise.all([
-        this.orders.aggregate<{ total: number }>([{ $match: { sellerId, 'escrow.phase': 'released' } }, { $group: { _id: null, total: { $sum: '$sellerEarning' } } }]),
-        this.orders.countDocuments({ sellerId, status: { $ne: 'awaiting-payment' }, 'payment.status': 'paid' }),
-        this.orders.countDocuments({ sellerId, status: { $in: ['pending', 'confirmed'] } }),
-        this.products.model.countDocuments({ sellerId, status: 'active', deletedAt: null }),
-        this.orders.countDocuments({ sellerId, 'payment.status': 'paid', 'payment.paidAt': { $gte: thisWeek } }),
-        this.orders.countDocuments({ sellerId, 'payment.status': 'paid', 'payment.paidAt': { $gte: lastWeek, $lt: thisWeek } }),
-        this.sumReleased(sellerId, thisWeek, new Date(now)),
-        this.sumReleased(sellerId, lastWeek, thisWeek),
-        this.products.model.countDocuments({ sellerId, publishedAt: { $gte: thisWeek }, deletedAt: null }),
-        this.products.model.countDocuments({ sellerId, publishedAt: { $gte: lastWeek, $lt: thisWeek }, deletedAt: null }),
-        this.orders.countDocuments({ sellerId, status: { $in: ['pending', 'confirmed'] }, createdAt: { $gte: thisWeek } }),
-        this.orders.countDocuments({ sellerId, status: { $in: ['pending', 'confirmed'] }, createdAt: { $gte: lastWeek, $lt: thisWeek } }),
+        this.sumReleased(user.id),
+        this.countOrders(and(mine, ne(orders.status, 'awaiting-payment'), eq(orders.paymentStatus, 'paid'))),
+        this.countOrders(and(mine, inArray(orders.status, ['pending', 'confirmed']))),
+        this.countProducts(and(listed, eq(products.status, 'active'))),
+        this.countOrders(and(mine, eq(orders.paymentStatus, 'paid'), gte(orders.paymentPaidAt, thisWeek))),
+        this.countOrders(and(mine, eq(orders.paymentStatus, 'paid'), gte(orders.paymentPaidAt, lastWeek), lt(orders.paymentPaidAt, thisWeek))),
+        this.sumReleased(user.id, thisWeek, new Date(now)),
+        this.sumReleased(user.id, lastWeek, thisWeek),
+        this.countProducts(and(listed, gte(products.publishedAt, thisWeek))),
+        this.countProducts(and(listed, gte(products.publishedAt, lastWeek), lt(products.publishedAt, thisWeek))),
+        this.countOrders(and(mine, inArray(orders.status, ['pending', 'confirmed']), gte(orders.createdAt, thisWeek))),
+        this.countOrders(and(mine, inArray(orders.status, ['pending', 'confirmed']), gte(orders.createdAt, lastWeek), lt(orders.createdAt, thisWeek))),
       ]);
     const change = (current: number, previous: number) => (previous === 0 ? (current > 0 ? 100 : 0) : Math.round(((current - previous) / previous) * 1000) / 10);
     return {
-      revenue: Math.round((revenueRows[0]?.total ?? 0) * 100) / 100,
+      revenue: Math.round(revenue * 100) / 100,
       totalOrders,
       activeProducts,
       pendingOrders,
@@ -765,11 +838,19 @@ export class OrdersService implements OnModuleInit {
     };
   }
 
-  private async sumReleased(sellerId: Types.ObjectId, from: Date, to: Date): Promise<number> {
-    const rows = await this.orders.aggregate<{ total: number }>([
-      { $match: { sellerId, 'escrow.phase': 'released', 'escrow.releasedAt': { $gte: from, $lt: to } } },
-      { $group: { _id: null, total: { $sum: '$sellerEarning' } } },
-    ]);
-    return rows[0]?.total ?? 0;
+  /** What has been released to the seller, overall or within a window. */
+  private async sumReleased(sellerId: string, from?: Date, to?: Date): Promise<number> {
+    const [row] = await this.db
+      .select({ total: sum(orders.sellerEarning).mapWith(Number) })
+      .from(orders)
+      .where(
+        and(
+          eq(orders.sellerId, sellerId),
+          eq(orders.escrowPhase, 'released'),
+          from ? gte(orders.escrowReleasedAt, from) : undefined,
+          to ? lt(orders.escrowReleasedAt, to) : undefined,
+        ),
+      );
+    return row?.total ?? 0;
   }
 }

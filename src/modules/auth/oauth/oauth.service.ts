@@ -1,21 +1,21 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { InjectModel } from '@nestjs/mongoose';
+import { and, eq, gt, sql } from 'drizzle-orm';
 import { randomBytes } from 'node:crypto';
-import { Model } from 'mongoose';
 import { AppError, Errors } from '../../../common/api/app-error';
-import type { Lean } from '../../../common/util/mongo';
+import { OAUTH_PROVIDERS, type OAuthProviderId } from '../../../common/domain';
 import { InjectConfig } from '../../../config/config.module';
 import type { AppConfig } from '../../../config/configuration';
+import { InjectDb, type Database } from '../../../database/database';
+import { oauthGrants, userOauthIdentities, users } from '../../../database/schema';
 import { MailService } from '../../mail/mail.service';
 import { PasswordService } from '../../users/password.service';
-import { OAUTH_PROVIDERS, User, type OAuthProviderId } from '../../users/schemas/user.schema';
+import { toUser, userColumns, type User } from '../../users/user.model';
 import { toPublicUser } from '../../users/user.presenter';
 import { UsersService } from '../../users/users.service';
 import { AuthService, type AuthResult } from '../auth.service';
 import { TokenService, hashToken, type SessionMeta } from '../token.service';
-import { OAuthGrant } from './oauth-grant.schema';
-import { OAUTH_PROVIDER_REGISTRY, OAuthProviderError, type OAuthProfile, type OAuthProviderRegistry } from './oauth-provider';
+import { OAUTH_PROVIDER_REGISTRY, type OAuthProfile, type OAuthProviderRegistry } from './oauth-provider';
 
 const STATE_TTL_SECONDS = 10 * 60;
 const GRANT_TTL_MS = 2 * 60 * 1000;
@@ -51,8 +51,7 @@ export class OAuthService {
     private readonly mail: MailService,
     private readonly jwt: JwtService,
     @InjectConfig() private readonly config: AppConfig,
-    @InjectModel(User.name) private readonly userModel: Model<User>,
-    @InjectModel(OAuthGrant.name) private readonly grants: Model<OAuthGrant>,
+    @InjectDb() private readonly db: Database,
   ) {}
 
   list(): { providers: { id: OAuthProviderId; enabled: boolean }[] } {
@@ -120,9 +119,9 @@ export class OAuthService {
 
     const { user, isNewUser } = await this.resolveUser(provider.id, profile);
     const code = randomBytes(32).toString('base64url');
-    await this.grants.create({
+    await this.db.insert(oauthGrants).values({
       codeHash: hashToken(code),
-      userId: user._id,
+      userId: user.id,
       isNewUser,
       next: state.next,
       expiresAt: new Date(Date.now() + GRANT_TTL_MS),
@@ -132,16 +131,18 @@ export class OAuthService {
 
   /** Trades the one-time code for a session. A code works once, for two minutes. */
   async exchange(code: string, meta: SessionMeta): Promise<OAuthExchangeResult> {
-    const grant = await this.grants
-      .findOneAndDelete({ codeHash: hashToken(code), expiresAt: { $gt: new Date() } })
-      .lean<Lean<OAuthGrant>>();
+    // Deleting the grant is the claim: a code works once even when two requests race.
+    const [grant] = await this.db
+      .delete(oauthGrants)
+      .where(and(eq(oauthGrants.codeHash, hashToken(code)), gt(oauthGrants.expiresAt, new Date())))
+      .returning();
     if (!grant) throw Errors.badRequest('That sign-in has expired. Try again.', 'OAUTH_CODE_INVALID');
     const user = await this.users.findById(grant.userId);
     if (!user) throw Errors.badRequest('That sign-in has expired. Try again.', 'OAUTH_CODE_INVALID');
     this.auth.assertCanSignIn(user);
-    await this.users.recordSignIn(String(user._id));
-    const tokens = await this.tokens.issue('user', String(user._id), user.tokenVersion ?? 0, meta);
-    return { user: toPublicUser(await this.users.getById(user._id)), tokens, isNewUser: grant.isNewUser, next: grant.next || null };
+    await this.users.recordSignIn(user.id);
+    const tokens = await this.tokens.issue('user', user.id, user.tokenVersion, meta);
+    return { user: toPublicUser(await this.users.getById(user.id)), tokens, isNewUser: grant.isNewUser, next: grant.next || null };
   }
 
   /**
@@ -149,8 +150,13 @@ export class OAuthService {
    * creating one by email when it is new. Linking needs an email the
    * provider has verified.
    */
-  async resolveUser(provider: OAuthProviderId, profile: OAuthProfile): Promise<{ user: Lean<User>; isNewUser: boolean }> {
-    const linked = await this.userModel.findOne({ oauth: { $elemMatch: { provider, subject: profile.subject } } }).lean<Lean<User>>();
+  async resolveUser(provider: OAuthProviderId, profile: OAuthProfile): Promise<{ user: User; isNewUser: boolean }> {
+    const [linkedRow] = await this.db
+      .select(userColumns)
+      .from(userOauthIdentities)
+      .innerJoin(users, eq(users.id, userOauthIdentities.userId))
+      .where(and(eq(userOauthIdentities.provider, provider), eq(userOauthIdentities.subject, profile.subject)));
+    const linked = linkedRow ? toUser(linkedRow) : null;
     if (linked) {
       this.auth.assertCanSignIn(linked);
       return { user: linked, isNewUser: false };
@@ -162,20 +168,20 @@ export class OAuthService {
     if (!profile.emailVerified) {
       throw Errors.badRequest('Confirm your email address with the provider first, or sign up with email.', 'OAUTH_EMAIL_UNVERIFIED');
     }
-    const identity = { provider, subject: profile.subject, email: profile.email, linkedAt: new Date() };
-
     const existing = await this.users.findByEmail(profile.email);
     if (existing) {
       this.auth.assertCanSignIn(existing);
-      const update: Record<string, unknown> = { $push: { oauth: identity } };
-      if (!existing.emailVerified) {
-        // Nobody ever proved they own this address; the provider just did. Whoever
-        // registered it (possibly someone squatting it) loses the password and sessions.
-        update.$set = { emailVerified: true, passwordHash: await this.randomPasswordHash() };
-        update.$inc = { tokenVersion: 1 };
-      }
-      const user = await this.users.update(String(existing._id), update);
-      if (!existing.emailVerified) await this.tokens.revokeAll('user', String(existing._id));
+      await this.link(existing.id, provider, profile);
+      const user = existing.emailVerified
+        ? existing
+        : // Nobody ever proved they own this address; the provider just did. Whoever
+          // registered it (possibly someone squatting it) loses the password and sessions.
+          await this.users.update(existing.id, {
+            emailVerified: true,
+            passwordHash: await this.randomPasswordHash(),
+            tokenVersion: sql`${users.tokenVersion} + 1`,
+          });
+      if (!existing.emailVerified) await this.tokens.revokeAll('user', existing.id);
       void this.mail.send(user.email, {
         subject: `${this.label(provider)} sign-in added to your DOOAA account`,
         heading: `${this.label(provider)} sign-in added`,
@@ -195,7 +201,8 @@ export class OAuthService {
       phone: '',
       passwordHash: await this.randomPasswordHash(),
     });
-    const user = await this.users.update(String(created._id), { $set: { emailVerified: true }, $push: { oauth: identity } });
+    await this.link(created.id, provider, profile);
+    const user = await this.users.update(created.id, { emailVerified: true });
     void this.mail.send(user.email, {
       subject: 'Welcome to DOOAA',
       heading: `Welcome, ${user.firstName}!`,
@@ -206,6 +213,14 @@ export class OAuthService {
       cta: { label: 'Start exploring', url: this.config.clientUrl },
     });
     return { user, isNewUser: true };
+  }
+
+  /** Records that this provider account signs in to the user. A repeat of the same link is a no-op. */
+  private async link(userId: string, provider: OAuthProviderId, profile: OAuthProfile): Promise<void> {
+    await this.db
+      .insert(userOauthIdentities)
+      .values({ userId, provider, subject: profile.subject, email: profile.email ?? null })
+      .onConflictDoNothing({ target: [userOauthIdentities.provider, userOauthIdentities.subject] });
   }
 
   private label(provider: OAuthProviderId): string {

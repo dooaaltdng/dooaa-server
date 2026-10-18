@@ -1,7 +1,7 @@
 import { Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { IsBoolean, IsOptional } from 'class-validator';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { AllowRestricted, CurrentStaff, CurrentUser, StaffOnly } from '../../common/auth/decorators';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
 import { PageQueryDto } from '../../common/util/pagination';
@@ -36,7 +36,7 @@ export class NotificationsController {
 
   @HttpCode(200)
   @Post(':id/read')
-  read(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string) {
+  read(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string) {
     return this.notifications.markRead({ id: user.id, type: 'user' }, id);
   }
 }
@@ -61,7 +61,7 @@ export class AdminNotificationsController {
 
   @HttpCode(200)
   @Post(':id/read')
-  read(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string) {
+  read(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string) {
     return this.notifications.markRead({ id: staff.id, type: 'staff' }, id);
   }
 }

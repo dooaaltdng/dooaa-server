@@ -23,6 +23,20 @@ export type ModeratedStatus = (typeof MODERATED_STATUSES)[number];
 export const VERIFICATION_LEVELS = ['normal', 'high-value'] as const;
 export type VerificationLevel = (typeof VERIFICATION_LEVELS)[number];
 
+/** Social sign-in providers an account can be linked to. */
+export const OAUTH_PROVIDERS = ['google', 'facebook'] as const;
+export type OAuthProviderId = (typeof OAUTH_PROVIDERS)[number];
+
+/** Who a session, an upload or a notification belongs to. */
+export const SUBJECT_TYPES = ['user', 'staff'] as const;
+export type SubjectType = (typeof SUBJECT_TYPES)[number];
+
+export const OTP_PURPOSES = ['verify-email', 'reset-password', 'change-password', 'confirm-release', 'verify-phone'] as const;
+export type OtpPurpose = (typeof OTP_PURPOSES)[number];
+
+export const OTP_CHANNELS = ['email', 'sms', 'whatsapp'] as const;
+export type OtpChannel = (typeof OTP_CHANNELS)[number];
+
 export const GENDERS = ['male', 'female', 'prefer-not-to-say'] as const;
 export type Gender = (typeof GENDERS)[number];
 
@@ -74,6 +88,9 @@ export const CLOSE_REASONS = [
 
 export const STAFF_ROLES = ['superadmin', 'admin', 'moderator'] as const;
 export type StaffRole = (typeof STAFF_ROLES)[number];
+
+export const STAFF_STATUSES = ['invited', 'active', 'disabled'] as const;
+export type StaffStatus = (typeof STAFF_STATUSES)[number];
 
 export const STAFF_ROLE_LABEL: Record<StaffRole, string> = {
   superadmin: 'Superadmin',
@@ -177,8 +194,8 @@ export type OrderStatus = (typeof ORDER_STATUSES)[number];
 export const ORDER_KINDS = ['standard', 'escrow'] as const;
 export type OrderKind = (typeof ORDER_KINDS)[number];
 
-/** How the buyer pays on the provider's checkout. */
-export const CHECKOUT_METHODS = ['card', 'transfer', 'ussd', 'bank'] as const;
+/** How the buyer pays on Bachs' hosted checkout: a Naira card or a bank transfer. */
+export const CHECKOUT_METHODS = ['card', 'transfer'] as const;
 export type CheckoutMethod = (typeof CHECKOUT_METHODS)[number];
 
 /** Where the buyer's money is, as the thread and the console see it. */
@@ -197,6 +214,31 @@ export function escrowStatusOf(phase: EscrowPhase): EscrowStatus {
 
 export const SETTLEMENTS = ['released', 'refunded', 'reversed', 'force-released'] as const;
 export type Settlement = (typeof SETTLEMENTS)[number];
+
+/** Where an order's own copy of its charge stands. */
+export const ORDER_PAYMENT_STATUSES = ['pending', 'paid', 'failed'] as const;
+export type OrderPaymentStatus = (typeof ORDER_PAYMENT_STATUSES)[number];
+
+export const ORDER_ACTORS = ['buyer', 'seller', 'system', 'staff'] as const;
+export type OrderActor = (typeof ORDER_ACTORS)[number];
+
+export const PAYMENT_STATUSES = ['pending', 'paid', 'failed', 'abandoned'] as const;
+export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
+
+export const REFUND_STATUSES = ['pending', 'processed', 'failed'] as const;
+export type RefundStatus = (typeof REFUND_STATUSES)[number];
+
+export const EARNING_STATUSES = ['pending', 'available', 'cancelled'] as const;
+export type EarningStatus = (typeof EARNING_STATUSES)[number];
+
+export const PAYOUT_STATUSES = ['processing', 'completed', 'failed'] as const;
+export type PayoutStatus = (typeof PAYOUT_STATUSES)[number];
+
+export const PAYOUT_ACCOUNT_SOURCES = ['settings', 'verification'] as const;
+export type PayoutAccountSource = (typeof PAYOUT_ACCOUNT_SOURCES)[number];
+
+export const COUPON_TYPES = ['percent', 'fixed'] as const;
+export type CouponType = (typeof COUPON_TYPES)[number];
 
 export const DISPUTE_STATES = ['active', 'pending', 'completed'] as const;
 export type DisputeState = (typeof DISPUTE_STATES)[number];
@@ -234,6 +276,15 @@ export type OfferStatus = (typeof OFFER_STATUSES)[number];
 export const MEETUP_STATUSES = ['proposed', 'accepted', 'declined'] as const;
 export type MeetupStatus = (typeof MEETUP_STATUSES)[number];
 
+export const SENDER_ROLES = ['buyer', 'seller', 'staff', 'system'] as const;
+export type SenderRole = (typeof SENDER_ROLES)[number];
+
+export const DISPUTE_PARTIES = ['buyer', 'seller'] as const;
+export type DisputeParty = (typeof DISPUTE_PARTIES)[number];
+
+export const NOTIFICATION_TONES = ['blue', 'green', 'red'] as const;
+export type NotificationTone = (typeof NOTIFICATION_TONES)[number];
+
 /* --- Reviews ------------------------------------------------------------- */
 
 export const REVIEW_ASPECTS = [
@@ -267,6 +318,12 @@ export const ID_TYPE_LABEL: Record<IdType, string> = {
 export const BANK_VERIFICATION_METHODS = ['instant', 'micro'] as const;
 export type BankVerificationMethod = (typeof BANK_VERIFICATION_METHODS)[number];
 
+export const VERIFICATION_STATUSES = ['pending', 'approved', 'rejected'] as const;
+export type VerificationStatus = (typeof VERIFICATION_STATUSES)[number];
+
+export const VERIFICATION_DOCUMENT_KINDS = ['id-front', 'id-back', 'selfie'] as const;
+export type VerificationDocumentKind = (typeof VERIFICATION_DOCUMENT_KINDS)[number];
+
 /* --- Support ------------------------------------------------------------- */
 
 export const SUPPORT_TOPICS = [
@@ -276,10 +333,27 @@ export const SUPPORT_TOPICS = [
   'Account and settings',
   'Something else',
 ] as const;
+export type SupportTopic = (typeof SUPPORT_TOPICS)[number];
+
+export const SUPPORT_STATUSES = ['open', 'resolved'] as const;
+export type SupportStatus = (typeof SUPPORT_STATUSES)[number];
 
 /* --- Media --------------------------------------------------------------- */
 
 export const MEDIA_PURPOSES = ['product', 'avatar', 'kyc', 'message', 'evidence', 'support', 'meetup', 'shipment', 'content'] as const;
 export type MediaPurpose = (typeof MEDIA_PURPOSES)[number];
+
+export const MEDIA_KINDS = ['image', 'video', 'file'] as const;
+export type MediaKind = (typeof MEDIA_KINDS)[number];
+
+export const MEDIA_VISIBILITIES = ['public', 'private'] as const;
+export type MediaVisibility = (typeof MEDIA_VISIBILITIES)[number];
+
 /** Identity documents never get a public URL. */
 export const PRIVATE_MEDIA_PURPOSES: MediaPurpose[] = ['kyc'];
+
+/* --- Analytics ----------------------------------------------------------- */
+
+/** Daily counters are kept for the whole site and per seller. */
+export const STAT_SCOPES = ['site', 'seller'] as const;
+export type StatScope = (typeof STAT_SCOPES)[number];

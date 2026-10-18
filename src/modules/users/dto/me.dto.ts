@@ -1,9 +1,8 @@
 import { Type } from 'class-transformer';
 import { IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUrl, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
-import { CLOSE_REASONS, GENDERS, type Gender } from '../../../common/domain';
+import { CLOSE_REASONS, type Gender, GENDERS, OTP_CHANNELS, type OtpChannel } from '../../../common/domain';
 import { Trim } from '../../../common/util/transforms';
 import { IsPersonName, IsPhoneNumber, IsStrongPassword } from '../../../common/util/validators';
-import { OTP_CHANNELS, type OtpChannel } from '../../otp/otp.schema';
 
 export class UpdateProfileDto {
   @IsOptional() @Trim() @IsPersonName('First name') firstName?: string;

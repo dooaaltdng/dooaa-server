@@ -5,8 +5,11 @@ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module';
 import { API_PREFIX, configureApp } from './bootstrap';
+import { loadEnvFiles } from './config/env-files';
 
 async function bootstrap() {
+  // Configuration is read when the app module initialises, so the env file only has to be loaded first.
+  loadEnvFiles();
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { bufferLogs: true, rawBody: true });
   app.useLogger(app.get(Logger));
   const config = configureApp(app);

@@ -1,6 +1,6 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post, Put } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { CurrentUser } from '../../common/auth/decorators';
 import type { AuthUser } from '../../common/auth/principal';
 import { CartService } from './cart.service';
@@ -23,12 +23,12 @@ export class CartController {
   }
 
   @Patch('items/:productId')
-  setQuantity(@CurrentUser() user: AuthUser, @Param('productId', ObjectIdPipe) productId: string, @Body() body: SetQuantityDto) {
+  setQuantity(@CurrentUser() user: AuthUser, @Param('productId', UuidPipe) productId: string, @Body() body: SetQuantityDto) {
     return this.cart.setQuantity(user, productId, body.quantity);
   }
 
   @Delete('items/:productId')
-  remove(@CurrentUser() user: AuthUser, @Param('productId', ObjectIdPipe) productId: string) {
+  remove(@CurrentUser() user: AuthUser, @Param('productId', UuidPipe) productId: string) {
     return this.cart.remove(user, productId);
   }
 

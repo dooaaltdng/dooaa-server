@@ -1,8 +1,7 @@
 import { CONDITION_LABEL, DELIVERY_LABEL, type Collection, type Condition, type ListingStatus } from '../../common/domain';
 import { tenureLabel, yearsSince } from '../../common/util/dates';
-import type { Lean } from '../../common/util/mongo';
-import type { User } from '../users/schemas/user.schema';
-import type { Product } from './schemas/product.schema';
+import type { User } from '../users/user.model';
+import type { Product } from './product.model';
 
 /** A product card — the storefront grids, rails, wishlist and cart. */
 export type ProductCard = {
@@ -140,11 +139,11 @@ export type PresenterContext = {
   wishlisted?: Set<string>;
 };
 
-function collectionsOf(product: Lean<Product>): Collection[] {
+function collectionsOf(product: Product): Collection[] {
   const out: Collection[] = [];
   if (product.featured) out.push('featured');
-  if ((product.stats?.unitsSold ?? 0) > 0) out.push('top-sellers');
-  if ((product.stats?.views ?? 0) > 0) out.push('popular');
+  if (product.stats.unitsSold > 0) out.push('top-sellers');
+  if (product.stats.views > 0) out.push('popular');
   return out;
 }
 
@@ -153,36 +152,36 @@ export function displayStatus(product: Pick<Product, 'status' | 'stock'>): Selle
   return product.status;
 }
 
-export function toProductCard(product: Lean<Product>, context: PresenterContext): ProductCard {
-  const id = String(product._id);
+export function toProductCard(product: Product, context: PresenterContext): ProductCard {
+  const id = product.id;
   return {
     id,
     title: product.title,
     summary: product.summary,
     price: product.price,
-    previousPrice: product.previousPrice ?? null,
+    previousPrice: product.previousPrice,
     location: product.location,
     condition: product.condition,
     conditionLabel: CONDITION_LABEL[product.condition],
     image: product.images[0] ?? product.videos[0]?.posterUrl ?? null,
     categoryId: product.categoryId,
     categoryName: context.categoryNames.get(product.categoryId) ?? product.categoryId,
-    brand: product.brand ?? null,
+    brand: product.brand,
     collections: collectionsOf(product),
-    createdAt: new Date(product.publishedAt ?? product.createdAt).toISOString(),
-    sellerId: String(product.sellerId),
+    createdAt: (product.publishedAt ?? product.createdAt).toISOString(),
+    sellerId: product.sellerId,
     verifiedSeller: product.sellerVerified,
     stock: product.stock,
     inStock: product.status === 'active' && product.stock > 0,
     pricing: product.pricing,
     paymentMethod: product.paymentMethod,
-    rating: product.stats?.ratingAverage ?? 0,
-    ratingCount: product.stats?.ratingCount ?? 0,
+    rating: product.stats.ratingAverage,
+    ratingCount: product.stats.ratingCount,
     wishlisted: context.wishlisted?.has(id) ?? false,
   };
 }
 
-export function toSellerPanel(seller: Lean<User> | null): SellerPanel {
+export function toSellerPanel(seller: User | null): SellerPanel {
   if (!seller) {
     return {
       id: '',
@@ -200,25 +199,25 @@ export function toSellerPanel(seller: Lean<User> | null): SellerPanel {
       memberSince: new Date().getUTCFullYear().toString(),
     };
   }
-  const days = seller.seller?.dispatchDays ?? 3;
+  const days = seller.seller.dispatchDays;
   return {
-    id: String(seller._id),
+    id: seller.id,
     name: `${seller.firstName} ${seller.lastName}`.trim(),
-    storeName: seller.seller?.storeName ?? null,
-    avatarUrl: seller.avatarUrl ?? null,
+    storeName: seller.seller.storeName,
+    avatarUrl: seller.avatarUrl,
     verified: seller.identity === 'verified',
     tenure: tenureLabel(seller.createdAt),
     dispatch: `Delivery within ${days} ${days === 1 ? 'day' : 'days'}`,
-    response: seller.seller?.responseLabel ?? 'Typically responds within a few hours',
+    response: seller.seller.responseLabel,
     location: seller.location ? `${seller.location}, Nigeria` : 'Lagos, Nigeria',
-    delivery: seller.seller?.deliveryLabel ?? 'Nationwide Delivery (1-3 business days within Lagos)',
-    rating: seller.stats?.ratingAverage ?? 0,
-    ratingCount: seller.stats?.ratingCount ?? 0,
-    memberSince: new Date(seller.createdAt).getUTCFullYear().toString(),
+    delivery: seller.seller.deliveryLabel,
+    rating: seller.stats.ratingAverage,
+    ratingCount: seller.stats.ratingCount,
+    memberSince: seller.createdAt.getUTCFullYear().toString(),
   };
 }
 
-export function toProductDetail(product: Lean<Product>, seller: Lean<User> | null, context: PresenterContext): ProductDetail {
+export function toProductDetail(product: Product, seller: User | null, context: PresenterContext): ProductDetail {
   const card = toProductCard(product, context);
   return {
     ...card,
@@ -233,44 +232,44 @@ export function toProductDetail(product: Lean<Product>, seller: Lean<User> | nul
   };
 }
 
-export function toSellerProduct(product: Lean<Product>, categoryNames: Map<string, string>): SellerProductView {
+export function toSellerProduct(product: Product, categoryNames: Map<string, string>): SellerProductView {
   return {
-    id: String(product._id),
-    sellerId: String(product.sellerId),
+    id: product.id,
+    sellerId: product.sellerId,
     title: product.title,
     description: product.description,
     highlights: product.highlights,
     payment: product.paymentMethod,
     price: product.price,
-    previousPrice: product.previousPrice ?? null,
+    previousPrice: product.previousPrice,
     pricing: product.pricing,
     condition: product.condition,
     stock: product.stock,
     category: product.categoryId,
     categoryName: categoryNames.get(product.categoryId) ?? product.categoryId,
-    brand: product.brand ?? null,
+    brand: product.brand,
     location: product.location,
     delivery: product.delivery,
     status: product.status,
     displayStatus: displayStatus(product),
     stockStatus: product.stock > 0 ? 'in-stock' : 'out-of-stock',
-    moderationNote: product.moderation?.note ?? null,
-    moderationFlags: product.moderation?.flags ?? [],
+    moderationNote: product.moderation.note,
+    moderationFlags: product.moderation.flags,
     images: product.images,
     videos: product.videos.map((video) => ({ url: video.url, posterUrl: video.posterUrl ?? null })),
-    unitsSold: product.stats?.unitsSold ?? 0,
-    revenue: product.stats?.revenue ?? 0,
-    views: product.stats?.views ?? 0,
-    wishlists: product.stats?.wishlists ?? 0,
-    lastSaleAt: product.stats?.lastSaleAt ? new Date(product.stats.lastSaleAt).toISOString() : null,
-    createdAt: new Date(product.createdAt).toISOString(),
-    publishedAt: product.publishedAt ? new Date(product.publishedAt).toISOString() : null,
+    unitsSold: product.stats.unitsSold,
+    revenue: product.stats.revenue,
+    views: product.stats.views,
+    wishlists: product.stats.wishlists,
+    lastSaleAt: product.stats.lastSaleAt?.toISOString() ?? null,
+    createdAt: product.createdAt.toISOString(),
+    publishedAt: product.publishedAt?.toISOString() ?? null,
   };
 }
 
-export function toAdminListing(product: Lean<Product>, seller: Lean<User> | null, categoryNames: Map<string, string>): AdminListingView {
+export function toAdminListing(product: Product, seller: User | null, categoryNames: Map<string, string>): AdminListingView {
   const panel = toSellerPanel(seller);
-  const id = String(product._id);
+  const id = product.id;
   return {
     id,
     title: product.title,
@@ -279,7 +278,7 @@ export function toAdminListing(product: Lean<Product>, seller: Lean<User> | null
     description: product.description,
     highlights: product.highlights,
     additionalDescription: product.highlights,
-    sellerId: String(product.sellerId),
+    sellerId: product.sellerId,
     sellerName: seller ? `${seller.firstName} ${seller.lastName}`.trim() : panel.name,
     sellerEmail: seller?.email ?? '',
     sellerAvatar: seller?.avatarUrl ?? null,
@@ -290,21 +289,21 @@ export function toAdminListing(product: Lean<Product>, seller: Lean<User> | null
     sellerDelivery: panel.delivery,
     deliveryPromise: panel.dispatch,
     price: product.price,
-    previousPrice: product.previousPrice ?? null,
-    priceSince: (product.priceChangedAt ?? product.publishedAt ?? product.createdAt)?.toISOString?.() ?? null,
-    previousPriceSince: product.previousPriceSince ? new Date(product.previousPriceSince).toISOString() : null,
+    previousPrice: product.previousPrice,
+    priceSince: (product.priceChangedAt ?? product.publishedAt ?? product.createdAt).toISOString(),
+    previousPriceSince: product.previousPriceSince?.toISOString() ?? null,
     stock: product.stock,
-    inventory: product.stock + (product.stats?.unitsSold ?? 0),
+    inventory: product.stock + product.stats.unitsSold,
     status: product.status,
     pricing: product.pricing,
     payment: product.paymentMethod,
     delivery: product.delivery,
     listedAs: product.listedAs,
-    listedOn: new Date(product.publishedAt ?? product.createdAt).toISOString(),
-    inquiries: product.stats?.inquiries ?? 0,
+    listedOn: (product.publishedAt ?? product.createdAt).toISOString(),
+    inquiries: product.stats.inquiries,
     featured: product.featured,
-    moderationFlags: product.moderation?.flags ?? [],
-    moderationNote: product.moderation?.note ?? null,
+    moderationFlags: product.moderation.flags,
+    moderationNote: product.moderation.note,
     media: [
       ...product.images.map((url, index) => ({ id: `${id}_img_${index}`, kind: 'image' as const, url, posterUrl: null })),
       ...product.videos.map((video, index) => ({ id: `${id}_vid_${index}`, kind: 'video' as const, url: video.url, posterUrl: video.posterUrl ?? null })),

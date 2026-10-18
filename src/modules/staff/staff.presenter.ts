@@ -1,7 +1,6 @@
-import type { StaffRole } from '../../common/domain';
+import type { StaffRole, StaffStatus } from '../../common/domain';
 import { STAFF_ROLE_LABEL } from '../../common/domain';
-import type { Lean } from '../../common/util/mongo';
-import type { Staff, StaffStatus } from './schemas/staff.schema';
+import type { StaffMember } from './staff.model';
 
 /** The console's `Session` shape — never carries the password. */
 export type StaffSession = {
@@ -17,9 +16,9 @@ export type StaffSession = {
   lastSeenAt: string | null;
 };
 
-export function toStaffSession(member: Lean<Staff>, online = false): StaffSession {
+export function toStaffSession(member: StaffMember, online = false): StaffSession {
   return {
-    id: String(member._id),
+    id: member.id,
     firstName: member.firstName,
     lastName: member.lastName,
     email: member.email,
@@ -28,6 +27,6 @@ export function toStaffSession(member: Lean<Staff>, online = false): StaffSessio
     avatar: member.avatarUrl ?? null,
     online,
     status: member.status,
-    lastSeenAt: member.lastSeenAt ? new Date(member.lastSeenAt).toISOString() : null,
+    lastSeenAt: member.lastSeenAt?.toISOString() ?? null,
   };
 }

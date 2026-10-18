@@ -1,8 +1,8 @@
 import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { ArrayMaxSize, IsArray, IsBoolean, IsIn, IsMongoId, IsOptional, IsString, Matches, MaxLength, MinLength, ValidateNested } from 'class-validator';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { ArrayMaxSize, IsArray, IsBoolean, IsIn, IsUUID, IsOptional, IsString, Matches, MaxLength, MinLength, ValidateNested } from 'class-validator';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { CurrentStaff, CurrentUser, RequirePermissions, RequireVerifiedEmail, StaffOnly } from '../../common/auth/decorators';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
 import { BANK_VERIFICATION_METHODS, ID_TYPES, VERIFICATION_LEVELS, type BankVerificationMethod, type IdType, type VerificationLevel } from '../../common/domain';
@@ -12,9 +12,9 @@ import { VerificationService } from './verification.service';
 
 class DocumentsDto {
   /** Media ids from uploads with purpose "kyc". */
-  @IsMongoId({ message: 'Upload the front of your ID.' }) idFront: string;
-  @IsOptional() @IsMongoId() idBack?: string;
-  @IsMongoId({ message: 'Take your selfie.' }) selfie: string;
+  @IsUUID('all', { message: 'Upload the front of your ID.' }) idFront: string;
+  @IsOptional() @IsUUID() idBack?: string;
+  @IsUUID('all', { message: 'Take your selfie.' }) selfie: string;
 }
 
 class BankDto {
@@ -76,27 +76,27 @@ export class AdminVerificationController {
   }
 
   @Get('verifications/:id')
-  get(@Param('id', ObjectIdPipe) id: string) {
+  get(@Param('id', UuidPipe) id: string) {
     return this.verification.get(id);
   }
 
   @RequirePermissions('users.verify')
   @HttpCode(200)
   @Post('verifications/:id/approve')
-  approve(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string, @Body() body: ApproveDto) {
+  approve(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string, @Body() body: ApproveDto) {
     return this.verification.approve(staff, id, body.level);
   }
 
   @RequirePermissions('users.verify')
   @HttpCode(200)
   @Post('verifications/:id/reject')
-  reject(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string, @Body() body: RejectDto) {
+  reject(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string, @Body() body: RejectDto) {
     return this.verification.reject(staff, id, body.reason);
   }
 
   @RequirePermissions('users.verify')
   @Patch('sellers/:id/verification-level')
-  level(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string, @Body() body: LevelDto) {
+  level(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string, @Body() body: LevelDto) {
     return this.verification.setLevel(staff, id, body.level);
   }
 }

@@ -1,10 +1,10 @@
-import type { QueryFilter } from 'mongoose';
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, or, sql, type SQL } from 'drizzle-orm';
 import { CONDITIONS, PRICE_BANDS, type Condition, type PriceBand, type SortKey } from '../../common/domain';
-import { escapeRegex } from '../../common/util/text';
-import type { Product } from './schemas/product.schema';
+import { products } from '../../database/schema';
+import { containsText, descNullsLast } from '../../database/sql';
 
 /** What a buyer can see: live, not deleted. */
-export const PUBLIC_PRODUCT_FILTER = { status: 'active', deletedAt: null } as const;
+export const PUBLIC_PRODUCT_FILTER: SQL = and(eq(products.status, 'active'), isNull(products.deletedAt))!;
 
 export type CatalogQuery = {
   q?: string;
@@ -19,6 +19,9 @@ export type CatalogQuery = {
   collection?: string;
   inStock?: boolean;
 };
+
+/** How a search term is matched: full-text (whole words, ranked), substring (partial words), or not at all. */
+export type SearchMode = 'text' | 'partial' | 'none';
 
 /** "Brand New" on the sidebar and "New" on cards are both `new`. */
 export function normalizeCondition(value: string): Condition | null {
@@ -37,66 +40,77 @@ export function sellerVerificationFilter(values: string[] | undefined): boolean 
   return verified === unverified ? null : verified;
 }
 
-/**
- * Builds the catalog's Mongo filter. `textMode` uses the full-text index
- * (whole words, relevance-ranked); the regex mode catches partial words
- * ("iph") when full-text finds nothing.
- */
-export function buildCatalogFilter(query: CatalogQuery, textMode: 'text' | 'regex' | 'none' = 'text'): QueryFilter<Product> {
-  const filter: Record<string, unknown> = { ...PUBLIC_PRODUCT_FILTER };
-  const and: Record<string, unknown>[] = [];
+/** The search term as the catalog uses it: trimmed and bounded. */
+export function searchTerm(query: Pick<CatalogQuery, 'q'>): string | undefined {
+  return query.q?.trim().slice(0, 80) || undefined;
+}
 
-  const term = query.q?.trim().slice(0, 80);
-  if (term && textMode === 'text') filter.$text = { $search: term };
-  if (term && textMode === 'regex') {
-    const pattern = new RegExp(escapeRegex(term), 'i');
-    and.push({ $or: [{ title: pattern }, { brand: pattern }, { summary: pattern }, { location: pattern }] });
+function tsQuery(term: string): SQL {
+  return sql`websearch_to_tsquery('english', ${term})`;
+}
+
+/**
+ * Builds the catalog's WHERE clause. Full-text mode matches whole words
+ * through the weighted `search` document; partial mode catches word
+ * fragments ("iph") when full-text finds nothing.
+ */
+export function buildCatalogFilter(query: CatalogQuery, mode: SearchMode = 'text'): SQL {
+  const conditions: SQL[] = [PUBLIC_PRODUCT_FILTER];
+
+  const term = searchTerm(query);
+  if (term && mode === 'text') conditions.push(sql`${products.search} @@ ${tsQuery(term)}`);
+  if (term && mode === 'partial') {
+    conditions.push(or(containsText(products.title, term), containsText(products.brand, term), containsText(products.summary, term), containsText(products.location, term))!);
   }
 
-  if (query.category?.length) filter.categoryId = { $in: query.category };
-  if (query.collection === 'featured') filter.featured = true;
-  if (query.collection === 'top-sellers') filter['stats.unitsSold'] = { $gt: 0 };
+  if (query.category?.length) conditions.push(inArray(products.categoryId, query.category));
+  if (query.collection === 'featured') conditions.push(eq(products.featured, true));
+  if (query.collection === 'top-sellers') conditions.push(gt(products.statsUnitsSold, 0));
 
-  const conditions = (query.condition ?? []).map(normalizeCondition).filter((value): value is Condition => Boolean(value));
-  if (query.condition?.length) filter.condition = { $in: conditions };
+  if (query.condition?.length) {
+    const conditionValues = query.condition.map(normalizeCondition).filter((value): value is Condition => Boolean(value));
+    conditions.push(conditionValues.length ? inArray(products.condition, conditionValues) : sql`false`);
+  }
 
-  if (query.brand?.length) filter.brand = { $in: query.brand.map((brand) => new RegExp(`^${escapeRegex(brand)}$`, 'i')) };
+  if (query.brand?.length) conditions.push(inArray(sql`lower(${products.brand})`, query.brand.map((brand) => brand.trim().toLowerCase())));
 
   const verified = sellerVerificationFilter(query.seller);
-  if (verified !== null) filter.sellerVerified = verified;
+  if (verified !== null) conditions.push(eq(products.sellerVerified, verified));
 
-  const price: Record<string, number> = {};
-  if (query.min !== undefined) price.$gte = query.min;
-  if (query.max !== undefined) price.$lte = query.max;
+  let min = query.min;
+  let max = query.max;
+  let below: number | undefined;
   if (query.price && query.price !== 'any') {
     const band = PRICE_BANDS[query.price];
     if (band) {
-      price.$gte = Math.max(price.$gte ?? 0, band.min);
-      if (Number.isFinite(band.max)) price.$lt = band.max;
+      min = Math.max(min ?? 0, band.min);
+      if (Number.isFinite(band.max)) below = band.max;
     }
   }
-  if (Object.keys(price).length) filter.price = price;
-  if (query.inStock) filter.stock = { $gt: 0 };
+  if (min !== undefined) conditions.push(gte(products.price, min));
+  if (max !== undefined) conditions.push(lte(products.price, max));
+  if (below !== undefined) conditions.push(lt(products.price, below));
+  if (query.inStock) conditions.push(gt(products.stock, 0));
 
-  if (and.length) filter.$and = and;
-  return filter as QueryFilter<Product>;
+  return and(...conditions)!;
 }
 
-export function catalogSort(query: CatalogQuery, textMode: 'text' | 'regex' | 'none'): Record<string, 1 | -1 | { $meta: 'textScore' }> {
+export function catalogSort(query: CatalogQuery, mode: SearchMode): SQL[] {
   switch (query.sort) {
     case 'price-asc':
-      return { price: 1, _id: 1 };
+      return [asc(products.price), asc(products.id)];
     case 'price-desc':
-      return { price: -1, _id: 1 };
+      return [desc(products.price), asc(products.id)];
     case 'newest':
-      return { publishedAt: -1, createdAt: -1, _id: -1 };
+      return [descNullsLast(products.publishedAt), desc(products.createdAt), desc(products.id)];
     case 'oldest':
-      return { publishedAt: 1, createdAt: 1, _id: 1 };
+      return [asc(products.publishedAt), asc(products.createdAt), asc(products.id)];
     default:
       break;
   }
-  if (query.collection === 'top-sellers') return { 'stats.unitsSold': -1, 'stats.ratingAverage': -1, _id: -1 };
-  if (query.collection === 'popular') return { 'stats.views': -1, 'stats.wishlists': -1, _id: -1 };
-  if (textMode === 'text') return { score: { $meta: 'textScore' }, _id: -1 };
-  return { featured: -1, publishedAt: -1, createdAt: -1, _id: -1 };
+  if (query.collection === 'top-sellers') return [desc(products.statsUnitsSold), desc(products.statsRatingAverage), desc(products.id)];
+  if (query.collection === 'popular') return [desc(products.statsViews), desc(products.statsWishlists), desc(products.id)];
+  const term = searchTerm(query);
+  if (mode === 'text' && term) return [sql`ts_rank(${products.search}, ${tsQuery(term)}) desc`, desc(products.id)];
+  return [desc(products.featured), descNullsLast(products.publishedAt), desc(products.createdAt), desc(products.id)];
 }

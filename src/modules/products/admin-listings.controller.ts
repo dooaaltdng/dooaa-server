@@ -2,7 +2,7 @@ import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestj
 import { ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { IsArray, IsBoolean, IsIn, IsNumber, IsOptional, IsString, MaxLength, Min } from 'class-validator';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { CurrentStaff, RequirePermissions, StaffOnly } from '../../common/auth/decorators';
 import type { AuthStaff } from '../../common/auth/principal';
 import { CONDITIONS, LISTING_STATUSES, type Condition, type ListingStatus } from '../../common/domain';
@@ -64,7 +64,7 @@ export class AdminListingsController {
   }
 
   @Get('listings/:id')
-  get(@Param('id', ObjectIdPipe) id: string) {
+  get(@Param('id', UuidPipe) id: string) {
     return this.products.adminGet(id);
   }
 
@@ -76,19 +76,19 @@ export class AdminListingsController {
 
   @RequirePermissions('listings.moderate')
   @Patch('listings/:id/status')
-  moderate(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string, @Body() body: ModerateListingDto) {
+  moderate(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string, @Body() body: ModerateListingDto) {
     return this.products.moderate(staff, id, body.status, body.note);
   }
 
   @RequirePermissions('listings.moderate')
   @Patch('listings/:id/featured')
-  feature(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string, @Body() body: FeatureListingDto) {
+  feature(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string, @Body() body: FeatureListingDto) {
     return this.products.setFeatured(staff, id, body.featured);
   }
 
   @RequirePermissions('listings.delete')
   @Delete('listings/:id')
-  remove(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string) {
+  remove(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string) {
     return this.products.adminRemove(staff, id);
   }
 

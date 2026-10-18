@@ -1,10 +1,7 @@
-import { createHmac } from 'node:crypto';
 import request from 'supertest';
 import type { TestApp } from './app';
-import { API, Http, data } from './http';
 import { codeFromMail, type TestUser } from './factories';
-import { PAYMENT_PROVIDER } from '../../src/modules/payments/providers/payment-provider';
-import { SandboxProvider } from '../../src/modules/payments/providers/sandbox.provider';
+import { API, Http, data } from './http';
 
 export const DELIVERY = {
   firstName: 'Nelson',
@@ -16,26 +13,24 @@ export const DELIVERY = {
   email: 'nelson@example.com',
 };
 
-/** Waits for the sandbox's simulated webhooks (charges, refunds, transfers) and queued mail. */
+/** Waits for Bachs' webhooks (charges, refunds, payouts) and queued mail to land. */
 export async function settle(t: TestApp): Promise<void> {
-  const provider = t.get<SandboxProvider>(PAYMENT_PROVIDER);
   for (let round = 0; round < 3; round += 1) {
-    await provider.idle();
+    await t.bachs.idle();
     await t.mail.idle();
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
 
-/** The buyer pays on the sandbox's hosted page. */
-export async function sandboxPay(t: TestApp, reference: string, outcome: 'success' | 'failed' = 'success', channel = 'card') {
-  const http = new Http(t);
-  return data(await http.post(`/payments/sandbox/${encodeURIComponent(reference)}/pay`, { outcome, channel }));
+/** The buyer pays on Bachs' hosted checkout. */
+export function bachsPay(t: TestApp, reference: string, outcome: 'success' | 'failed' = 'success', options: { method?: 'NGN_CARD' | 'NGN_BANK_TRANSFER'; amount?: number } = {}) {
+  return t.bachs.pay(reference, outcome, options);
 }
 
 /** Pays and confirms, the way the client's callback page does. */
 export async function payAndVerify(t: TestApp, buyer: TestUser, reference: string, outcome: 'success' | 'failed' = 'success') {
   const http = new Http(t);
-  await sandboxPay(t, reference, outcome);
+  bachsPay(t, reference, outcome);
   const payment = data(await http.post(`/payments/${encodeURIComponent(reference)}/verify`, {}, buyer.token));
   await settle(t);
   return payment;
@@ -56,15 +51,10 @@ export async function paidOrder(t: TestApp, buyer: TestUser, productId: string, 
   return data(await http.get(`/orders/${checkout.orders[0].id}`, buyer.token));
 }
 
-/** Signs a sandbox webhook the way the provider would. */
-export function signedWebhook(t: TestApp, body: unknown) {
-  const raw = JSON.stringify(body);
-  const signature = createHmac('sha512', process.env.PAYMENT_WEBHOOK_SECRET!).update(raw).digest('hex');
-  return request(t.server)
-    .post(`${API}/payments/webhooks/sandbox`)
-    .set('Content-Type', 'application/json')
-    .set('x-sandbox-signature', signature)
-    .send(raw);
+/** Posts an event to the webhook, signed the way Bachs signs it. */
+export function signedWebhook(t: TestApp, event: unknown) {
+  const raw = JSON.stringify(event);
+  return request(t.server).post(`${API}/payments/webhooks/bachs`).set(t.bachs.signatureHeaders(raw)).send(raw);
 }
 
 /** Ships, receives and releases an order, ending with money in the seller's balance. */

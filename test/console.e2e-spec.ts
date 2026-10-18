@@ -43,7 +43,7 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       const seller = await registerSeller(t);
       const buyer = await registerUser(t);
       const product = await createProduct(t, seller.id, { title: 'Canon EOS R50' });
-      const order = await paidOrder(t, buyer, String(product._id));
+      const order = await paidOrder(t, buyer, product.id);
       data(await http.post(`/seller/orders/${order.id}/ship`, { carrier: 'UPS', trackingNumber: 'UPS-1' }, seller.token));
       data(await http.post(`/orders/${order.id}/dispute`, { reason: 'The kit lens was missing from the box.' }, buyer.token));
 
@@ -59,7 +59,7 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       const seller = await registerSeller(t);
       const buyer = await registerUser(t);
       const product = await createProduct(t, seller.id, { title: 'PlayStation 5 Slim' });
-      const order = await paidOrder(t, buyer, String(product._id));
+      const order = await paidOrder(t, buyer, product.id);
       await completeOrder(t, buyer, seller, order.id);
       const profile = data(await http.get(`/admin/sellers/${seller.id}`, superadmin.token));
       expect(profile).toMatchObject({ listingCount: 1, soldCount: 1, documents: [], verificationStatus: null });
@@ -74,11 +74,11 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
 
       failure(await http.patch(`/admin/users/${seller.id}/status`, { status: 'banned' }, moderator.token), 403, 'PERMISSION_DENIED');
       expect(data(await http.patch(`/admin/users/${seller.id}/status`, { status: 'suspended', reason: 'Reported listings' }, moderator.token))).toEqual({ id: seller.id, status: 'suspended' });
-      failure(await http.get(`/products/${product._id}`), 404);
+      failure(await http.get(`/products/${product.id}`), 404);
       failure(await http.get('/seller/products', seller.token), 403, 'ACCOUNT_SUSPENDED');
 
       data(await http.patch(`/admin/users/${seller.id}/status`, { status: 'active' }, moderator.token));
-      expect(data(await http.get(`/products/${product._id}`)).title).toBe('Restricted Seller Item');
+      expect(data(await http.get(`/products/${product.id}`)).title).toBe('Restricted Seller Item');
 
       const admin = await staffToken(t, 'admin');
       data(await http.patch(`/admin/users/${seller.id}/status`, { status: 'banned' }, admin.token));
@@ -106,7 +106,7 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
 
       expect(data(await http.post(`/admin/sellers/${seller.id}/verify`, {}, superadmin.token))).toEqual({ id: seller.id, identity: 'verified' });
       expect(data(await http.get('/auth/me', seller.token)).identity).toBe('verified');
-      expect((await model<Product>(t, Product.name).findById(product._id).lean())?.sellerVerified).toBe(true);
+      expect((await model<Product>(t, Product.name).findById(product.id).lean())?.sellerVerified).toBe(true);
       await t.mail.idle();
       expect(t.mail.lastTo(seller.email)?.subject).toBe('Your DOOAA identity is verified');
       // Idempotent: a second click changes nothing and sends nothing new.
@@ -180,7 +180,7 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       const seller = await registerSeller(t, { storeName: 'Zainab Gadget Hub' });
       const buyer = await registerUser(t, { firstName: 'Zainab', lastName: 'Yusuf' });
       const product = await createProduct(t, seller.id, { title: 'Zainab Special Edition Speaker' });
-      const order = await paidOrder(t, buyer, String(product._id));
+      const order = await paidOrder(t, buyer, product.id);
       data(await http.post(`/seller/orders/${order.id}/ship`, { carrier: 'GIG', trackingNumber: 'GIG-1' }, seller.token));
       const dispute = data(await http.post(`/orders/${order.id}/dispute`, { reason: 'Zainab speaker does not power on at all.' }, buyer.token));
       const moderator = await staffToken(t, 'moderator');
@@ -188,7 +188,7 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       const hits = data(await http.get('/admin/search?q=zainab', moderator.token));
       expect(hits.users.map((row: any) => row.id)).toEqual(expect.arrayContaining([seller.id, buyer.id]));
       expect(hits.users.find((row: any) => row.id === seller.id)).toMatchObject({ role: 'seller', href: `/users/sellers/${seller.id}` });
-      expect(hits.listings[0]).toMatchObject({ id: String(product._id), sellerName: 'Zainab Gadget Hub', href: `/listings?item=${product._id}` });
+      expect(hits.listings[0]).toMatchObject({ id: product.id, sellerName: 'Zainab Gadget Hub', href: `/listings?item=${product.id}` });
       expect(hits.transactions.map((row: any) => row.id)).toContain(order.orderId);
       expect(hits.disputes[0]).toMatchObject({ id: dispute.id, href: `/disputes?id=${dispute.id}` });
 
@@ -252,7 +252,7 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       const seller = await registerSeller(t);
       const buyer = await registerUser(t);
       const product = await createProduct(t, seller.id, { price: 95_000 });
-      await paidOrder(t, buyer, String(product._id));
+      await paidOrder(t, buyer, product.id);
       const metrics = data(await http.get('/admin/dashboard/metrics', superadmin.token));
       expect(metrics.map((metric: any) => metric.id)).toEqual(['buyers', 'sellers', 'items', 'transactions']);
       expect(metrics[0].value).toBeGreaterThan(0);
@@ -269,8 +269,8 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       const seller = await registerSeller(t);
       const buyer = await registerUser(t);
       const product = await createProduct(t, seller.id, { price: 50_000 });
-      data(await http.get(`/products/${product._id}`, buyer.token));
-      await paidOrder(t, buyer, String(product._id));
+      data(await http.get(`/products/${product.id}`, buyer.token));
+      await paidOrder(t, buyer, product.id);
       // The view is counted just after the product page is answered.
       const analytics = await eventually(async () => {
         const page = data(await http.get('/seller/analytics?range=7d', seller.token));
@@ -318,9 +318,9 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       const seller = await registerSeller(t);
       const buyer = await registerUser(t);
       const product = await createProduct(t, seller.id);
-      await paidOrder(t, buyer, String(product._id));
-      data(await http.put(`/wishlist/${String((await createProduct(t, seller.id))._id)}`, {}, buyer.token));
-      data(await http.post('/cart/items', { productId: String((await createProduct(t, seller.id))._id), quantity: 2 }, buyer.token));
+      await paidOrder(t, buyer, product.id);
+      data(await http.put(`/wishlist/${(await createProduct(t, seller.id)).id}`, {}, buyer.token));
+      data(await http.post('/cart/items', { productId: (await createProduct(t, seller.id)).id, quantity: 2 }, buyer.token));
       await settle(t);
       const summary = data(await http.get('/me/summary', buyer.token));
       expect(summary).toMatchObject({ orders: 1, wishlist: 1, cart: 2, messages: expect.any(Number), notifications: expect.any(Number) });
@@ -331,14 +331,14 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       const seller = await registerSeller(t);
       const buyer = await registerUser(t);
       const product = await createProduct(t, seller.id, { stock: 3 });
-      data(await http.post('/cart/items', { productId: String(product._id), quantity: 2 }, buyer.token));
+      data(await http.post('/cart/items', { productId: product.id, quantity: 2 }, buyer.token));
       data(await http.put('/cart/delivery', DELIVERY, buyer.token));
       const checkout = data(await http.post('/checkout', { method: 'transfer' }, buyer.token));
-      expect((await model<Product>(t, Product.name).findById(product._id).lean())!.stock).toBe(1);
+      expect((await model<Product>(t, Product.name).findById(product.id).lean())!.stock).toBe(1);
       const jobs = t.get<JobsService>(JobsService);
       const result = await jobs.paymentsJob(new Date(Date.now() + 2 * 3_600_000));
       expect(result.expired).toBeGreaterThanOrEqual(1);
-      expect((await model<Product>(t, Product.name).findById(product._id).lean())!.stock).toBe(3);
+      expect((await model<Product>(t, Product.name).findById(product.id).lean())!.stock).toBe(3);
       expect((await model<Order>(t, Order.name).findById(checkout.orders[0].orderId).lean())!.status).toBe('cancelled');
     });
 
@@ -346,7 +346,7 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       const seller = await registerSeller(t);
       const buyer = await registerUser(t);
       const product = await createProduct(t, seller.id);
-      data(await http.post('/cart/items', { productId: String(product._id) }, buyer.token));
+      data(await http.post('/cart/items', { productId: product.id }, buyer.token));
       data(await http.put('/cart/delivery', DELIVERY, buyer.token));
       const checkout = data(await http.post('/checkout', { method: 'card' }, buyer.token));
       // Paid at the provider, but our webhook and the verify call never arrived.
@@ -367,7 +367,7 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       const seller = await registerSeller(t);
       const buyer: TestUser = await registerUser(t);
       const product = await createProduct(t, seller.id, { price: 10_000 });
-      const checkout = data(await http.post('/checkout/escrow', { productId: String(product._id), method: 'card', delivery: DELIVERY }, buyer.token));
+      const checkout = data(await http.post('/checkout/escrow', { productId: product.id, method: 'card', delivery: DELIVERY }, buyer.token));
       await payAndVerify(t, buyer, checkout.payment.reference);
       expect(data(await http.get('/me/summary', buyer.token)).orders).toBe(1);
     });

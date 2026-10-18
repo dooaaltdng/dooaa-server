@@ -1,47 +1,6 @@
-import { TtlCache } from './cache';
-import { escrowReference, idOf, isObjectId, orderReference, paymentReference, randomDigits } from './ids';
+import { escrowReference, orderReference, paymentReference, randomDigits } from './ids';
 import { paginateArray, pageWindow, toPage } from './pagination';
-import { Types } from 'mongoose';
-
-describe('TtlCache', () => {
-  it('returns values until they expire', async () => {
-    const cache = new TtlCache<number>(20);
-    cache.set('a', 1);
-    expect(cache.get('a')).toBe(1);
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(cache.get('a')).toBeUndefined();
-  });
-
-  it('shares one in-flight load between concurrent callers', async () => {
-    const cache = new TtlCache<number>(1_000);
-    let loads = 0;
-    const load = async () => {
-      loads += 1;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      return 42;
-    };
-    const values = await Promise.all([cache.wrap('k', load), cache.wrap('k', load), cache.wrap('k', load)]);
-    expect(values).toEqual([42, 42, 42]);
-    expect(loads).toBe(1);
-  });
-
-  it('evicts the oldest entry at capacity and forgets on delete', () => {
-    const cache = new TtlCache<number>(1_000, 2);
-    cache.set('a', 1);
-    cache.set('b', 2);
-    cache.set('c', 3);
-    expect(cache.get('a')).toBeUndefined();
-    cache.delete('b');
-    expect(cache.get('b')).toBeUndefined();
-    expect(cache.get('c')).toBe(3);
-  });
-
-  it('does not cache a failed load', async () => {
-    const cache = new TtlCache<number>(1_000);
-    await expect(cache.wrap('x', async () => Promise.reject(new Error('boom')))).rejects.toThrow('boom');
-    expect(await cache.wrap('x', async () => 7)).toBe(7);
-  });
-});
+import { isUuid, uuidv7 } from './uuid';
 
 describe('references', () => {
   it('generates the reference formats the apps print', () => {
@@ -56,14 +15,23 @@ describe('references', () => {
     expect(seen.size).toBe(2_000);
   });
 
-  it('recognises object ids', () => {
-    const id = new Types.ObjectId();
-    expect(isObjectId(id.toHexString())).toBe(true);
-    expect(isObjectId('123')).toBe(false);
-    expect(isObjectId(12)).toBe(false);
-    expect(idOf(id)).toBe(id.toHexString());
-    expect(idOf({ _id: id })).toBe(id.toHexString());
-    expect(idOf(null)).toBeUndefined();
+});
+
+describe('uuid', () => {
+  it('mints version 7 ids that sort by time', () => {
+    const earlier = uuidv7(Date.UTC(2026, 0, 1));
+    const later = uuidv7(Date.UTC(2026, 0, 2));
+    expect(earlier).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(earlier < later).toBe(true);
+    expect(new Set(Array.from({ length: 1_000 }, () => uuidv7())).size).toBe(1_000);
+  });
+
+  it('recognises record ids', () => {
+    expect(isUuid(uuidv7())).toBe(true);
+    expect(isUuid('0190f8f5-3b1c-7e4a-9d2c-1f2e3d4c5b6a')).toBe(true);
+    expect(isUuid('65f0c0ffee0000000000abcd')).toBe(false);
+    expect(isUuid('123')).toBe(false);
+    expect(isUuid(12)).toBe(false);
   });
 });
 

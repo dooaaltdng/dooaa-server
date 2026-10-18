@@ -1,20 +1,20 @@
 import { Injectable } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
+import { and, count, desc, eq, exists, inArray, isNotNull, or, sql, type SQL } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff } from '../../common/auth/principal';
 import type { EscrowStatus, Permission, Settlement } from '../../common/domain';
-import type { Lean } from '../../common/util/mongo';
-import { pageWindow, toPage, type Page } from '../../common/util/pagination';
-import { containsRegex } from '../../common/util/text';
 import { formatNaira } from '../../common/util/money';
+import { pageWindow, toPage, type Page } from '../../common/util/pagination';
+import { isUuid } from '../../common/util/uuid';
+import { InjectDb, type Database } from '../../database/database';
+import { orderItems, orders, products, users } from '../../database/schema';
+import { containsText, descNullsLast } from '../../database/sql';
 import { AuditService } from '../audit/audit.service';
-import { Product } from '../products/schemas/product.schema';
 import { SettingsService } from '../settings/settings.service';
-import { User } from '../users/schemas/user.schema';
+import { UsersService } from '../users/users.service';
+import type { Order } from './order.model';
 import { toEscrowTransaction, type EscrowTransactionView } from './order.presenter';
 import { OrdersService, type Actor } from './orders.service';
-import { Order } from './schemas/order.schema';
 
 const SETTLEMENT_PERMISSION: Record<Settlement, Permission> = {
   released: 'escrow.release',
@@ -34,48 +34,70 @@ const SETTLEMENT_ACTION: Record<Settlement, string> = {
 @Injectable()
 export class EscrowAdminService {
   constructor(
-    @InjectModel(Order.name) private readonly orders: Model<Order>,
-    @InjectModel(User.name) private readonly users: Model<User>,
-    @InjectModel(Product.name) private readonly products: Model<Product>,
+    @InjectDb() private readonly db: Database,
+    private readonly users: UsersService,
     private readonly orderService: OrdersService,
     private readonly settings: SettingsService,
     private readonly audit: AuditService,
   ) {}
 
-  private async views(rows: Lean<Order>[]): Promise<EscrowTransactionView[]> {
-    const people = await this.users.find({ _id: { $in: rows.flatMap((row) => [row.buyerId, row.sellerId]) } }).lean<Lean<User>[]>();
-    const byId = new Map(people.map((person) => [String(person._id), person]));
-    const products = await this.products
-      .find({ _id: { $in: rows.map((row) => row.items[0]?.productId).filter(Boolean) } })
-      .select('categoryId')
-      .lean<Lean<Product>[]>();
-    const category = new Map(products.map((product) => [String(product._id), product.categoryId]));
+  private async views(rows: Order[]): Promise<EscrowTransactionView[]> {
+    const firstProducts = rows.map((row) => row.items[0]?.productId).filter((id): id is string => Boolean(id));
+    const [people, categories] = await Promise.all([
+      this.users.findByIds(rows.flatMap((row) => [row.buyerId, row.sellerId])),
+      firstProducts.length ? this.db.select({ id: products.id, categoryId: products.categoryId }).from(products).where(inArray(products.id, firstProducts)) : [],
+    ]);
+    const byId = new Map(people.map((person) => [person.id, person]));
+    const category = new Map(categories.map((product) => [product.id, product.categoryId]));
     return rows.map((row) =>
-      toEscrowTransaction(row, byId.get(String(row.buyerId)) ?? null, byId.get(String(row.sellerId)) ?? null, category.get(String(row.items[0]?.productId)) ?? null),
+      toEscrowTransaction(row, byId.get(row.buyerId) ?? null, byId.get(row.sellerId) ?? null, category.get(row.items[0]?.productId ?? '') ?? null),
     );
   }
 
   async list(query: { search?: string; status?: EscrowStatus | 'all'; page?: number; limit?: number }): Promise<Page<EscrowTransactionView>> {
-    const filter: Record<string, unknown> = { escrow: { $exists: true } };
-    if (query.status && query.status !== 'all') filter['escrow.status'] = query.status;
-    if (query.search?.trim()) {
-      const pattern = containsRegex(query.search);
-      const people = await this.users
-        .find({ $or: [{ firstName: pattern }, { lastName: pattern }, { email: pattern }, { 'seller.storeName': pattern }] })
-        .select('_id')
-        .limit(300)
-        .lean();
-      const ids = people.map((person) => person._id);
-      filter.$or = [{ 'escrow.reference': pattern }, { reference: pattern }, { 'items.title': pattern }, { buyerId: { $in: ids } }, { sellerId: { $in: ids } }];
+    const conditions: SQL[] = [isNotNull(orders.escrowReference)];
+    if (query.status && query.status !== 'all') conditions.push(eq(orders.escrowStatus, query.status));
+    const search = query.search?.trim();
+    if (search) {
+      const people = this.db
+        .select({ id: users.id })
+        .from(users)
+        .where(or(containsText(users.firstName, search), containsText(users.lastName, search), containsText(users.email, search), containsText(users.sellerStoreName, search)));
+      conditions.push(
+        or(
+          containsText(orders.escrowReference, search),
+          containsText(orders.reference, search),
+          exists(
+            this.db
+              .select({ one: sql`1` })
+              .from(orderItems)
+              .where(and(eq(orderItems.orderId, orders.id), containsText(orderItems.title, search))),
+          ),
+          inArray(orders.buyerId, people),
+          inArray(orders.sellerId, people),
+        )!,
+      );
     }
-    const total = await this.orders.countDocuments(filter);
+    const where = and(...conditions);
+    const [{ total }] = await this.db.select({ total: count() }).from(orders).where(where);
     const window = pageWindow(total, query.page, query.limit ?? 8);
-    const rows = await this.orders.find(filter).sort({ 'escrow.fundedAt': -1, _id: -1 }).skip(window.skip).limit(window.size).lean<Lean<Order>[]>();
-    return toPage(await this.views(rows), total, window);
+    const rows = await this.db
+      .select()
+      .from(orders)
+      .where(where)
+      .orderBy(descNullsLast(orders.escrowFundedAt), desc(orders.id))
+      .offset(window.skip)
+      .limit(window.size);
+    return toPage(await this.views(await this.orderService.withItems(rows)), total, window);
+  }
+
+  private async ledgerOrder(id: string): Promise<Order | null> {
+    const order = isUuid(id) ? await this.orderService.findById(id) : null;
+    return order?.escrow ? order : null;
   }
 
   async get(id: string): Promise<EscrowTransactionView> {
-    const order = Types.ObjectId.isValid(id) ? await this.orders.findOne({ _id: id, escrow: { $exists: true } }).lean<Lean<Order>>() : null;
+    const order = await this.ledgerOrder(id);
     if (!order) throw Errors.notFound('That transaction is no longer on the ledger.', 'TRANSACTION_NOT_FOUND');
     return (await this.views([order]))[0];
   }
@@ -89,7 +111,7 @@ export class EscrowAdminService {
     if (!(await this.settings.can(staff.role, SETTLEMENT_PERMISSION[settlement]))) {
       throw Errors.forbidden('Your role does not allow this action.', 'PERMISSION_DENIED');
     }
-    const order = Types.ObjectId.isValid(id) ? await this.orders.findOne({ _id: id, escrow: { $exists: true } }).lean<Lean<Order>>() : null;
+    const order = await this.ledgerOrder(id);
     if (!order?.escrow) throw Errors.notFound('That transaction is no longer on the ledger.', 'TRANSACTION_NOT_FOUND');
     const escrowEnabled = (await this.settings.section('escrow')).enabled;
     if (!escrowEnabled && (settlement === 'force-released' || settlement === 'reversed')) {
@@ -124,7 +146,7 @@ export class EscrowAdminService {
       action: SETTLEMENT_ACTION[settlement],
       target: `${order.escrow.reference} (${formatNaira(order.total)})`,
       targetType: 'escrow',
-      targetId: String(order._id),
+      targetId: order.id,
       elevated: settlement === 'force-released' || settlement === 'reversed',
       meta: { from: phase, settlement, note },
     });

@@ -1,12 +1,8 @@
 import { Global, Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { JwtModule } from '@nestjs/jwt';
-import { MongooseModule } from '@nestjs/mongoose';
-import { Staff, StaffSchema } from '../staff/schemas/staff.schema';
-import { User, UserSchema } from '../users/schemas/user.schema';
 import { AuthGuard } from './auth.guard';
 import { PrincipalService } from './principal.service';
-import { Session, SessionSchema } from './schemas/session.schema';
 import { TokenService } from './token.service';
 
 /**
@@ -15,15 +11,8 @@ import { TokenService } from './token.service';
  */
 @Global()
 @Module({
-  imports: [
-    JwtModule.register({}),
-    MongooseModule.forFeature([
-      { name: Session.name, schema: SessionSchema },
-      { name: User.name, schema: UserSchema },
-      { name: Staff.name, schema: StaffSchema },
-    ]),
-  ],
+  imports: [JwtModule.register({})],
   providers: [TokenService, PrincipalService, { provide: APP_GUARD, useClass: AuthGuard }],
-  exports: [TokenService, PrincipalService, MongooseModule],
+  exports: [TokenService, PrincipalService],
 })
 export class AuthCoreModule {}

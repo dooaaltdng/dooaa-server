@@ -1,22 +1,21 @@
 import { Injectable } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, QueryFilter, Types } from 'mongoose';
+import { and, count, desc, eq, exists, gte, inArray, isNotNull, isNull, lte, ne, or, sql, type SQL } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff } from '../../common/auth/principal';
-import type { AccountStatus, ModeratedStatus, OrderStatus } from '../../common/domain';
+import type { AccountStatus, IdentityStatus, ModeratedStatus, OrderStatus, VerificationLevel } from '../../common/domain';
 import { dayKey } from '../../common/util/dates';
-import type { Lean } from '../../common/util/mongo';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
-import { escapeRegex, excerpt, normalizeEmail } from '../../common/util/text';
+import { excerpt, normalizeEmail } from '../../common/util/text';
+import { InjectDb, type Database } from '../../database/database';
+import { disputes, messages, orderItems, orders, products, users } from '../../database/schema';
+import { containsText, escapeLike, isUniqueViolation } from '../../database/sql';
 import { AuditService } from '../audit/audit.service';
-import { Message } from '../conversations/schemas/message.schema';
-import { Dispute } from '../disputes/dispute.schema';
 import { MailService } from '../mail/mail.service';
-import { Order } from '../orders/schemas/order.schema';
+import type { Order } from '../orders/order.model';
+import { OrdersService } from '../orders/orders.service';
 import { ProductsService } from '../products/products.service';
-import { Product } from '../products/schemas/product.schema';
 import { SettingsService } from '../settings/settings.service';
-import { User } from '../users/schemas/user.schema';
+import { toUser, userColumns, type User } from '../users/user.model';
 import { UsersService } from '../users/users.service';
 import { VerificationService, type KycDocumentView } from '../verification/verification.service';
 
@@ -42,12 +41,12 @@ type AccountRow = {
   status: AccountStatus;
   avatar: string | null;
   region: string | null;
-  identity: User['identity'];
+  identity: IdentityStatus;
 };
 
 export type BuyerRow = AccountRow & { totalPurchase: number };
 export type SellerRow = AccountRow & {
-  verification: User['verificationLevel'];
+  verification: VerificationLevel;
   activeListings: number;
   storeName: string | null;
   /** Null when the seller may list without a cap. */
@@ -84,11 +83,8 @@ const STATUS_ACTION: Record<ModeratedStatus, string> = {
 @Injectable()
 export class AdminUsersService {
   constructor(
-    @InjectModel(User.name) private readonly users: Model<User>,
-    @InjectModel(Order.name) private readonly orders: Model<Order>,
-    @InjectModel(Product.name) private readonly products: Model<Product>,
-    @InjectModel(Dispute.name) private readonly disputes: Model<Dispute>,
-    @InjectModel(Message.name) private readonly messages: Model<Message>,
+    @InjectDb() private readonly db: Database,
+    private readonly orderService: OrdersService,
     private readonly userService: UsersService,
     private readonly productService: ProductsService,
     private readonly verification: VerificationService,
@@ -97,120 +93,139 @@ export class AdminUsersService {
     private readonly mail: MailService,
   ) {}
 
-  private filter(role: 'buyer' | 'seller', query: UserFilters): QueryFilter<User> {
-    const and: Record<string, unknown>[] = [];
-    and.push(role === 'seller' ? { role: 'seller' } : { role: { $ne: 'seller' } });
-    and.push({ email: { $ne: OFFICIAL_STORE_EMAIL } });
-    and.push(query.statuses?.length ? { status: { $in: query.statuses } } : { status: { $ne: 'closed' } });
-    if (query.regions?.length) and.push({ region: { $in: query.regions } });
-    const joined: Record<string, Date> = {};
-    if (query.joinedFrom) joined.$gte = new Date(`${query.joinedFrom}T00:00:00+01:00`);
-    if (query.joinedTo) joined.$lte = new Date(`${query.joinedTo}T23:59:59.999+01:00`);
-    if (Object.keys(joined).length) and.push({ createdAt: joined });
-    const countField = role === 'seller' ? 'stats.activeListings' : 'stats.purchases';
-    const count: Record<string, number> = {};
-    if (query.minCount !== undefined) count.$gte = query.minCount;
-    if (query.maxCount !== undefined) count.$lte = query.maxCount;
-    if (Object.keys(count).length) and.push({ [countField]: count });
+  private filter(role: 'buyer' | 'seller', query: UserFilters): SQL {
+    const conditions: SQL[] = [
+      // Accounts that have not picked a role yet sit with the buyers.
+      role === 'seller' ? eq(users.role, 'seller') : sql`${users.role} is distinct from 'seller'`,
+      ne(users.email, OFFICIAL_STORE_EMAIL),
+      query.statuses?.length ? inArray(users.status, query.statuses) : ne(users.status, 'closed'),
+    ];
+    if (query.regions?.length) conditions.push(inArray(users.region, query.regions));
+    if (query.joinedFrom) conditions.push(gte(users.createdAt, new Date(`${query.joinedFrom}T00:00:00+01:00`)));
+    if (query.joinedTo) conditions.push(lte(users.createdAt, new Date(`${query.joinedTo}T23:59:59.999+01:00`)));
+    const countColumn = role === 'seller' ? users.statsActiveListings : users.statsPurchases;
+    if (query.minCount !== undefined) conditions.push(gte(countColumn, query.minCount));
+    if (query.maxCount !== undefined) conditions.push(lte(countColumn, query.maxCount));
     const term = query.search?.trim();
     if (term) {
       // Each word must match a name, the email or the store; phone numbers match on digits alone.
-      const words = term.split(/\s+/).slice(0, 4);
-      for (const word of words) {
-        const pattern = new RegExp(escapeRegex(word), 'i');
-        and.push({ $or: [{ firstName: pattern }, { lastName: pattern }, { email: pattern }, { 'seller.storeName': pattern }, ...(/^\+?[\d\s]{4,}$/.test(word) ? [{ phone: new RegExp(escapeRegex(word.replace(/\D/g, ''))) }] : [])] });
+      for (const word of term.split(/\s+/).slice(0, 4)) {
+        const matches = [containsText(users.firstName, word), containsText(users.lastName, word), containsText(users.email, word), containsText(users.sellerStoreName, word)];
+        if (/^\+?[\d\s]{4,}$/.test(word)) matches.push(containsText(users.phone, word.replace(/\D/g, '')));
+        conditions.push(or(...matches)!);
       }
     }
-    return { $and: and } as QueryFilter<User>;
+    return and(...conditions)!;
   }
 
-  private base(user: Lean<User>): AccountRow {
+  private base(user: User): AccountRow {
     return {
-      id: String(user._id),
+      id: user.id,
       name: `${user.firstName} ${user.lastName}`.trim(),
       email: user.email,
-      phone: user.phone ?? '',
+      phone: user.phone,
       joinedDate: dayKey(user.createdAt),
       lastLogin: user.lastLoginAt ? dayKey(user.lastLoginAt) : null,
       status: user.status,
-      avatar: user.avatarUrl ?? null,
-      region: user.region ?? null,
+      avatar: user.avatarUrl,
+      region: user.region,
       identity: user.identity,
     };
   }
 
-  private buyerRow(user: Lean<User>): BuyerRow {
-    return { ...this.base(user), totalPurchase: user.stats?.purchases ?? 0 };
+  private buyerRow(user: User): BuyerRow {
+    return { ...this.base(user), totalPurchase: user.stats.purchases };
   }
 
-  private sellerRow(user: Lean<User>): SellerRow {
+  private sellerRow(user: User): SellerRow {
     return {
       ...this.base(user),
       verification: user.verificationLevel,
-      activeListings: user.stats?.activeListings ?? 0,
-      storeName: user.seller?.storeName ?? null,
-      listingLimit: user.seller?.listingLimit ?? null,
+      activeListings: user.stats.activeListings,
+      storeName: user.seller.storeName,
+      listingLimit: user.seller.listingLimit,
     };
   }
 
-  async listBuyers(query: UserFilters): Promise<Page<BuyerRow>> {
-    const filter = this.filter('buyer', query);
-    const total = await this.users.countDocuments(filter);
+  private async page(where: SQL, query: UserFilters): Promise<{ rows: User[]; total: number; window: ReturnType<typeof pageWindow> }> {
+    const [{ total }] = await this.db.select({ total: count() }).from(users).where(where);
     const window = pageWindow(total, query.page, query.limit ?? 7);
-    const rows = await this.users.find(filter).sort({ createdAt: -1, _id: -1 }).skip(window.skip).limit(window.size).lean<Lean<User>[]>();
-    return toPage(rows.map((row) => this.buyerRow(row)), total, window);
+    const rows = await this.db.select(userColumns).from(users).where(where).orderBy(desc(users.createdAt), desc(users.id)).offset(window.skip).limit(window.size);
+    return { rows: rows.map(toUser), total, window };
+  }
+
+  async listBuyers(query: UserFilters): Promise<Page<BuyerRow>> {
+    const { rows, total, window } = await this.page(this.filter('buyer', query), query);
+    return toPage(
+      rows.map((row) => this.buyerRow(row)),
+      total,
+      window,
+    );
   }
 
   async listSellers(query: UserFilters): Promise<Page<SellerRow>> {
-    const filter = this.filter('seller', query);
-    const total = await this.users.countDocuments(filter);
-    const window = pageWindow(total, query.page, query.limit ?? 7);
-    const rows = await this.users.find(filter).sort({ createdAt: -1, _id: -1 }).skip(window.skip).limit(window.size).lean<Lean<User>[]>();
-    return toPage(rows.map((row) => this.sellerRow(row)), total, window);
+    const { rows, total, window } = await this.page(this.filter('seller', query), query);
+    return toPage(
+      rows.map((row) => this.sellerRow(row)),
+      total,
+      window,
+    );
   }
 
-  private async account(id: string, role: 'buyer' | 'seller'): Promise<Lean<User>> {
-    const user = Types.ObjectId.isValid(id) ? await this.users.findById(id).lean<Lean<User>>() : null;
+  private async account(id: string, role: 'buyer' | 'seller'): Promise<User> {
+    const user = await this.userService.findById(id);
     const matches = user && (role === 'seller' ? user.role === 'seller' : user.role !== 'seller');
     if (!user || !matches) throw Errors.notFound(`That ${role} is not on the platform.`, 'USER_NOT_FOUND');
     return user;
   }
 
-  private async disputesOf(userId: Types.ObjectId): Promise<{ disputes: ProfileDispute[]; messages: ProfileMessage[] }> {
-    const rows = await this.disputes.find({ $or: [{ buyerId: userId }, { sellerId: userId }] }).sort({ createdAt: -1 }).limit(10).lean<Lean<Dispute>[]>();
-    const disputes = rows.map((row) => ({
-      id: String(row._id),
+  private async disputesOf(userId: string): Promise<{ disputes: ProfileDispute[]; messages: ProfileMessage[] }> {
+    const rows = await this.db
+      .select()
+      .from(disputes)
+      .where(or(eq(disputes.buyerId, userId), eq(disputes.sellerId, userId)))
+      .orderBy(desc(disputes.createdAt))
+      .limit(10);
+    const profileDisputes = rows.map((row) => ({
+      id: row.id,
       reference: row.reference,
       subject: excerpt(row.reason, 60),
       orderId: row.orderNumber,
       status: row.state === 'completed' ? ('resolved' as const) : ('review' as const),
     }));
-    const byConversation = new Map(rows.filter((row) => row.conversationId).map((row) => [String(row.conversationId), row.reference]));
+    const byConversation = new Map(rows.filter((row) => row.conversationId).map((row) => [row.conversationId!, row.reference]));
     const authored = byConversation.size
-      ? await this.messages
-          .find({
-            conversationId: { $in: [...byConversation.keys()].map((id) => new Types.ObjectId(id)) },
-            senderId: userId,
-            $or: [{ body: { $ne: '' } }, { kind: 'dispute' }],
-          })
-          .sort({ createdAt: -1 })
+      ? await this.db
+          .select()
+          .from(messages)
+          .where(
+            and(
+              inArray(messages.conversationId, [...byConversation.keys()]),
+              eq(messages.senderId, userId),
+              or(ne(messages.body, ''), eq(messages.kind, 'dispute')),
+            ),
+          )
+          .orderBy(desc(messages.createdAt))
           .limit(5)
-          .lean<Lean<Message>[]>()
       : [];
-    const messages = authored.map((message) => ({
-      id: String(message._id),
-      reference: byConversation.get(String(message.conversationId)) ?? '',
+    const profileMessages = authored.map((message) => ({
+      id: message.id,
+      reference: byConversation.get(message.conversationId) ?? '',
       excerpt: excerpt(message.body || message.dispute?.reason || '', 90),
       date: dayKey(message.createdAt),
     }));
-    return { disputes, messages };
+    return { disputes: profileDisputes, messages: profileMessages };
+  }
+
+  private async recentOrders(where: SQL, limit: number): Promise<Order[]> {
+    return this.orderService.withItems(await this.db.select().from(orders).where(where).orderBy(desc(orders.createdAt)).limit(limit));
   }
 
   async buyerProfile(id: string) {
     const user = await this.account(id, 'buyer');
-    const orders = await this.orders.find({ buyerId: user._id, status: { $ne: 'awaiting-payment' } }).sort({ createdAt: -1 }).limit(5).lean<Lean<Order>[]>();
-    const sellers = await this.users.find({ _id: { $in: orders.map((order) => order.sellerId) } }).select('email').lean();
-    const sellerEmail = new Map(sellers.map((seller) => [String(seller._id), seller.email]));
+    const recent = await this.recentOrders(and(eq(orders.buyerId, user.id), ne(orders.status, 'awaiting-payment'))!, 5);
+    const sellers = await this.userService.findByIds(recent.map((order) => order.sellerId));
+    const sellerEmail = new Map(sellers.map((seller) => [seller.id, seller.email]));
     const verified = user.identity === 'verified';
     const kycHeadline = verified ? 'Level 2 Verified' : user.identity === 'pending' ? 'Level 1 — ID under review' : user.identity === 'rejected' ? 'Level 1 — ID rejected' : 'Level 1 — Awaiting ID';
     return {
@@ -218,38 +233,40 @@ export class AdminUsersService {
       kycLevel: verified ? 2 : 1,
       kycHeadline,
       kycDetail: verified ? 'ID and Proof of selfie is confirmed' : user.emailVerified ? 'Email and phone confirmed. No ID on file.' : 'Email not yet confirmed.',
-      transactions: orders.map((order) => ({
-        id: String(order._id),
+      transactions: recent.map((order) => ({
+        id: order.id,
         orderId: `#${order.reference}`,
-        item: order.items.length > 1 ? `${order.items[0].title} +${order.items.length - 1} more` : order.items[0].title,
-        sellerEmail: sellerEmail.get(String(order.sellerId)) ?? '',
+        item: order.items.length > 1 ? `${order.items[0].title} +${order.items.length - 1} more` : (order.items[0]?.title ?? 'Order'),
+        sellerEmail: sellerEmail.get(order.sellerId) ?? '',
         date: dayKey(order.createdAt),
         status: TRANSACTION_STATUS[order.status] ?? order.status,
       })),
-      ...(await this.disputesOf(user._id)),
+      ...(await this.disputesOf(user.id)),
     };
   }
 
   async sellerProfile(id: string) {
     const user = await this.account(id, 'seller');
-    const [listings, listingCount, sold, soldCount, verification] = await Promise.all([
-      this.products.find({ sellerId: user._id, deletedAt: null }).sort({ createdAt: -1 }).limit(4).lean<Lean<Product>[]>(),
-      this.products.countDocuments({ sellerId: user._id, deletedAt: null }),
-      this.orders.find({ sellerId: user._id, 'payment.status': 'paid' }).sort({ createdAt: -1 }).limit(4).lean<Lean<Order>[]>(),
-      this.orders.countDocuments({ sellerId: user._id, 'payment.status': 'paid' }),
-      this.verification.latestFor(String(user._id)),
+    const listed = and(eq(products.sellerId, user.id), isNull(products.deletedAt));
+    const paidSales = and(eq(orders.sellerId, user.id), eq(orders.paymentStatus, 'paid'))!;
+    const [listings, [{ listingCount }], sold, [{ soldCount }], verification] = await Promise.all([
+      this.db.select().from(products).where(listed).orderBy(desc(products.createdAt)).limit(4),
+      this.db.select({ listingCount: count() }).from(products).where(listed),
+      this.recentOrders(paidSales, 4),
+      this.db.select({ soldCount: count() }).from(orders).where(paidSales),
+      this.verification.latestFor(user.id),
     ]);
     const documents: KycDocumentView[] = verification ? await this.verification.documentsFor(verification) : [];
     return {
       ...this.sellerRow(user),
       verificationStatus: verification?.status ?? null,
-      verificationId: verification ? String(verification._id) : null,
+      verificationId: verification?.id ?? null,
       documents,
-      listings: listings.map((product) => ({ id: String(product._id), product: product.title, price: product.price, stock: product.stock, status: product.status, dateListed: dayKey(product.publishedAt ?? product.createdAt) })),
+      listings: listings.map((product) => ({ id: product.id, product: product.title, price: product.price, stock: product.stock, status: product.status, dateListed: dayKey(product.publishedAt ?? product.createdAt) })),
       listingCount,
-      sold: sold.map((order) => ({ id: String(order._id), item: order.items[0]?.title ?? 'Order', orderId: `#${order.reference}`, salePrice: order.total, dateListed: dayKey(order.payment.paidAt ?? order.createdAt) })),
+      sold: sold.map((order) => ({ id: order.id, item: order.items[0]?.title ?? 'Order', orderId: `#${order.reference}`, salePrice: order.total, dateListed: dayKey(order.payment.paidAt ?? order.createdAt) })),
       soldCount,
-      ...(await this.disputesOf(user._id)),
+      ...(await this.disputesOf(user.id)),
     };
   }
 
@@ -261,7 +278,7 @@ export class AdminUsersService {
   async setStatus(staff: AuthStaff, id: string, status: ModeratedStatus, reason?: string) {
     const needed = status === 'banned' ? 'users.ban' : 'users.suspend';
     if (!(await this.settings.can(staff.role, needed))) throw Errors.forbidden('Your role does not allow this action.', 'PERMISSION_DENIED');
-    const user = Types.ObjectId.isValid(id) ? await this.users.findById(id).lean<Lean<User>>() : null;
+    const user = await this.userService.findById(id);
     if (!user || user.email === OFFICIAL_STORE_EMAIL) throw Errors.notFound('That account is not on the platform.', 'USER_NOT_FOUND');
     if (user.status === 'closed') throw Errors.conflict('This account was closed by its owner.', 'ACCOUNT_CLOSED');
     if (user.status === status) return { id, status };
@@ -303,10 +320,10 @@ export class AdminUsersService {
     if (user.identity === 'verified') return { id, identity: 'verified' as const };
     const pending = await this.verification.latestFor(id, 'pending');
     if (pending) {
-      await this.verification.approve(staff, String(pending._id));
+      await this.verification.approve(staff, pending.id);
       return { id, identity: 'verified' as const };
     }
-    await this.userService.update(id, { $set: { identity: 'verified' } });
+    await this.userService.update(id, { identity: 'verified' });
     await this.productService.syncSellerVerified(id, true);
     await this.audit.record(staff, { action: 'Verified a seller manually', target: `${user.firstName} ${user.lastName}`, targetType: 'user', targetId: id });
     void this.mail.send(user.email, {
@@ -321,13 +338,13 @@ export class AdminUsersService {
   async setListingLimit(staff: AuthStaff, id: string, limit: number | null) {
     if (!(await this.settings.can(staff.role, 'users.suspend'))) throw Errors.forbidden('Your role does not allow this action.', 'PERMISSION_DENIED');
     const user = await this.account(id, 'seller');
-    await this.userService.update(id, { $set: { 'seller.listingLimit': limit } });
+    await this.userService.update(id, { sellerListingLimit: limit });
     await this.audit.record(staff, {
       action: limit === null ? "Lifted a seller's listing limit" : `Limited a seller to ${limit} live listing${limit === 1 ? '' : 's'}`,
       target: `${user.firstName} ${user.lastName}`,
       targetType: 'user',
       targetId: id,
-      meta: { from: user.seller?.listingLimit ?? null, to: limit },
+      meta: { from: user.seller.listingLimit, to: limit },
     });
     void this.mail.send(user.email, {
       subject: limit === null ? 'Your DOOAA listing limit has been lifted' : 'A listing limit has been set on your DOOAA store',
@@ -346,7 +363,7 @@ export class AdminUsersService {
    */
   async changeEmail(staff: AuthStaff, id: string, email: string) {
     if (!(await this.settings.can(staff.role, 'users.verify'))) throw Errors.forbidden('Your role does not allow this action.', 'PERMISSION_DENIED');
-    const user = Types.ObjectId.isValid(id) ? await this.users.findById(id).lean<Lean<User>>() : null;
+    const user = await this.userService.findById(id);
     if (!user || user.email === OFFICIAL_STORE_EMAIL) throw Errors.notFound('That account is not on the platform.', 'USER_NOT_FOUND');
     if (user.status === 'closed') throw Errors.conflict('This account was closed by its owner.', 'ACCOUNT_CLOSED');
     const next = normalizeEmail(email);
@@ -354,9 +371,9 @@ export class AdminUsersService {
     const taken = await this.userService.findByEmail(next);
     if (taken) throw Errors.conflict('Another account already uses that email.', 'EMAIL_TAKEN');
     try {
-      await this.userService.update(id, { $set: { email: next, emailVerified: false } });
+      await this.userService.update(id, { email: next, emailVerified: false });
     } catch (error) {
-      if ((error as { code?: number }).code === 11000) throw Errors.conflict('Another account already uses that email.', 'EMAIL_TAKEN');
+      if (isUniqueViolation(error, 'users_email_key')) throw Errors.conflict('Another account already uses that email.', 'EMAIL_TAKEN');
       throw error;
     }
     await this.audit.record(staff, {
@@ -388,73 +405,102 @@ export class AdminUsersService {
     const term = raw.trim().slice(0, 80);
     const empty: ConsoleSearchResults = { users: [], listings: [], transactions: [], disputes: [] };
     if (term.length < 2) return empty;
-    const pattern = new RegExp(escapeRegex(term), 'i');
-    const bare = term.replace(/^#/, '');
-    const refPattern = new RegExp(`^#?${escapeRegex(bare)}`, 'i');
+    const bare = escapeLike(term.replace(/^#/, ''));
+    // References match from the start, with or without the leading "#".
+    const startsRef = (column: SQL | typeof orders.reference) => or(sql`${column} ilike ${`${bare}%`}`, sql`${column} ilike ${`#${bare}%`}`)!;
     const digits = term.replace(/\D/g, '');
+    const words = term.split(/\s+/).slice(0, 3);
 
-    const [users, listings, orders, disputes] = await Promise.all([
-      this.users
-        .find({
-          email: { $ne: OFFICIAL_STORE_EMAIL },
-          $or: [
-            { firstName: pattern },
-            { lastName: pattern },
-            { email: pattern },
-            { 'seller.storeName': pattern },
-            ...(term.includes(' ') ? [{ $and: term.split(/\s+/).slice(0, 3).map((word) => ({ $or: [{ firstName: new RegExp(escapeRegex(word), 'i') }, { lastName: new RegExp(escapeRegex(word), 'i') }] })) }] : []),
-            ...(digits.length >= 4 ? [{ phone: new RegExp(escapeRegex(digits)) }] : []),
-          ],
-        })
-        .sort({ createdAt: -1 })
+    const [userRows, listings, orderRows, disputeRows] = await Promise.all([
+      this.db
+        .select(userColumns)
+        .from(users)
+        .where(
+          and(
+            ne(users.email, OFFICIAL_STORE_EMAIL),
+            or(
+              containsText(users.firstName, term),
+              containsText(users.lastName, term),
+              containsText(users.email, term),
+              containsText(users.sellerStoreName, term),
+              term.includes(' ') ? and(...words.map((word) => or(containsText(users.firstName, word), containsText(users.lastName, word))!)) : undefined,
+              digits.length >= 4 ? containsText(users.phone, digits) : undefined,
+            ),
+          ),
+        )
+        .orderBy(desc(users.createdAt))
+        .limit(5),
+      this.db
+        .select({ id: products.id, title: products.title, sellerId: products.sellerId, status: products.status })
+        .from(products)
+        .where(and(isNull(products.deletedAt), containsText(products.title, term)))
+        .orderBy(desc(products.createdAt))
+        .limit(5),
+      this.db
+        .select()
+        .from(orders)
+        .where(
+          and(
+            isNotNull(orders.escrowReference),
+            or(
+              startsRef(sql`${orders.escrowReference}`),
+              startsRef(orders.reference),
+              exists(
+                this.db
+                  .select({ one: sql`1` })
+                  .from(orderItems)
+                  .where(and(eq(orderItems.orderId, orders.id), containsText(orderItems.title, term))),
+              ),
+            ),
+          ),
+        )
+        .orderBy(desc(orders.createdAt))
         .limit(5)
-        .lean<Lean<User>[]>(),
-      this.products.find({ deletedAt: null, title: pattern }).sort({ createdAt: -1 }).limit(5).lean<Lean<Product>[]>(),
-      this.orders
-        .find({ escrow: { $exists: true }, $or: [{ 'escrow.reference': refPattern }, { reference: refPattern }, { 'items.title': pattern }] })
-        .sort({ createdAt: -1 })
-        .limit(5)
-        .lean<Lean<Order>[]>(),
-      this.disputes.find({ $or: [{ reference: refPattern }, { orderNumber: refPattern }, { item: pattern }] }).sort({ createdAt: -1 }).limit(5).lean<Lean<Dispute>[]>(),
+        .then((rows) => this.orderService.withItems(rows)),
+      this.db
+        .select({ id: disputes.id, reference: disputes.reference, item: disputes.item, state: disputes.state })
+        .from(disputes)
+        .where(or(startsRef(sql`${disputes.reference}`), startsRef(sql`${disputes.orderNumber}`), containsText(disputes.item, term)))
+        .orderBy(desc(disputes.createdAt))
+        .limit(5),
     ]);
 
-    const sellerIds = [...new Set(listings.map((product) => String(product.sellerId)))];
-    const sellers = await this.users.find({ _id: { $in: sellerIds } }).select('firstName lastName seller').lean<Lean<User>[]>();
-    const sellerName = new Map(sellers.map((seller) => [String(seller._id), seller.seller?.storeName || `${seller.firstName} ${seller.lastName}`]));
+    const sellers = await this.userService.findByIds(listings.map((product) => product.sellerId));
+    const sellerName = new Map(sellers.map((seller) => [seller.id, seller.seller.storeName || `${seller.firstName} ${seller.lastName}`]));
 
     return {
-      users: users.map((user) => {
+      users: userRows.map(toUser).map((user) => {
         const role = user.role === 'seller' ? 'seller' : 'buyer';
         return {
-          id: String(user._id),
+          id: user.id,
           name: `${user.firstName} ${user.lastName}`.trim(),
           email: user.email,
           role,
           status: user.status,
-          href: `/users/${role === 'seller' ? 'sellers' : 'buyers'}/${String(user._id)}`,
+          href: `/users/${role === 'seller' ? 'sellers' : 'buyers'}/${user.id}`,
         };
       }),
       listings: listings.map((product) => ({
-        id: String(product._id),
+        id: product.id,
         title: product.title,
-        sellerName: sellerName.get(String(product.sellerId)) ?? 'Seller',
+        sellerName: sellerName.get(product.sellerId) ?? 'Seller',
         status: product.status,
-        href: `/listings?item=${String(product._id)}`,
+        href: `/listings?item=${product.id}`,
       })),
-      transactions: orders.map((order) => ({
-        id: String(order._id),
+      transactions: orderRows.map((order) => ({
+        id: order.id,
         reference: order.escrow!.reference,
         orderNumber: `#${order.reference}`,
         item: order.items.length > 1 ? `${order.items[0].title} +${order.items.length - 1} more` : (order.items[0]?.title ?? 'Order'),
         amount: order.total,
         href: `/payments?search=${encodeURIComponent(order.escrow!.reference)}`,
       })),
-      disputes: disputes.map((dispute) => ({
-        id: String(dispute._id),
+      disputes: disputeRows.map((dispute) => ({
+        id: dispute.id,
         reference: dispute.reference,
         item: dispute.item,
         state: dispute.state,
-        href: `/disputes?id=${String(dispute._id)}`,
+        href: `/disputes?id=${dispute.id}`,
       })),
     };
   }

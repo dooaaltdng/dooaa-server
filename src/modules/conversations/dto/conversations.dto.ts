@@ -1,12 +1,12 @@
 import { Type } from 'class-transformer';
-import { IsIn, IsInt, IsMongoId, IsNumber, IsOptional, IsString, IsUrl, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { IsIn, IsInt, IsUUID, IsNumber, IsOptional, IsString, IsUrl, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
 import { USER_MESSAGE_KINDS, type UserMessageKind } from '../../../common/domain';
 import { PageQueryDto } from '../../../common/util/pagination';
 import { Trim } from '../../../common/util/transforms';
 
 export class StartConversationDto {
-  @IsOptional() @IsMongoId() productId?: string;
-  @IsOptional() @IsMongoId() sellerId?: string;
+  @IsOptional() @IsUUID() productId?: string;
+  @IsOptional() @IsUUID() sellerId?: string;
   @IsOptional() @Trim() @IsString() @MaxLength(2000) body?: string;
 }
 
@@ -17,7 +17,7 @@ export class ConversationsQueryDto extends PageQueryDto {
 
 export class MessagesQueryDto {
   /** Message id to page backwards from. */
-  @IsOptional() @IsMongoId() before?: string;
+  @IsOptional() @IsUUID() before?: string;
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(100) limit?: number;
 }
 

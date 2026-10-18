@@ -15,12 +15,11 @@ import { ApiConsumes, ApiTags } from '@nestjs/swagger';
 import type { Response } from 'express';
 import { IsIn, IsInt, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
 import { Type } from 'class-transformer';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { RawResponse } from '../../common/api/raw-response.decorator';
 import { CurrentStaff, CurrentUser, Public, StaffOnly } from '../../common/auth/decorators';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
-import type { MediaPurpose } from '../../common/domain';
-import { MEDIA_KINDS, type MediaKind } from './media.schema';
+import { MEDIA_KINDS, type MediaKind, type MediaPurpose } from '../../common/domain';
 import { MediaService, type UploadedFile as Upload } from './media.service';
 
 /** Purposes a marketplace account may upload for. */
@@ -81,7 +80,7 @@ export class MediaController {
   }
 
   @Delete(':id')
-  remove(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string) {
+  remove(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string) {
     return this.media.remove(id, { id: user.id, type: 'user' });
   }
 
@@ -89,7 +88,7 @@ export class MediaController {
   @Public()
   @RawResponse()
   @Get(':id/content')
-  async content(@Param('id', ObjectIdPipe) id: string, @Query() query: SignedQueryDto, @Res() response: Response) {
+  async content(@Param('id', UuidPipe) id: string, @Query() query: SignedQueryDto, @Res() response: Response) {
     const { media, object } = await this.media.read(id, { expires: Number(query.expires), sig: query.sig });
     if ('redirect' in object) return response.redirect(302, object.redirect);
     response.setHeader('Content-Type', object.contentType);

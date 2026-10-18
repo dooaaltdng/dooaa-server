@@ -1,16 +1,16 @@
 import { Injectable } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
-import { Model } from 'mongoose';
+import { eq, sql } from 'drizzle-orm';
+import { CacheService } from '../../cache/cache.service';
 import { Errors } from '../../common/api/app-error';
 import { flattenValidationErrors } from '../../common/api/validation';
 import type { AuthStaff } from '../../common/auth/principal';
 import { PERMISSIONS, SUPERADMIN_ONLY, type Permission, type StaffRole } from '../../common/domain';
-import { TtlCache } from '../../common/util/cache';
+import { InjectDb, type Database } from '../../database/database';
+import { settings as settingsTable } from '../../database/schema';
 import { AuditService } from '../audit/audit.service';
 import { SECTION_DTO } from './dto/settings.dto';
-import { SettingsRecord } from './settings.schema';
 import {
   defaultSettings,
   type PlatformSettings,
@@ -28,6 +28,9 @@ const SECTION_LABEL: Record<SettingsSection, string> = {
 };
 
 const RECORD_ID = 'platform';
+const CACHE_KEY = 'settings';
+/** Writers delete the cached copy; the TTL only bounds how long a missed delete could linger. */
+const CACHE_TTL_MS = 60_000;
 
 /** Merges stored values over the defaults so a key added later always has a value. */
 export function mergeSettings(stored: Partial<Record<SettingsSection, unknown>> | undefined): PlatformSettings {
@@ -62,16 +65,15 @@ export function normalizeRoles(value: Record<StaffRole, Permission[]>): Record<S
 
 @Injectable()
 export class SettingsService {
-  private readonly cache = new TtlCache<PlatformSettings>(10_000, 1);
-
   constructor(
-    @InjectModel(SettingsRecord.name) private readonly records: Model<SettingsRecord>,
+    @InjectDb() private readonly db: Database,
+    private readonly cache: CacheService,
     private readonly audit: AuditService,
   ) {}
 
   get(): Promise<PlatformSettings> {
-    return this.cache.wrap(RECORD_ID, async () => {
-      const record = await this.records.findById(RECORD_ID).lean();
+    return this.cache.wrap(CACHE_KEY, CACHE_TTL_MS, async () => {
+      const [record] = await this.db.select({ values: settingsTable.values }).from(settingsTable).where(eq(settingsTable.id, RECORD_ID));
       return mergeSettings(record?.values as Partial<Record<SettingsSection, unknown>> | undefined);
     });
   }
@@ -109,12 +111,15 @@ export class SettingsService {
     }
 
     const before = await this.section(key);
-    await this.records.updateOne(
-      { _id: RECORD_ID },
-      { $set: { [`values.${key}`]: next, updatedBy: actor.id } },
-      { upsert: true },
-    );
-    this.cache.clear();
+    const section = JSON.stringify({ [key]: next });
+    await this.db
+      .insert(settingsTable)
+      .values({ id: RECORD_ID, values: { [key]: next }, updatedBy: actor.id })
+      .onConflictDoUpdate({
+        target: settingsTable.id,
+        set: { values: sql`${settingsTable.values} || ${section}::jsonb`, updatedBy: actor.id },
+      });
+    await this.cache.delete(CACHE_KEY);
 
     await this.audit.record(actor, {
       action: describeChange(key, before, next),
@@ -129,12 +134,12 @@ export class SettingsService {
 
   /** Restores every section to its default. Used by seeding and tests. */
   async reset(): Promise<void> {
-    await this.records.deleteOne({ _id: RECORD_ID });
-    this.cache.clear();
+    await this.db.delete(settingsTable).where(eq(settingsTable.id, RECORD_ID));
+    await this.cache.delete(CACHE_KEY);
   }
 
-  invalidate(): void {
-    this.cache.clear();
+  async invalidate(): Promise<void> {
+    await this.cache.delete(CACHE_KEY);
   }
 
   /** What the storefront may read without signing in. */

@@ -1,31 +1,35 @@
 import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
+import { and, count, desc, eq, gte, inArray, sql } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
+import type { EarningStatus, PayoutStatus } from '../../common/domain';
 import { EventBus } from '../../common/events/event-bus';
 import { payoutReference } from '../../common/util/ids';
 import { formatNaira, fromKobo, toKobo } from '../../common/util/money';
-import type { Lean } from '../../common/util/mongo';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
+import { isUuid } from '../../common/util/uuid';
+import { InjectDb, type Database } from '../../database/database';
+import { earnings, payouts, users, wallets } from '../../database/schema';
 import { AuditService } from '../audit/audit.service';
-import { PaymentMethodsService } from '../payments/payment-methods.service';
-import { PAYMENT_EVENTS, type TransferUpdated } from '../payments/payments.service';
+import { PaymentMethodsService, type PayoutAccount } from '../payments/payment-methods.service';
+import { PAYMENT_EVENTS, type PayoutSettled } from '../payments/payments.service';
 import { PAYMENT_PROVIDER, type PaymentProvider } from '../payments/providers/payment-provider';
 import { SettingsService } from '../settings/settings.service';
 import { PasswordService } from '../users/password.service';
-import { User } from '../users/schemas/user.schema';
-import { Earning, Payout, Wallet } from './wallet.schema';
+import { UsersService } from '../users/users.service';
 
 export const WALLET_EVENTS = {
   payoutUpdated: 'wallet.payout-updated',
 } as const;
 
-export type PayoutUpdated = { payout: Lean<Payout> };
+export type Earning = typeof earnings.$inferSelect;
+export type Payout = typeof payouts.$inferSelect;
+
+export type PayoutUpdated = { payout: Payout };
 
 export type WalletOverview = { available: number; pending: number; withdrawn: number };
 
-export type EarningView = { id: string; orderId: string; orderNumber: string; product: string; amount: number; status: Earning['status']; at: string };
+export type EarningView = { id: string; orderId: string; orderNumber: string; product: string; amount: number; status: EarningStatus; at: string };
 
 export type PayoutView = {
   id: string;
@@ -36,31 +40,31 @@ export type PayoutView = {
   bankName: string;
   accountName: string;
   last4: string;
-  status: Payout['status'];
+  status: PayoutStatus;
   at: string;
   completedAt: string | null;
   failureReason: string | null;
 };
 
 export type OrderForWallet = {
-  _id: Types.ObjectId;
-  sellerId: Types.ObjectId;
+  id: string;
+  sellerId: string;
   reference: string;
   sellerEarning: number;
   items: { title: string }[];
 };
+
+type BalanceChange = Partial<Record<'availableKobo' | 'pendingKobo' | 'withdrawnKobo', number>>;
 
 @Injectable()
 export class WalletService implements OnModuleInit {
   private readonly logger = new Logger(WalletService.name);
 
   constructor(
-    @InjectModel(Wallet.name) private readonly wallets: Model<Wallet>,
-    @InjectModel(Earning.name) private readonly earnings: Model<Earning>,
-    @InjectModel(Payout.name) private readonly payouts: Model<Payout>,
-    @InjectModel(User.name) private readonly users: Model<User>,
+    @InjectDb() private readonly db: Database,
     @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
     private readonly methods: PaymentMethodsService,
+    private readonly users: UsersService,
     private readonly passwords: PasswordService,
     private readonly settings: SettingsService,
     private readonly audit: AuditService,
@@ -68,63 +72,80 @@ export class WalletService implements OnModuleInit {
   ) {}
 
   onModuleInit(): void {
-    this.events.on<TransferUpdated>(PAYMENT_EVENTS.transferUpdated, (event) => this.applyTransfer(event));
+    this.events.on<PayoutSettled>(PAYMENT_EVENTS.payoutSettled, (event) => this.applyPayout(event));
   }
 
-  private async bump(sellerId: Types.ObjectId | string, inc: Partial<Record<'availableKobo' | 'pendingKobo' | 'withdrawnKobo', number>>, requireAvailable?: number): Promise<boolean> {
-    const filter: Record<string, unknown> = { sellerId: new Types.ObjectId(String(sellerId)) };
-    if (requireAvailable !== undefined) filter.availableKobo = { $gte: requireAvailable };
-    const result = await this.wallets.updateOne(filter, { $inc: inc }, { upsert: requireAvailable === undefined });
-    return result.modifiedCount > 0 || result.upsertedCount > 0;
+  /**
+   * Moves a seller's balances in one statement. With `requireAvailable`, the
+   * change only happens if that much is available — two withdrawals at once
+   * cannot both pass. Without it, the wallet is created on first use.
+   */
+  private async bump(sellerId: string, change: BalanceChange, requireAvailable?: number): Promise<boolean> {
+    const set = {
+      availableKobo: sql`${wallets.availableKobo} + ${change.availableKobo ?? 0}`,
+      pendingKobo: sql`${wallets.pendingKobo} + ${change.pendingKobo ?? 0}`,
+      withdrawnKobo: sql`${wallets.withdrawnKobo} + ${change.withdrawnKobo ?? 0}`,
+    };
+    if (requireAvailable !== undefined) {
+      const updated = await this.db
+        .update(wallets)
+        .set(set)
+        .where(and(eq(wallets.sellerId, sellerId), gte(wallets.availableKobo, requireAvailable)))
+        .returning({ sellerId: wallets.sellerId });
+      return updated.length > 0;
+    }
+    await this.db
+      .insert(wallets)
+      .values({ sellerId, availableKobo: change.availableKobo ?? 0, pendingKobo: change.pendingKobo ?? 0, withdrawnKobo: change.withdrawnKobo ?? 0 })
+      .onConflictDoUpdate({ target: wallets.sellerId, set });
+    return true;
   }
 
   /* --- Escrow hooks (idempotent per order) ----------------------------------- */
 
   /** Payment confirmed: the seller's earning is now pending in escrow. */
   async onFunded(order: OrderForWallet): Promise<void> {
-    const result = await this.earnings.updateOne(
-      { orderId: order._id },
-      {
-        $setOnInsert: {
-          sellerId: order.sellerId,
-          orderId: order._id,
-          orderNumber: `#${order.reference}`,
-          product: order.items[0]?.title ?? 'Order',
-          amount: order.sellerEarning,
-          status: 'pending',
-          fundedAt: new Date(),
-        },
-      },
-      { upsert: true },
-    );
-    if (result.upsertedCount) await this.bump(order.sellerId, { pendingKobo: toKobo(order.sellerEarning) });
+    const created = await this.db
+      .insert(earnings)
+      .values({
+        sellerId: order.sellerId,
+        orderId: order.id,
+        orderNumber: `#${order.reference}`,
+        product: order.items[0]?.title ?? 'Order',
+        amount: order.sellerEarning,
+        status: 'pending',
+        fundedAt: new Date(),
+      })
+      .onConflictDoNothing({ target: earnings.orderId })
+      .returning({ id: earnings.id });
+    if (created.length) await this.bump(order.sellerId, { pendingKobo: toKobo(order.sellerEarning) });
   }
 
   /** Escrow released: the earning becomes withdrawable (and is paid out at once if auto-payout is on). */
   async onReleased(order: OrderForWallet): Promise<void> {
-    const earning = await this.earnings.findOneAndUpdate(
-      { orderId: order._id, status: 'pending' },
-      { $set: { status: 'available', releasedAt: new Date() } },
-      { returnDocument: 'after' },
-    );
+    const [earning] = await this.db
+      .update(earnings)
+      .set({ status: 'available', releasedAt: new Date() })
+      .where(and(eq(earnings.orderId, order.id), eq(earnings.status, 'pending')))
+      .returning();
     if (!earning) return;
     const kobo = toKobo(earning.amount);
     await this.bump(order.sellerId, { pendingKobo: -kobo, availableKobo: kobo });
     const commerce = await this.settings.section('commerce');
     if (commerce.autoPayout) {
-      await this.autoPayout(String(order.sellerId), earning.amount).catch((error) =>
-        this.logger.warn(`Auto-payout for ${String(order.sellerId)} not started: ${(error as Error).message}`),
+      await this.startPayout(order.sellerId, earning.amount, undefined, true).catch((error: Error) =>
+        this.logger.warn(`Auto-payout for ${order.sellerId} not started: ${error.message}`),
       );
     }
   }
 
   /** Refunded before release: the pending earning is cancelled. */
   async onCancelled(order: OrderForWallet): Promise<void> {
-    const earning = await this.earnings.findOneAndUpdate(
-      { orderId: order._id, status: 'pending' },
-      { $set: { status: 'cancelled', cancelledAt: new Date() } },
-      { returnDocument: 'after' },
-    );
+    const [earning] = await this.db
+      .update(earnings)
+      .set({ status: 'cancelled', cancelledAt: new Date() })
+      .where(and(eq(earnings.orderId, order.id), eq(earnings.status, 'pending')))
+      .returning();
     if (earning) await this.bump(order.sellerId, { pendingKobo: -toKobo(earning.amount) });
   }
 
@@ -133,20 +154,23 @@ export class WalletService implements OnModuleInit {
    * possible while the seller has not already withdrawn it.
    */
   async onReversed(order: OrderForWallet): Promise<void> {
-    const earning = await this.earnings.findOne({ orderId: order._id, status: 'available' }).lean();
+    const [earning] = await this.db
+      .select()
+      .from(earnings)
+      .where(and(eq(earnings.orderId, order.id), eq(earnings.status, 'available')));
     if (!earning) return;
     const kobo = toKobo(earning.amount);
     const debited = await this.bump(order.sellerId, { availableKobo: -kobo, pendingKobo: kobo }, kobo);
     if (!debited) {
       throw Errors.conflict('The seller has already withdrawn these funds, so the decision cannot be reversed from the console.', 'FUNDS_WITHDRAWN');
     }
-    await this.earnings.updateOne({ _id: earning._id }, { $set: { status: 'pending' }, $unset: { releasedAt: 1 } });
+    await this.db.update(earnings).set({ status: 'pending', releasedAt: null }).where(eq(earnings.id, earning.id));
   }
 
   /* --- Reads ---------------------------------------------------------------- */
 
   async overview(sellerId: string): Promise<WalletOverview> {
-    const wallet = await this.wallets.findOne({ sellerId: new Types.ObjectId(sellerId) }).lean();
+    const [wallet] = await this.db.select().from(wallets).where(eq(wallets.sellerId, sellerId));
     return {
       available: fromKobo(wallet?.availableKobo ?? 0),
       pending: fromKobo(wallet?.pendingKobo ?? 0),
@@ -154,21 +178,21 @@ export class WalletService implements OnModuleInit {
     };
   }
 
-  private earningView(row: Lean<Earning>): EarningView {
+  private earningView(row: Earning): EarningView {
     return {
-      id: String(row._id),
-      orderId: String(row.orderId),
+      id: row.id,
+      orderId: row.orderId,
       orderNumber: row.orderNumber,
       product: row.product,
       amount: row.amount,
       status: row.status,
-      at: new Date(row.releasedAt ?? row.fundedAt).toISOString(),
+      at: (row.releasedAt ?? row.fundedAt).toISOString(),
     };
   }
 
-  private payoutView(row: Lean<Payout>): PayoutView {
+  private payoutView(row: Payout): PayoutView {
     return {
-      id: String(row._id),
+      id: row.id,
       reference: row.reference,
       amount: row.amount,
       destination: 'Bank Account',
@@ -176,30 +200,38 @@ export class WalletService implements OnModuleInit {
       accountName: row.destination.accountName,
       last4: row.destination.last4,
       status: row.status,
-      at: new Date(row.createdAt).toISOString(),
-      completedAt: row.completedAt ? new Date(row.completedAt).toISOString() : null,
-      failureReason: row.failureReason ?? null,
+      at: row.createdAt.toISOString(),
+      completedAt: row.completedAt?.toISOString() ?? null,
+      failureReason: row.failureReason,
     };
   }
 
   /** Earnings & Payouts: the three overview figures, released earnings and payout history. */
   async summary(sellerId: string, page = 1, limit = 20) {
-    const owner = new Types.ObjectId(sellerId);
-    const [overview, earnings, payouts, minimum] = await Promise.all([
+    const [overview, released, payoutPage, minimum] = await Promise.all([
       this.overview(sellerId),
-      this.earnings.find({ sellerId: owner, status: 'available' }).sort({ releasedAt: -1 }).limit(50).lean<Lean<Earning>[]>(),
+      this.db
+        .select()
+        .from(earnings)
+        .where(and(eq(earnings.sellerId, sellerId), eq(earnings.status, 'available')))
+        .orderBy(desc(earnings.releasedAt))
+        .limit(50),
       this.payoutPage(sellerId, page, limit),
       this.settings.section('commerce').then((commerce) => commerce.minimumWithdrawal),
     ]);
-    return { overview, minimumWithdrawal: minimum, earnings: earnings.map((row) => this.earningView(row)), payouts };
+    return { overview, minimumWithdrawal: minimum, earnings: released.map((row) => this.earningView(row)), payouts: payoutPage };
   }
 
   async payoutPage(sellerId: string, page = 1, limit = 20): Promise<Page<PayoutView>> {
-    const filter = { sellerId: new Types.ObjectId(sellerId) };
-    const total = await this.payouts.countDocuments(filter);
+    const where = eq(payouts.sellerId, sellerId);
+    const [{ total }] = await this.db.select({ total: count() }).from(payouts).where(where);
     const window = pageWindow(total, page, limit);
-    const rows = await this.payouts.find(filter).sort({ createdAt: -1, _id: -1 }).skip(window.skip).limit(window.size).lean<Lean<Payout>[]>();
-    return toPage(rows.map((row) => this.payoutView(row)), total, window);
+    const rows = await this.db.select().from(payouts).where(where).orderBy(desc(payouts.createdAt), desc(payouts.id)).offset(window.skip).limit(window.size);
+    return toPage(
+      rows.map((row) => this.payoutView(row)),
+      total,
+      window,
+    );
   }
 
   /* --- Withdrawals ------------------------------------------------------------ */
@@ -207,14 +239,13 @@ export class WalletService implements OnModuleInit {
   /**
    * The Withdraw dialog. Re-confirms the password, takes the amount out of
    * the available balance atomically (two simultaneous withdrawals cannot
-   * both pass) and asks the provider to transfer it.
+   * both pass) and asks Bachs to pay it out.
    */
   async requestPayout(user: AuthUser, input: { amount: number; password: string; accountId?: string; destination?: string }): Promise<PayoutView> {
     if (input.destination && input.destination !== 'bank') {
       throw Errors.badRequest('Payouts go to a Nigerian bank account. Add one under Payment accounts.', 'PAYOUT_METHOD_UNAVAILABLE');
     }
-    const record = await this.users.findById(user.id).select('+passwordHash').lean();
-    if (!(await this.passwords.verify(input.password, record?.passwordHash))) {
+    if (!(await this.passwords.verify(input.password, await this.users.passwordHashOf(user.id)))) {
       throw Errors.badRequest('That password is incorrect.', 'INVALID_PASSWORD');
     }
     const minimum = (await this.settings.section('commerce')).minimumWithdrawal;
@@ -222,159 +253,172 @@ export class WalletService implements OnModuleInit {
     return this.startPayout(user.id, input.amount, input.accountId, false);
   }
 
-  private async autoPayout(sellerId: string, amount: number): Promise<void> {
-    await this.startPayout(sellerId, amount, undefined, true);
+  /** The account a payout goes to, once Bachs has approved it. */
+  private async usableAccount(sellerId: string, accountId?: string): Promise<PayoutAccount> {
+    const account = await this.methods.payoutAccount(sellerId, accountId);
+    if (!account) throw Errors.badRequest('Add a bank account under Payment accounts before withdrawing.', 'NO_PAYOUT_ACCOUNT');
+    if (!(await this.methods.ensureUsable(account))) {
+      throw Errors.badRequest('That bank account is still being reviewed by our payment partner. Try again once it is approved.', 'PAYOUT_ACCOUNT_UNVERIFIED');
+    }
+    return account;
   }
 
   private async startPayout(sellerId: string, amount: number, accountId: string | undefined, automatic: boolean): Promise<PayoutView> {
-    const account = await this.methods.payoutAccount(sellerId, accountId);
-    if (!account) throw Errors.badRequest('Add a bank account under Payment accounts before withdrawing.', 'NO_PAYOUT_ACCOUNT');
-    if (!account.verified) throw Errors.badRequest('That bank account has not been verified yet.', 'PAYOUT_ACCOUNT_UNVERIFIED');
-
+    const account = await this.usableAccount(sellerId, accountId);
     const kobo = toKobo(amount);
     if (kobo <= 0) throw Errors.badRequest('Enter an amount to withdraw.', 'VALIDATION_FAILED');
     const debited = await this.bump(sellerId, { availableKobo: -kobo }, kobo);
     if (!debited) throw Errors.badRequest('That is more than your available balance.', 'INSUFFICIENT_BALANCE');
 
-    const payout = await this.payouts.create({
-      sellerId: new Types.ObjectId(sellerId),
-      reference: payoutReference(),
-      amount: fromKobo(kobo),
-      destination: {
-        accountId: account._id,
-        bankName: account.bankName,
-        accountName: account.accountName,
-        last4: account.last4,
-        recipientCode: account.recipientCode,
-      },
-      status: 'processing',
-      automatic,
-      attempts: 1,
-    });
-    return this.payoutView(await this.transfer(payout.toObject() as Lean<Payout>));
+    const [payout] = await this.db
+      .insert(payouts)
+      .values({
+        sellerId,
+        reference: payoutReference(),
+        amount: fromKobo(kobo),
+        destination: {
+          accountId: account.id,
+          bankName: account.bankName,
+          accountName: account.accountName,
+          last4: account.last4,
+          recipientCode: account.recipientCode,
+        },
+        status: 'processing',
+        automatic,
+        attempts: 1,
+      })
+      .returning();
+    return this.payoutView(await this.send(payout));
   }
 
-  /** Hands the payout to the provider. A refusal returns the money to the available balance. */
-  private async transfer(payout: Lean<Payout>): Promise<Lean<Payout>> {
+  /** Hands the payout to Bachs. A refusal returns the money to the available balance. */
+  private async send(payout: Payout): Promise<Payout> {
     try {
-      const result = await this.provider.initiateTransfer({
+      const result = await this.provider.createPayout({
+        destinationId: payout.destination.recipientCode,
         amount: payout.amount,
-        recipientCode: payout.destination.recipientCode,
         reference: payout.reference,
-        reason: 'DOOAA seller payout',
       });
-      await this.payouts.updateOne({ _id: payout._id }, { $set: { transferCode: result.transferCode } });
-      if (result.status === 'success') await this.applyTransfer({ reference: payout.reference, status: 'success', transferCode: result.transferCode });
-      if (result.status === 'failed') await this.applyTransfer({ reference: payout.reference, status: 'failed', transferCode: result.transferCode, reason: 'Refused by the provider' });
+      await this.db.update(payouts).set({ transferCode: result.payoutId }).where(eq(payouts.id, payout.id));
+      if (result.status !== 'pending') {
+        await this.applyPayout({ reference: payout.reference, status: result.status, payoutId: result.payoutId, reason: result.failureReason ?? 'Refused by the provider' });
+      }
     } catch (error) {
-      await this.applyTransfer({ reference: payout.reference, status: 'failed', reason: (error as Error).message });
+      await this.applyPayout({ reference: payout.reference, status: 'failed', reason: (error as Error).message });
       throw error;
     }
-    return (await this.payouts.findById(payout._id).lean<Lean<Payout>>())!;
+    return this.payoutById(payout.id);
   }
 
-  /** The provider's word on a transfer. Idempotent: each payout settles once. */
-  async applyTransfer(event: TransferUpdated): Promise<void> {
+  private async payoutById(id: string): Promise<Payout> {
+    const [row] = await this.db.select().from(payouts).where(eq(payouts.id, id));
+    return row;
+  }
+
+  /** Bachs' word on a payout. Idempotent: each payout settles once. */
+  async applyPayout(event: PayoutSettled): Promise<void> {
     if (event.status === 'success') {
-      const payout = await this.payouts
-        .findOneAndUpdate({ reference: event.reference, status: 'processing' }, { $set: { status: 'completed', completedAt: new Date() } }, { returnDocument: 'after' })
-        .lean<Lean<Payout>>();
+      const [payout] = await this.db
+        .update(payouts)
+        .set({ status: 'completed', completedAt: new Date(), ...(event.payoutId ? { transferCode: event.payoutId } : {}) })
+        .where(and(eq(payouts.reference, event.reference), eq(payouts.status, 'processing')))
+        .returning();
       if (!payout) return;
       await this.bump(payout.sellerId, { withdrawnKobo: toKobo(payout.amount) });
       await this.events.emit<PayoutUpdated>(WALLET_EVENTS.payoutUpdated, { payout });
       return;
     }
-    // Failed or reversed: the money comes back to the available balance.
-    const payout = await this.payouts
-      .findOneAndUpdate(
-        { reference: event.reference, status: { $in: event.status === 'reversed' ? ['processing', 'completed'] : ['processing'] } },
-        { $set: { status: 'failed', failedAt: new Date(), failureReason: event.reason ?? (event.status === 'reversed' ? 'Reversed by the bank' : 'Transfer failed') } },
-        { returnDocument: 'before' },
-      )
-      .lean<Lean<Payout>>();
+    // Failed: the money comes back to the available balance.
+    const [payout] = await this.db
+      .update(payouts)
+      .set({ status: 'failed', failedAt: new Date(), failureReason: event.reason ?? 'Payout failed' })
+      .where(and(eq(payouts.reference, event.reference), eq(payouts.status, 'processing')))
+      .returning();
     if (!payout) return;
-    const kobo = toKobo(payout.amount);
-    await this.bump(payout.sellerId, { availableKobo: kobo, ...(payout.status === 'completed' ? { withdrawnKobo: -kobo } : {}) });
-    const latest = (await this.payouts.findById(payout._id).lean<Lean<Payout>>())!;
-    await this.events.emit<PayoutUpdated>(WALLET_EVENTS.payoutUpdated, { payout: latest });
+    await this.bump(payout.sellerId, { availableKobo: toKobo(payout.amount) });
+    await this.events.emit<PayoutUpdated>(WALLET_EVENTS.payoutUpdated, { payout });
   }
 
   /* --- Console ----------------------------------------------------------------- */
 
-  async adminPayouts(query: { status?: Payout['status']; page?: number; limit?: number }): Promise<Page<PayoutView & { sellerId: string; sellerName: string; sellerEmail: string }>> {
-    const filter: Record<string, unknown> = {};
-    if (query.status) filter.status = query.status;
-    const total = await this.payouts.countDocuments(filter);
+  async adminPayouts(query: { status?: PayoutStatus; page?: number; limit?: number }): Promise<Page<PayoutView & { sellerId: string; sellerName: string; sellerEmail: string }>> {
+    const where = query.status ? eq(payouts.status, query.status) : undefined;
+    const [{ total }] = await this.db.select({ total: count() }).from(payouts).where(where);
     const window = pageWindow(total, query.page, query.limit ?? 20);
-    const rows = await this.payouts.find(filter).sort({ createdAt: -1 }).skip(window.skip).limit(window.size).lean<Lean<Payout>[]>();
-    const sellers = await this.users.find({ _id: { $in: rows.map((row) => row.sellerId) } }).select('firstName lastName email').lean();
-    const byId = new Map(sellers.map((seller) => [String(seller._id), seller]));
+    const rows = await this.db
+      .select({ payout: payouts, firstName: users.firstName, lastName: users.lastName, email: users.email })
+      .from(payouts)
+      .leftJoin(users, eq(users.id, payouts.sellerId))
+      .where(where)
+      .orderBy(desc(payouts.createdAt), desc(payouts.id))
+      .offset(window.skip)
+      .limit(window.size);
     return toPage(
-      rows.map((row) => {
-        const seller = byId.get(String(row.sellerId));
-        return {
-          ...this.payoutView(row),
-          sellerId: String(row.sellerId),
-          sellerName: seller ? `${seller.firstName} ${seller.lastName}` : 'Unknown seller',
-          sellerEmail: seller?.email ?? '',
-        };
-      }),
+      rows.map((row) => ({
+        ...this.payoutView(row.payout),
+        sellerId: row.payout.sellerId,
+        sellerName: row.firstName ? `${row.firstName} ${row.lastName}` : 'Unknown seller',
+        sellerEmail: row.email ?? '',
+      })),
       total,
       window,
     );
   }
 
-  /** Re-sends a failed payout to the provider (e.g. after the seller fixed their bank). */
+  /** Re-sends a failed payout to Bachs (e.g. after the seller fixed their bank). */
   async retryPayout(staff: AuthStaff, id: string): Promise<PayoutView> {
-    const payout = await this.payouts.findById(id).lean<Lean<Payout>>();
+    const payout = isUuid(id) ? await this.payoutById(id) : undefined;
     if (!payout) throw Errors.notFound('That payout does not exist.', 'PAYOUT_NOT_FOUND');
     if (payout.status !== 'failed') throw Errors.conflict('Only a failed payout can be retried.', 'PAYOUT_NOT_FAILED');
+    const account = await this.usableAccount(payout.sellerId).catch((error: Error) => {
+      throw Errors.conflict(error.message, 'NO_PAYOUT_ACCOUNT');
+    });
     const kobo = toKobo(payout.amount);
     const debited = await this.bump(payout.sellerId, { availableKobo: -kobo }, kobo);
     if (!debited) throw Errors.conflict('The seller no longer has that much available.', 'INSUFFICIENT_BALANCE');
-    const account = await this.methods.payoutAccount(String(payout.sellerId));
-    if (!account) {
+    const [fresh] = await this.db
+      .update(payouts)
+      .set({
+        status: 'processing',
+        // A new reference: Bachs treats a reference (and its idempotency key) as one payout, forever.
+        reference: payoutReference(),
+        destination: { accountId: account.id, bankName: account.bankName, accountName: account.accountName, last4: account.last4, recipientCode: account.recipientCode },
+        failureReason: null,
+        failedAt: null,
+        transferCode: null,
+        attempts: sql`${payouts.attempts} + 1`,
+      })
+      .where(and(eq(payouts.id, id), eq(payouts.status, 'failed')))
+      .returning();
+    if (!fresh) {
       await this.bump(payout.sellerId, { availableKobo: kobo });
-      throw Errors.conflict('The seller has no payout account on file.', 'NO_PAYOUT_ACCOUNT');
+      throw Errors.conflict('Only a failed payout can be retried.', 'PAYOUT_NOT_FAILED');
     }
-    const fresh = await this.payouts
-      .findByIdAndUpdate(
-        id,
-        {
-          $set: {
-            status: 'processing',
-            reference: payoutReference(),
-            destination: { accountId: account._id, bankName: account.bankName, accountName: account.accountName, last4: account.last4, recipientCode: account.recipientCode },
-          },
-          $unset: { failureReason: 1, failedAt: 1, transferCode: 1 },
-          $inc: { attempts: 1 },
-        },
-        { returnDocument: 'after' },
-      )
-      .lean<Lean<Payout>>();
     await this.audit.record(staff, { action: 'Retried a seller payout', target: `${formatNaira(payout.amount)} to ${account.bankName} ****${account.last4}`, targetType: 'payout', targetId: id });
-    return this.payoutView(await this.transfer(fresh!).catch(async () => (await this.payouts.findById(id).lean<Lean<Payout>>())!));
+    return this.payoutView(await this.send(fresh).catch(() => this.payoutById(id)));
   }
 
   /** Rebuilds a wallet from its history — used by tests and support to prove the books balance. */
   async recompute(sellerId: string): Promise<WalletOverview> {
-    const owner = new Types.ObjectId(sellerId);
-    const [earnings, payouts] = await Promise.all([
-      this.earnings.find({ sellerId: owner }).lean(),
-      this.payouts.find({ sellerId: owner }).lean(),
+    const [earningRows, payoutRows] = await Promise.all([
+      this.db.select({ status: earnings.status, amount: earnings.amount }).from(earnings).where(eq(earnings.sellerId, sellerId)),
+      this.db.select({ status: payouts.status, amount: payouts.amount }).from(payouts).where(eq(payouts.sellerId, sellerId)),
     ]);
     const sum = (values: number[]) => values.reduce((total, value) => total + toKobo(value), 0);
-    const pending = sum(earnings.filter((row) => row.status === 'pending').map((row) => row.amount));
-    const released = sum(earnings.filter((row) => row.status === 'available').map((row) => row.amount));
-    const withdrawn = sum(payouts.filter((row) => row.status === 'completed').map((row) => row.amount));
-    const inFlight = sum(payouts.filter((row) => row.status === 'processing').map((row) => row.amount));
+    const pending = sum(earningRows.filter((row) => row.status === 'pending').map((row) => row.amount));
+    const released = sum(earningRows.filter((row) => row.status === 'available').map((row) => row.amount));
+    const withdrawn = sum(payoutRows.filter((row) => row.status === 'completed').map((row) => row.amount));
+    const inFlight = sum(payoutRows.filter((row) => row.status === 'processing').map((row) => row.amount));
     return { available: fromKobo(released - withdrawn - inFlight), pending: fromKobo(pending), withdrawn: fromKobo(withdrawn) };
   }
 
   /** True when any money is still owed to or held for this seller. */
   async hasOpenBalance(sellerId: string): Promise<boolean> {
     const overview = await this.overview(sellerId);
-    const processing = await this.payouts.countDocuments({ sellerId: new Types.ObjectId(sellerId), status: 'processing' });
+    const [{ processing }] = await this.db
+      .select({ processing: count() })
+      .from(payouts)
+      .where(and(eq(payouts.sellerId, sellerId), inArray(payouts.status, ['processing'])));
     return overview.pending > 0 || overview.available > 0 || processing > 0;
   }
 }

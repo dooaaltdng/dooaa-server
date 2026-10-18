@@ -2,7 +2,7 @@ import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common
 import { ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { IsBoolean, IsInt, IsOptional, IsString, Max, MaxLength, Min, MinLength, ValidateNested } from 'class-validator';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { CurrentStaff, CurrentUser, Public, RequirePermissions, SellerOnly, StaffOnly } from '../../common/auth/decorators';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
 import { PageQueryDto } from '../../common/util/pagination';
@@ -56,13 +56,13 @@ export class ReviewsController {
 
   @Public()
   @Get('products/:id/reviews')
-  product(@Param('id', ObjectIdPipe) id: string, @Query() query: PageQueryDto) {
+  product(@Param('id', UuidPipe) id: string, @Query() query: PageQueryDto) {
     return this.reviews.forProduct(id, query.page, query.limit);
   }
 
   @Public()
   @Get('sellers/:id/reviews')
-  async seller(@Param('id', ObjectIdPipe) id: string, @Query() query: PageQueryDto) {
+  async seller(@Param('id', UuidPipe) id: string, @Query() query: PageQueryDto) {
     return { summary: await this.reviews.summary(id), reviews: await this.reviews.forSeller(id, query.page, query.limit) };
   }
 }
@@ -80,7 +80,7 @@ export class SellerReviewsController {
   }
 
   @Post(':id/reply')
-  reply(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string, @Body() body: ReplyDto) {
+  reply(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Body() body: ReplyDto) {
     return this.reviews.reply(user, id, body.body);
   }
 }
@@ -93,7 +93,7 @@ export class AdminReviewsController {
 
   @RequirePermissions('listings.moderate')
   @Patch(':id')
-  hide(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string, @Body() body: HideDto) {
+  hide(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string, @Body() body: HideDto) {
     return this.reviews.setHidden(staff, id, body.hidden);
   }
 }

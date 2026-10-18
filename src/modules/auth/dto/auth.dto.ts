@@ -1,8 +1,7 @@
 import { Equals, IsBoolean, IsEmail, IsIn, IsOptional, IsString, Length, Matches, MaxLength, MinLength } from 'class-validator';
-import { USER_ROLES, type UserRole } from '../../../common/domain';
+import { OTP_CHANNELS, type OtpChannel, USER_ROLES, type UserRole } from '../../../common/domain';
 import { ToLowerTrim, Trim } from '../../../common/util/transforms';
 import { IsPersonName, IsPhoneNumber, IsStrongPassword } from '../../../common/util/validators';
-import { OTP_CHANNELS, type OtpChannel } from '../../otp/otp.schema';
 
 export class SignUpDto {
   @Trim() @IsPersonName('First name') firstName: string;

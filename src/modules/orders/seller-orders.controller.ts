@@ -1,7 +1,7 @@
 import { Body, Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsIn, IsInt, IsMongoId, IsNumber, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
+import { IsIn, IsInt, IsUUID, IsNumber, IsOptional, IsString, Max, MaxLength, Min, MinLength } from 'class-validator';
 import { CurrentUser, RequireVerifiedEmail, SellerOnly } from '../../common/auth/decorators';
 import type { AuthUser } from '../../common/auth/principal';
 import { AuthThrottle } from '../../common/auth/throttle';
@@ -18,7 +18,7 @@ class WithdrawDto {
   @Type(() => Number) @IsNumber({ maxDecimalPlaces: 2 }, { message: 'Enter an amount.' }) @Min(1, { message: 'Enter an amount.' }) amount: number;
   @IsString() @MinLength(1, { message: 'Enter your password.' }) @MaxLength(128) password: string;
   /** Defaults to the primary payout account. */
-  @IsOptional() @IsMongoId() accountId?: string;
+  @IsOptional() @IsUUID() accountId?: string;
   @IsOptional() @IsIn(['bank', 'paypal']) destination?: 'bank' | 'paypal';
 }
 

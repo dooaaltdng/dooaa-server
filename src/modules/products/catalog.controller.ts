@@ -1,6 +1,6 @@
 import { Controller, Get, Param, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { CurrentUser, Public } from '../../common/auth/decorators';
 import type { AuthUser } from '../../common/auth/principal';
 import { PageQueryDto } from '../../common/util/pagination';
@@ -47,13 +47,13 @@ export class CatalogController {
 
   /** The product page: gallery, specs, seller panel, rating, the latest reviews and related items. */
   @Get('products/:id')
-  async detail(@Param('id', ObjectIdPipe) id: string, @CurrentUser() user?: AuthUser) {
+  async detail(@Param('id', UuidPipe) id: string, @CurrentUser() user?: AuthUser) {
     const [detail, reviews] = await Promise.all([this.products.detail(id, user), this.reviews.forProduct(id, 1, 3)]);
     return { ...detail, reviewCount: reviews.total, reviews: reviews.rows };
   }
 
   @Get('sellers/:id/products')
-  sellerProducts(@Param('id', ObjectIdPipe) id: string, @Query() query: PageQueryDto, @CurrentUser() user?: AuthUser) {
+  sellerProducts(@Param('id', UuidPipe) id: string, @Query() query: PageQueryDto, @CurrentUser() user?: AuthUser) {
     return this.products.bySeller(id, query.page, query.limit, user);
   }
 }

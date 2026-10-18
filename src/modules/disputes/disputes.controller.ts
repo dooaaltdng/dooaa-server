@@ -1,7 +1,7 @@
 import { Body, Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { ArrayMaxSize, IsArray, IsIn, IsOptional, IsString, IsUrl, Matches, MaxLength, MinLength } from 'class-validator';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { CurrentStaff, CurrentUser, RequirePermissions, StaffOnly } from '../../common/auth/decorators';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
 import { DISPUTE_OUTCOMES, DISPUTE_STATES, type DisputeOutcome, type DisputeState } from '../../common/domain';
@@ -59,13 +59,13 @@ export class DisputesController {
   }
 
   @Get('disputes/:id')
-  get(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string) {
+  get(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string) {
     return this.disputes.get(user, id);
   }
 
   @HttpCode(200)
   @Post('disputes/:id/respond')
-  respond(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string, @Body() body: RespondDto) {
+  respond(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Body() body: RespondDto) {
     return this.disputes.respond(user, id, body);
   }
 }
@@ -82,19 +82,19 @@ export class AdminDisputesController {
   }
 
   @Get(':id')
-  get(@Param('id', ObjectIdPipe) id: string) {
+  get(@Param('id', UuidPipe) id: string) {
     return this.disputes.adminGet(id);
   }
 
   @Post(':id/messages')
-  message(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string, @Body() body: DisputeMessageDto) {
+  message(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string, @Body() body: DisputeMessageDto) {
     return this.disputes.postMessage(staff, id, body.body, body.image);
   }
 
   @RequirePermissions('disputes.rule')
   @HttpCode(200)
   @Post(':id/resolve')
-  resolve(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string, @Body() body: ResolveDto) {
+  resolve(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string, @Body() body: ResolveDto) {
     return this.disputes.resolve(staff, id, body.outcome, body.note);
   }
 
@@ -102,7 +102,7 @@ export class AdminDisputesController {
   @RequirePermissions('disputes.rule')
   @HttpCode(200)
   @Post(':id/reopen')
-  reopen(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string, @Body() body: ReopenDto) {
+  reopen(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string, @Body() body: ReopenDto) {
     return this.disputes.reopen(staff, id, body.note);
   }
 }

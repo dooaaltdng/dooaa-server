@@ -1,7 +1,7 @@
 import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { ArrayMaxSize, IsArray, IsEmail, IsIn, IsOptional, IsString, IsUrl, MaxLength, MinLength } from 'class-validator';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { AllowRestricted, CurrentStaff, CurrentUser, OptionalAuth, StaffOnly } from '../../common/auth/decorators';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
 import { AuthThrottle } from '../../common/auth/throttle';
@@ -54,7 +54,7 @@ export class AdminSupportController {
   }
 
   @Patch(':id')
-  status(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string, @Body() body: TicketStatusDto) {
+  status(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string, @Body() body: TicketStatusDto) {
     return this.support.setStatus(staff, id, body.status);
   }
 }

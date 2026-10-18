@@ -24,7 +24,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
 
   async function shippedOrder(buyer: TestUser, seller: TestUser, price = 60_000) {
     const product = await createProduct(t, seller.id, { price });
-    const order = await paidOrder(t, buyer, String(product._id));
+    const order = await paidOrder(t, buyer, product.id);
     data(await http.post(`/seller/orders/${order.id}/ship`, { carrier: 'GIG Logistics', trackingNumber: 'GIG-77' }, seller.token));
     return { order, product };
   }
@@ -34,7 +34,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       const seller = await registerSeller(t);
       const buyer = await registerUser(t, { firstName: 'Jonny', lastName: 'Drill' });
       const product = await createProduct(t, seller.id, { price: 45_000 });
-      const order = await paidOrder(t, buyer, String(product._id));
+      const order = await paidOrder(t, buyer, product.id);
       failure(await http.post(`/orders/${order.id}/review`, { rating: 5 }, buyer.token), 409, 'ORDER_NOT_COMPLETE');
       await completeOrder(t, buyer, seller, order.id);
 
@@ -61,7 +61,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       ]);
       expect(ratings.summary.aspects.find((aspect: any) => aspect.key === 'communication')).toEqual({ key: 'communication', label: 'Communication', score: 5 });
 
-      const detail = data(await http.get(`/products/${product._id}`));
+      const detail = data(await http.get(`/products/${product.id}`));
       expect(detail).toMatchObject({ rating: 4, ratingCount: 1, reviewCount: 1 });
       expect(detail.reviews[0]).toMatchObject({ author: 'Jonny Drill', body: 'Good communication and product as described.' });
       expect(data(await http.get(`/sellers/${seller.id}/reviews`)).summary.total).toBe(1);
@@ -71,7 +71,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       const seller = await registerSeller(t);
       const buyer = await registerUser(t);
       const product = await createProduct(t, seller.id);
-      const order = await paidOrder(t, buyer, String(product._id));
+      const order = await paidOrder(t, buyer, product.id);
       await completeOrder(t, buyer, seller, order.id);
       const review = data(await http.post(`/orders/${order.id}/review`, { rating: 1, body: 'Terrible!!' }, buyer.token));
 
@@ -90,7 +90,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       const seller = await registerSeller(t);
       const review = async (buyer: TestUser, rating: number, body: string) => {
         const product = await createProduct(t, seller.id, { title: `Item for ${body.slice(0, 10)}` });
-        const order = await paidOrder(t, buyer, String(product._id));
+        const order = await paidOrder(t, buyer, product.id);
         await completeOrder(t, buyer, seller, order.id);
         return data(await http.post(`/orders/${order.id}/review`, { rating, body }, buyer.token));
       };
@@ -164,7 +164,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       const approved = data(await http.post(`/admin/verifications/${row.id}/approve`, { level: 'high-value' }, admin.token));
       expect(approved.status).toBe('approved');
       expect(data(await http.get('/auth/me', seller.token))).toMatchObject({ identity: 'verified', verificationLevel: 'high-value' });
-      expect((await model<Product>(t, Product.name).findById(product._id).lean())!.sellerVerified).toBe(true);
+      expect((await model<Product>(t, Product.name).findById(product.id).lean())!.sellerVerified).toBe(true);
       failure(await http.post(`/admin/verifications/${row.id}/reject`, { reason: 'Too late now' }, admin.token), 409, 'VERIFICATION_NOT_PENDING');
     });
 
@@ -188,7 +188,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       const seller = await registerSeller(t);
       const buyer = await registerUser(t, { firstName: 'Melissa', lastName: 'Jones' });
       const unshippedProduct = await createProduct(t, seller.id);
-      const unshipped = await paidOrder(t, buyer, String(unshippedProduct._id));
+      const unshipped = await paidOrder(t, buyer, unshippedProduct.id);
       failure(await http.post(`/orders/${unshipped.id}/dispute`, { reason: 'Seller is not responding to me at all.' }, buyer.token), 409, 'ORDER_NOT_DISPUTABLE');
 
       const { order } = await shippedOrder(buyer, seller);

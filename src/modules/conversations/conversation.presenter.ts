@@ -1,12 +1,9 @@
 import type { EscrowPhase } from '../../common/domain';
 import { clockTime, dayKey, longDate, secondsUntil } from '../../common/util/dates';
-import type { Lean } from '../../common/util/mongo';
 import { maskLast4 } from '../../common/util/text';
-import type { Order } from '../orders/schemas/order.schema';
-import type { User } from '../users/schemas/user.schema';
-import type { Conversation } from './schemas/conversation.schema';
-import type { Message } from './schemas/message.schema';
-import type { Offer } from './schemas/offer.schema';
+import type { Order } from '../orders/order.model';
+import type { User } from '../users/user.model';
+import type { Conversation, Message, Offer } from './conversation.model';
 
 /** The pill text the thread header shows for each escrow phase. */
 export const ESCROW_LABEL: Record<EscrowPhase, string> = {
@@ -135,11 +132,11 @@ function meetupDay(date: string): string {
   return new Date(`${date}T12:00:00+01:00`).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'Africa/Lagos' });
 }
 
-export function toMessageView(message: Lean<Message>, viewerId: string): MessageView {
+export function toMessageView(message: Message, viewerId: string): MessageView {
   return {
-    id: String(message._id),
-    conversationId: String(message.conversationId),
-    mine: Boolean(message.senderId && String(message.senderId) === viewerId),
+    id: message.id,
+    conversationId: message.conversationId,
+    mine: Boolean(message.senderId && message.senderId === viewerId),
     senderRole: message.senderRole,
     kind: message.kind,
     body: message.body,
@@ -147,8 +144,8 @@ export function toMessageView(message: Lean<Message>, viewerId: string): Message
     media: message.media
       ? { url: message.media.url, posterUrl: message.media.posterUrl ?? null, name: message.media.name ?? null, size: message.media.size ?? null, format: message.media.format ?? null }
       : null,
-    product: message.product ? { productId: message.product.productId ? String(message.product.productId) : null, title: message.product.title, price: message.product.price, image: message.product.image } : null,
-    offerId: message.offerId ? String(message.offerId) : null,
+    product: message.product ? { productId: message.product.productId ?? null, title: message.product.title, price: message.product.price, image: message.product.image } : null,
+    offerId: message.offerId,
     meetup: message.meetup
       ? {
           venue: message.meetup.venue,
@@ -163,28 +160,28 @@ export function toMessageView(message: Lean<Message>, viewerId: string): Message
         }
       : null,
     dispute: message.dispute ?? null,
-    createdAt: new Date(message.createdAt).toISOString(),
+    createdAt: message.createdAt.toISOString(),
     time: clockTime(message.createdAt),
     day: dayKey(message.createdAt),
   };
 }
 
-export function toOfferView(offer: Lean<Offer>, buyer: Lean<User> | null, subject: Conversation['subject'] | undefined): OfferView {
+export function toOfferView(offer: Offer, buyer: User | null, subject: Conversation['subject'] | undefined): OfferView {
   return {
-    id: String(offer._id),
+    id: offer.id,
     amount: offer.amount,
     listed: offer.listed,
     note: offer.note,
     status: offer.status,
     counter: offer.counter ? { amount: offer.counter.amount, note: offer.counter.note, at: new Date(offer.counter.at).toISOString() } : null,
-    agreedAmount: offer.agreedAmount ?? null,
+    agreedAmount: offer.agreedAmount,
     from: { name: buyer ? `${buyer.firstName} ${buyer.lastName}` : 'Buyer', role: 'Buyer' },
-    product: { id: String(offer.productId), title: subject?.title ?? '', summary: subject?.summary ?? '', image: subject?.image ?? '' },
-    createdAt: new Date(offer.createdAt).toISOString(),
+    product: { id: offer.productId, title: subject?.title ?? '', summary: subject?.summary ?? '', image: subject?.image ?? '' },
+    createdAt: offer.createdAt.toISOString(),
   };
 }
 
-export function trackingSteps(order: Lean<Order>): TrackingStep[] {
+export function trackingSteps(order: Order): TrackingStep[] {
   const escrow = order.escrow;
   const iso = (value?: Date | null) => (value ? new Date(value).toISOString() : null);
   return [
@@ -213,10 +210,10 @@ export function trackingSteps(order: Lean<Order>): TrackingStep[] {
 
 const CONDITION_LABEL: Record<string, string> = { new: 'Brand New', 'slightly-used': 'Slightly Used', used: 'Used', refurbished: 'Refurbished' };
 
-export function toConversationEscrow(order: Lean<Order>, buyer: Lean<User> | null, seller: Lean<User> | null, sellerPayoutLast4?: string | null, now = new Date()): ConversationEscrow | null {
+export function toConversationEscrow(order: Order, buyer: User | null, seller: User | null, sellerPayoutLast4?: string | null, now = new Date()): ConversationEscrow | null {
   if (!order.escrow) return null;
   const escrow = order.escrow;
-  const sellerName = seller ? (seller.seller?.storeName || `${seller.firstName} ${seller.lastName}`) : 'Seller';
+  const sellerName = seller ? seller.seller.storeName || `${seller.firstName} ${seller.lastName}` : 'Seller';
   const buyerName = buyer ? `${buyer.firstName} ${buyer.lastName}` : `${order.delivery.firstName} ${order.delivery.lastName}`;
   const item = order.items[0];
   return {
@@ -261,7 +258,7 @@ export function toConversationEscrow(order: Lean<Order>, buyer: Lean<User> | nul
               line2: [order.delivery.city, order.delivery.zip].filter(Boolean).join(', '),
               line3: [order.delivery.state, 'Nigeria'].filter(Boolean).join(', '),
             },
-            sellerProfile: { name: sellerName, memberSince: seller ? String(new Date(seller.createdAt).getUTCFullYear()) : '' },
+            sellerProfile: { name: sellerName, memberSince: seller ? String(seller.createdAt.getUTCFullYear()) : '' },
             payment: { brand: order.payment.brand ?? 'Card', last4: order.payment.last4 ?? '', ref: order.payment.reference ?? '' },
             history: [
               escrow.shippedAt && { label: 'Awaiting Shipped', at: new Date(escrow.fundedAt).toISOString() },

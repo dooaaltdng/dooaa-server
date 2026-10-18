@@ -1,5 +1,6 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import type { Response } from 'express';
+import { PG_ERRORS, pgError } from '../../database/sql';
 import { AppError } from './app-error';
 import type { ApiFailure } from './envelope';
 
@@ -27,6 +28,12 @@ const FRIENDLY: Record<number, string> = {
 };
 
 type Failure = { status: number; body: ApiFailure };
+
+/** "users_email_key" on "users" → "email": unique constraints are named `<table>_<columns>_key`. */
+function fieldOf(constraint: string | undefined, table: string | undefined): string | undefined {
+  if (!constraint || !table || !constraint.startsWith(`${table}_`) || !constraint.endsWith('_key')) return undefined;
+  return constraint.slice(table.length + 1, -'_key'.length).replace(/_/g, ' ') || undefined;
+}
 
 function messageOf(response: unknown, fallback: string): string {
   if (typeof response === 'string') return response;
@@ -61,10 +68,9 @@ export function toFailure(exception: unknown): Failure {
     return { status, body: { ok: false, error: message, code: STATUS_CODE[status] ?? 'ERROR' } };
   }
 
-  const error = exception as { name?: string; code?: number | string; keyValue?: Record<string, unknown>; path?: string; errors?: Record<string, { message: string }> };
-
-  if (error?.code === 11000) {
-    const field = Object.keys(error.keyValue ?? {})[0];
+  const database = pgError(exception);
+  if (database?.code === PG_ERRORS.uniqueViolation) {
+    const field = fieldOf(database.constraint, database.table);
     return {
       status: HttpStatus.CONFLICT,
       body: {
@@ -75,21 +81,17 @@ export function toFailure(exception: unknown): Failure {
       },
     };
   }
-
-  if (error?.name === 'CastError') {
-    return {
-      status: HttpStatus.BAD_REQUEST,
-      body: { ok: false, error: `Invalid ${error.path ?? 'value'}.`, code: 'INVALID_ID' },
-    };
+  if (database?.code === PG_ERRORS.foreignKeyViolation) {
+    return { status: HttpStatus.CONFLICT, body: { ok: false, error: 'That refers to something that no longer exists.', code: 'REFERENCE_MISSING' } };
+  }
+  if (database?.code === PG_ERRORS.checkViolation) {
+    return { status: HttpStatus.BAD_REQUEST, body: { ok: false, error: 'That value is not allowed.', code: 'VALIDATION_FAILED' } };
+  }
+  if (database?.code === PG_ERRORS.invalidTextRepresentation) {
+    return { status: HttpStatus.BAD_REQUEST, body: { ok: false, error: 'Invalid value.', code: 'INVALID_ID' } };
   }
 
-  if (error?.name === 'ValidationError' && error.errors) {
-    const details = Object.entries(error.errors).map(([field, value]) => ({ field, messages: [value.message] }));
-    return {
-      status: HttpStatus.BAD_REQUEST,
-      body: { ok: false, error: details[0]?.messages[0] ?? 'Validation failed.', code: 'VALIDATION_FAILED', details },
-    };
-  }
+  const error = exception as { name?: string; code?: number | string };
 
   if (error?.name === 'MulterError') {
     const tooLarge = error.code === 'LIMIT_FILE_SIZE';

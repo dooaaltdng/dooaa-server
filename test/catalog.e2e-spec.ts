@@ -157,21 +157,21 @@ describe('Catalog (e2e)', () => {
     it('counts views from shoppers but not from the seller', async () => {
       const product = await createProduct(t, seller.id, { title: 'View counter test' });
       const buyer = await registerUser(t);
-      data(await http.get(`/products/${product._id}`, buyer.token));
-      data(await http.get(`/products/${product._id}`));
-      data(await http.get(`/products/${product._id}`, seller.token));
+      data(await http.get(`/products/${product.id}`, buyer.token));
+      data(await http.get(`/products/${product.id}`));
+      data(await http.get(`/products/${product.id}`, seller.token));
       await eventually(async () => {
-        const stored = await model<Product>(t, Product.name).findById(product._id).lean();
+        const stored = await model<Product>(t, Product.name).findById(product.id).lean();
         expect(stored?.stats.views).toBe(2);
       });
       // …and the seller's own visit never lands later.
       await new Promise((resolve) => setTimeout(resolve, 150));
-      expect((await model<Product>(t, Product.name).findById(product._id).lean())?.stats.views).toBe(2);
+      expect((await model<Product>(t, Product.name).findById(product.id).lean())?.stats.views).toBe(2);
     });
 
     it('hides listings that are not live', async () => {
       const draft = await model<Product>(t, Product.name).findOne({ title: 'Hidden draft listing' }).lean();
-      failure(await http.get(`/products/${draft!._id}`), 404, 'PRODUCT_NOT_FOUND');
+      failure(await http.get(`/products/${draft.id}`), 404, 'PRODUCT_NOT_FOUND');
       failure(await http.get(`/products/${new Types.ObjectId()}`), 404, 'PRODUCT_NOT_FOUND');
       failure(await http.get('/products/not-an-id'), 404);
     });
@@ -360,13 +360,13 @@ describe('Catalog (e2e)', () => {
     it('lets moderators approve but not delete, and audits both', async () => {
       const moderator = await staffToken(t, 'moderator', { firstName: 'Amara', lastName: 'Eze' });
       const pending = await createProduct(t, seller.id, { title: 'Awaiting moderation', status: 'pending' });
-      const approved = data(await http.patch(`/admin/listings/${pending._id}/status`, { status: 'active', note: 'Looks genuine' }, moderator.token));
+      const approved = data(await http.patch(`/admin/listings/${pending.id}/status`, { status: 'active', note: 'Looks genuine' }, moderator.token));
       expect(approved.status).toBe('active');
-      failure(await http.delete(`/admin/listings/${pending._id}`, moderator.token), 403, 'PERMISSION_DENIED');
+      failure(await http.delete(`/admin/listings/${pending.id}`, moderator.token), 403, 'PERMISSION_DENIED');
 
       const admin = await staffToken(t, 'admin');
-      data(await http.delete(`/admin/listings/${pending._id}`, admin.token));
-      failure(await http.get(`/admin/listings/${pending._id}`, admin.token), 404);
+      data(await http.delete(`/admin/listings/${pending.id}`, admin.token));
+      failure(await http.get(`/admin/listings/${pending.id}`, admin.token), 404);
       const log = data(await http.get('/admin/audit?search=Awaiting', admin.token));
       expect(log.rows.map((row: any) => row.action)).toEqual(expect.arrayContaining(['Approved a listing', 'Deleted a listing']));
     });

@@ -20,7 +20,7 @@ export class JobsController {
   @Post('jobs/run')
   async run(@CurrentStaff() staff: AuthStaff) {
     const result = await this.jobs.runAll();
-    await this.audit.record(staff, { action: 'Ran background jobs', target: 'Payments & escrow', targetType: 'system' });
+    await this.audit.record(staff, { action: 'Ran background jobs', target: 'Payments, escrow & housekeeping', targetType: 'system' });
     return result;
   }
 }

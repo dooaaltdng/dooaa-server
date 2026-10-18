@@ -1,5 +1,5 @@
 import { Global, Inject, Module } from '@nestjs/common';
-import { APP_CONFIG, assertProductionConfig, loadConfig } from './configuration';
+import { APP_CONFIG, assertConfig, loadConfig } from './configuration';
 
 @Global()
 @Module({
@@ -8,7 +8,7 @@ import { APP_CONFIG, assertProductionConfig, loadConfig } from './configuration'
       provide: APP_CONFIG,
       useFactory: () => {
         const config = loadConfig();
-        assertProductionConfig(config);
+        assertConfig(config);
         return config;
       },
     },

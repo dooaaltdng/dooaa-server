@@ -1,10 +1,10 @@
 import { Type } from 'class-transformer';
-import { ArrayMaxSize, IsArray, IsEmail, IsInt, IsMongoId, IsOptional, IsString, Max, MaxLength, Min, MinLength, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsEmail, IsInt, IsUUID, IsOptional, IsString, Max, MaxLength, Min, MinLength, ValidateNested } from 'class-validator';
 import { Trim, ToLowerTrim } from '../../../common/util/transforms';
 import { IsPhoneNumber } from '../../../common/util/validators';
 
 export class AddCartItemDto {
-  @IsMongoId({ message: 'Choose a product.' }) productId: string;
+  @IsUUID('all', { message: 'Choose a product.' }) productId: string;
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(999) quantity?: number;
 }
 

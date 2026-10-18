@@ -1,4 +1,4 @@
-import type { OAuthProviderId } from '../../users/schemas/user.schema';
+import { type OAuthProviderId } from '../../../common/domain';
 
 /** Who the provider says signed in. Only `subject` is guaranteed. */
 export type OAuthProfile = {

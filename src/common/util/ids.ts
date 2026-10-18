@@ -1,5 +1,4 @@
 import { randomBytes, randomInt } from 'node:crypto';
-import { Types, isValidObjectId } from 'mongoose';
 
 export function randomDigits(length: number): string {
   let out = '';
@@ -33,20 +32,4 @@ export function payoutReference(): string {
 
 export function refundReference(): string {
   return `dooaa_rf_${Date.now().toString(36)}_${randomBytes(5).toString('hex')}`;
-}
-
-export function isObjectId(value: unknown): value is string {
-  return typeof value === 'string' && /^[a-f\d]{24}$/i.test(value) && isValidObjectId(value);
-}
-
-export function toObjectId(value: string | Types.ObjectId): Types.ObjectId {
-  return value instanceof Types.ObjectId ? value : new Types.ObjectId(value);
-}
-
-/** String form of an ObjectId-like value, or undefined. */
-export function idOf(value: unknown): string | undefined {
-  if (value === null || value === undefined) return undefined;
-  if (value instanceof Types.ObjectId) return value.toHexString();
-  if (typeof value === 'object' && '_id' in (value as object)) return idOf((value as { _id: unknown })._id);
-  return String(value);
 }

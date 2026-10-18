@@ -1,30 +1,38 @@
 /**
  * Typed configuration, read from the environment once per app instance.
  *
- * Every external side effect has a driver switch (mail, SMS, storage,
- * payments) so development and tests run fully offline while production
- * talks to the real third parties. Money never moves inside DOOAA: charges,
- * refunds and seller payouts are always executed by the payment provider.
+ * Every environment runs the same stack: PostgreSQL, Redis, Bachs, Cloudinary
+ * and SMTP (development points them at sandboxes and test accounts). Money
+ * never moves inside DOOAA: charges, refunds and seller payouts are always
+ * executed by Bachs. The test suite swaps the external services for
+ * in-memory doubles through dependency injection, not configuration.
  */
 
 export type NodeEnv = 'development' | 'production' | 'test';
-export type MailTransport = 'smtp' | 'memory' | 'log';
 export type SmsDriver = 'termii' | 'memory' | 'log';
-export type StorageDriver = 'local' | 'cloudinary' | 'memory';
-export type PaymentProviderName = 'paystack' | 'sandbox';
 /** `live` talks to Google/Facebook; `sandbox` signs in offline with a fake profile (development and tests). */
 export type OAuthDriver = 'live' | 'sandbox';
 
 export interface AppConfig {
   env: NodeEnv;
   port: number;
-  /** Public base URL of this API, used for links it hands out (media, sandbox checkout). */
+  /** Public base URL of this API, used for links it hands out (media, webhooks). */
   appUrl: string;
   clientUrl: string;
   adminUrl: string;
   corsOrigins: string[];
   logLevel: string;
-  mongo: { uri: string; dbName?: string };
+  database: {
+    url: string;
+    poolMax: number;
+    /** Server-side ceiling on any one statement, so a runaway query cannot hold a connection. */
+    statementTimeoutMs: number;
+  };
+  redis: {
+    url: string;
+    /** Prepended to every key, so several apps or environments can share one Redis. */
+    keyPrefix: string;
+  };
   jwt: {
     accessSecret: string;
     refreshSecret: string;
@@ -45,7 +53,7 @@ export interface AppConfig {
   };
   auth: { maxFailedSignIns: number; lockMinutes: number; bcryptRounds: number; cookieSameSite: 'lax' | 'strict' | 'none'; cookieSecure: boolean };
   mail: {
-    transport: MailTransport;
+    /** The From header, e.g. `DOOAA <no-reply@dooaa.ng>`. */
     from: string;
     supportInbox: string;
     smtp: { host: string; port: number; secure: boolean; user?: string; pass?: string };
@@ -55,24 +63,22 @@ export interface AppConfig {
     termii: { apiKey?: string; senderId: string; baseUrl: string };
   };
   storage: {
-    driver: StorageDriver;
-    localDir: string;
     maxImageMb: number;
     maxVideoMb: number;
     maxFileMb: number;
     signingSecret: string;
-    cloudinary: { cloudName?: string; apiKey?: string; apiSecret?: string; folder: string };
+    cloudinary: { cloudName: string; apiKey: string; apiSecret: string; folder: string };
   };
   payments: {
-    provider: PaymentProviderName;
     currency: 'NGN';
-    /** Where the provider sends the buyer after paying; the client verifies from there. */
+    /** Where Bachs sends the buyer after paying; the client verifies from there. */
     callbackUrl: string;
-    paystack: { secretKey?: string; publicKey?: string; baseUrl: string };
-    /** Signs sandbox webhooks so the sandbox exercises the same verification path. */
-    sandboxSecret: string;
-    /** How long the sandbox takes to "settle" transfers, refunds and charge webhooks. */
-    sandboxDelayMs: number;
+    bachs: {
+      secretKey: string;
+      /** Signs the webhooks Bachs sends; from the Bachs dashboard's webhook settings. */
+      webhookSecret: string;
+      baseUrl: string;
+    };
   };
   oauth: {
     driver: OAuthDriver;
@@ -116,6 +122,11 @@ function oneOf<T extends string>(name: string, allowed: readonly T[], fallback: 
   return raw && allowed.includes(raw) ? raw : fallback;
 }
 
+/** Bachs keys say which environment they belong to; the base URL follows unless set explicitly. */
+export function bachsBaseUrl(secretKey: string): string {
+  return secretKey.startsWith('sk_live_') ? 'https://api.bachs.io' : 'https://sandbox-api.bachs.io';
+}
+
 export function loadConfig(): AppConfig {
   const env = oneOf<NodeEnv>('NODE_ENV', ['development', 'production', 'test'], 'development');
   const production = env === 'production';
@@ -130,6 +141,7 @@ export function loadConfig(): AppConfig {
 
   // Development secrets are deterministic so restarts keep sessions; production must set them.
   const devSecret = (label: string) => `dooaa-dev-${label}-secret-change-me`;
+  const bachsSecretKey = str('BACHS_SECRET_KEY');
 
   return {
     env,
@@ -139,9 +151,14 @@ export function loadConfig(): AppConfig {
     adminUrl,
     corsOrigins: Array.from(new Set([clientUrl, adminUrl, ...extraOrigins])),
     logLevel: str('LOG_LEVEL', production ? 'info' : env === 'test' ? 'silent' : 'debug'),
-    mongo: {
-      uri: str('MONGODB_URI', 'mongodb://127.0.0.1:27017/dooaa'),
-      dbName: str('MONGODB_DB') || undefined,
+    database: {
+      url: str('DATABASE_URL'),
+      poolMax: num('DATABASE_POOL_MAX', 10),
+      statementTimeoutMs: num('DATABASE_STATEMENT_TIMEOUT_MS', 30_000),
+    },
+    redis: {
+      url: str('REDIS_URL'),
+      keyPrefix: str('REDIS_KEY_PREFIX', `dooaa:${env}:`),
     },
     jwt: {
       accessSecret: str('JWT_ACCESS_SECRET', production ? '' : devSecret('access')),
@@ -167,11 +184,10 @@ export function loadConfig(): AppConfig {
       cookieSecure: bool('COOKIE_SECURE', production),
     },
     mail: {
-      transport: oneOf<MailTransport>('MAIL_TRANSPORT', ['smtp', 'memory', 'log'], production ? 'smtp' : 'log'),
-      from: str('MAIL_FROM', 'DOOAA <no-reply@dooaa.ng>'),
+      from: str('SMTP_FROM', 'DOOAA <no-reply@dooaa.ng>'),
       supportInbox: str('SUPPORT_INBOX', 'support@dooaa.ng'),
       smtp: {
-        host: str('SMTP_HOST', 'localhost'),
+        host: str('SMTP_HOST'),
         port: num('SMTP_PORT', 587),
         secure: bool('SMTP_SECURE', false),
         user: str('SMTP_USER') || undefined,
@@ -187,35 +203,25 @@ export function loadConfig(): AppConfig {
       },
     },
     storage: {
-      // Cloudinary is the upload destination; local disk is an explicit opt-in for offline work.
-      driver: oneOf<StorageDriver>('STORAGE_DRIVER', ['local', 'cloudinary', 'memory'], env === 'test' ? 'memory' : 'cloudinary'),
-      localDir: str('STORAGE_LOCAL_DIR', 'uploads'),
       maxImageMb: num('MAX_IMAGE_MB', 10),
       maxVideoMb: num('MAX_VIDEO_MB', 50),
       maxFileMb: num('MAX_FILE_MB', 10),
       signingSecret: str('MEDIA_SIGNING_SECRET', production ? '' : devSecret('media')),
       cloudinary: {
-        cloudName: str('CLOUDINARY_CLOUD_NAME') || undefined,
-        apiKey: str('CLOUDINARY_API_KEY') || undefined,
-        apiSecret: str('CLOUDINARY_API_SECRET') || undefined,
+        cloudName: str('CLOUDINARY_CLOUD_NAME'),
+        apiKey: str('CLOUDINARY_API_KEY'),
+        apiSecret: str('CLOUDINARY_API_SECRET'),
         folder: str('CLOUDINARY_FOLDER', 'dooaa'),
       },
     },
     payments: {
-      provider: oneOf<PaymentProviderName>(
-        'PAYMENT_PROVIDER',
-        ['paystack', 'sandbox'],
-        production ? 'paystack' : 'sandbox',
-      ),
       currency: 'NGN',
       callbackUrl: str('PAYMENT_CALLBACK_URL', `${clientUrl}/checkout/callback`),
-      paystack: {
-        secretKey: str('PAYSTACK_SECRET_KEY') || undefined,
-        publicKey: str('PAYSTACK_PUBLIC_KEY') || undefined,
-        baseUrl: str('PAYSTACK_BASE_URL', 'https://api.paystack.co'),
+      bachs: {
+        secretKey: bachsSecretKey,
+        webhookSecret: str('BACHS_WEBHOOK_SECRET'),
+        baseUrl: str('BACHS_BASE_URL', bachsBaseUrl(bachsSecretKey)).replace(/\/$/, ''),
       },
-      sandboxSecret: str('PAYMENT_WEBHOOK_SECRET', devSecret('sandbox-webhook')),
-      sandboxDelayMs: num('PAYMENT_SANDBOX_DELAY_MS', env === 'test' ? 0 : 800),
     },
     oauth: {
       driver: oneOf<OAuthDriver>('OAUTH_DRIVER', ['live', 'sandbox'], env === 'production' ? 'live' : 'sandbox'),
@@ -244,51 +250,49 @@ export function loadConfig(): AppConfig {
   };
 }
 
-/** Cloudinary is the primary upload destination in every environment that uses it. */
-export function assertStorageConfig(config: AppConfig): void {
-  if (config.storage.driver !== 'cloudinary') return;
-  const { cloudName, apiKey, apiSecret } = config.storage.cloudinary;
-  const missing = [
-    !cloudName && 'CLOUDINARY_CLOUD_NAME',
-    !apiKey && 'CLOUDINARY_API_KEY',
-    !apiSecret && 'CLOUDINARY_API_SECRET',
-  ].filter(Boolean);
-  if (missing.length) {
-    throw new Error(
-      `Cloudinary is the upload destination: set ${missing.join(', ')}` +
-        (config.env === 'production' ? '.' : ' (or STORAGE_DRIVER=local for offline development).'),
-    );
-  }
-}
-
-/** Fails fast at boot when production is missing something it cannot run without. */
-export function assertProductionConfig(config: AppConfig): void {
-  assertStorageConfig(config);
-  if (config.env !== 'production') return;
+/**
+ * Fails fast at boot when something the app cannot run without is missing.
+ * The services are required in every environment; production additionally
+ * needs real secrets. The test suite replaces the services with in-memory
+ * doubles, so it only needs the database.
+ */
+export function assertConfig(config: AppConfig): void {
   const missing: string[] = [];
   const need = (value: unknown, name: string) => {
     if (!value) missing.push(name);
   };
-  need(process.env.MONGODB_URI, 'MONGODB_URI');
-  need(config.jwt.accessSecret, 'JWT_ACCESS_SECRET');
-  need(config.jwt.refreshSecret, 'JWT_REFRESH_SECRET');
-  need(config.jwt.staffSecret, 'JWT_STAFF_SECRET');
-  need(config.otp.pepper, 'OTP_PEPPER');
-  need(config.storage.signingSecret, 'MEDIA_SIGNING_SECRET');
-  if (config.mail.transport === 'smtp') need(process.env.SMTP_HOST, 'SMTP_HOST');
-  if (config.sms.driver === 'termii') need(config.sms.termii.apiKey, 'TERMII_API_KEY');
-  if (config.payments.provider === 'paystack') need(config.payments.paystack.secretKey, 'PAYSTACK_SECRET_KEY');
-  // Social sign-in is optional (a provider without credentials is just hidden), but never the fake one.
-  if (config.oauth.driver === 'sandbox') missing.push('OAUTH_DRIVER (sandbox is for development only; use live)');
-  for (const [name, secret] of [
-    ['JWT_ACCESS_SECRET', config.jwt.accessSecret],
-    ['JWT_REFRESH_SECRET', config.jwt.refreshSecret],
-    ['JWT_STAFF_SECRET', config.jwt.staffSecret],
-  ] as const) {
-    if (secret && secret.length < 32) missing.push(`${name} (must be at least 32 characters)`);
+  need(config.database.url, 'DATABASE_URL');
+  if (config.env !== 'test') {
+    need(config.redis.url, 'REDIS_URL');
+    need(config.mail.smtp.host, 'SMTP_HOST');
+    need(config.storage.cloudinary.cloudName, 'CLOUDINARY_CLOUD_NAME');
+    need(config.storage.cloudinary.apiKey, 'CLOUDINARY_API_KEY');
+    need(config.storage.cloudinary.apiSecret, 'CLOUDINARY_API_SECRET');
+    need(config.payments.bachs.secretKey, 'BACHS_SECRET_KEY');
+    need(config.payments.bachs.webhookSecret, 'BACHS_WEBHOOK_SECRET');
+  }
+  if (config.env === 'production') {
+    need(config.jwt.accessSecret, 'JWT_ACCESS_SECRET');
+    need(config.jwt.refreshSecret, 'JWT_REFRESH_SECRET');
+    need(config.jwt.staffSecret, 'JWT_STAFF_SECRET');
+    need(config.otp.pepper, 'OTP_PEPPER');
+    need(config.storage.signingSecret, 'MEDIA_SIGNING_SECRET');
+    if (config.sms.driver === 'termii') need(config.sms.termii.apiKey, 'TERMII_API_KEY');
+    if (config.payments.bachs.secretKey && !config.payments.bachs.secretKey.startsWith('sk_live_')) {
+      missing.push('BACHS_SECRET_KEY (production needs a live key, sk_live_…)');
+    }
+    // Social sign-in is optional (a provider without credentials is just hidden), but never the fake one.
+    if (config.oauth.driver === 'sandbox') missing.push('OAUTH_DRIVER (sandbox is for development only; use live)');
+    for (const [name, secret] of [
+      ['JWT_ACCESS_SECRET', config.jwt.accessSecret],
+      ['JWT_REFRESH_SECRET', config.jwt.refreshSecret],
+      ['JWT_STAFF_SECRET', config.jwt.staffSecret],
+    ] as const) {
+      if (secret && secret.length < 32) missing.push(`${name} (must be at least 32 characters)`);
+    }
   }
   if (missing.length) {
-    throw new Error(`Missing production configuration: ${missing.join(', ')}`);
+    throw new Error(`Missing ${config.env} configuration: ${missing.join(', ')}`);
   }
 }
 

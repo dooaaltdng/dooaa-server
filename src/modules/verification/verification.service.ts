@@ -1,12 +1,13 @@
 import { Injectable } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
+import { and, count, desc, eq, inArray } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
-import { ID_TYPE_LABEL, type BankVerificationMethod, type IdType, type VerificationLevel } from '../../common/domain';
+import { ID_TYPE_LABEL, type BankVerificationMethod, type IdentityStatus, type IdType, type UserRole, type VerificationLevel, type VerificationStatus } from '../../common/domain';
 import { longDate } from '../../common/util/dates';
-import type { Lean } from '../../common/util/mongo';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
+import { isUuid } from '../../common/util/uuid';
+import { InjectDb, type Database } from '../../database/database';
+import { users, verifications, type VerificationBank } from '../../database/schema';
 import { AuditService } from '../audit/audit.service';
 import { MailService } from '../mail/mail.service';
 import { MediaService } from '../media/media.service';
@@ -14,9 +15,9 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { PaymentMethodsService } from '../payments/payment-methods.service';
 import { ProductsService } from '../products/products.service';
 import { SettingsService } from '../settings/settings.service';
-import { User } from '../users/schemas/user.schema';
 import { UsersService } from '../users/users.service';
-import { Verification } from './verification.schema';
+
+export type Verification = typeof verifications.$inferSelect;
 
 export type SubmitVerificationInput = {
   idType: IdType;
@@ -30,7 +31,7 @@ export type KycDocumentView = { id: string; label: string; caption: string; acti
 
 export type VerificationView = {
   id: string;
-  status: Verification['status'];
+  status: VerificationStatus;
   idType: IdType;
   idTypeLabel: string;
   submittedAt: string;
@@ -42,8 +43,7 @@ export type VerificationView = {
 @Injectable()
 export class VerificationService {
   constructor(
-    @InjectModel(Verification.name) private readonly verifications: Model<Verification>,
-    @InjectModel(User.name) private readonly userModel: Model<User>,
+    @InjectDb() private readonly db: Database,
     private readonly users: UsersService,
     private readonly media: MediaService,
     private readonly methods: PaymentMethodsService,
@@ -54,25 +54,22 @@ export class VerificationService {
     private readonly audit: AuditService,
   ) {}
 
-  private view(row: Lean<Verification>): VerificationView {
+  private view(row: Verification): VerificationView {
     return {
-      id: String(row._id),
+      id: row.id,
       status: row.status,
       idType: row.idType,
       idTypeLabel: ID_TYPE_LABEL[row.idType],
-      submittedAt: new Date(row.submittedAt).toISOString(),
-      reviewedAt: row.reviewedAt ? new Date(row.reviewedAt).toISOString() : null,
-      rejectionReason: row.rejectionReason ?? null,
+      submittedAt: row.submittedAt.toISOString(),
+      reviewedAt: row.reviewedAt?.toISOString() ?? null,
+      rejectionReason: row.rejectionReason,
       bank: row.bank ? { method: row.bank.method, bankName: row.bank.bankName, last4: row.bank.last4, accountName: row.bank.accountName } : null,
     };
   }
 
   /** Where the account's identity check stands. */
-  async mine(user: AuthUser): Promise<{ identity: User['identity']; verificationLevel: VerificationLevel; latest: VerificationView | null }> {
-    const [record, latest] = await Promise.all([
-      this.users.getById(user.id),
-      this.verifications.findOne({ userId: new Types.ObjectId(user.id) }).sort({ createdAt: -1 }).lean<Lean<Verification>>(),
-    ]);
+  async mine(user: AuthUser): Promise<{ identity: IdentityStatus; verificationLevel: VerificationLevel; latest: VerificationView | null }> {
+    const [record, latest] = await Promise.all([this.users.getById(user.id), this.latestFor(user.id)]);
     return { identity: record.identity, verificationLevel: record.verificationLevel, latest: latest ? this.view(latest) : null };
   }
 
@@ -92,7 +89,7 @@ export class VerificationService {
     const ids = [input.documents.idFront, input.documents.selfie, ...(input.documents.idBack ? [input.documents.idBack] : [])];
     await this.media.ownedByIds(ids, { id: user.id, type: 'user' }, 'kyc');
 
-    let bank: Verification['bank'];
+    let bank: VerificationBank | null = null;
     if (input.bank) {
       if (input.bank.method === 'micro') {
         throw Errors.badRequest('Micro-deposits are not available for Nigerian banks. Link your bank instantly instead.', 'MICRO_DEPOSITS_UNAVAILABLE');
@@ -105,26 +102,30 @@ export class VerificationService {
         bankCode: input.bank.bankCode,
         last4: account.last4,
         accountName: account.holder,
-        payoutAccountId: new Types.ObjectId(account.id),
+        payoutAccountId: account.id,
       };
     }
 
     const now = new Date();
-    const created = await this.verifications.create({
-      userId: new Types.ObjectId(user.id),
-      status: 'pending',
-      idType: input.idType,
-      documents: [
-        { kind: 'id-front', mediaId: new Types.ObjectId(input.documents.idFront), uploadedAt: now },
-        ...(input.documents.idBack ? [{ kind: 'id-back' as const, mediaId: new Types.ObjectId(input.documents.idBack), uploadedAt: now }] : []),
-        { kind: 'selfie', mediaId: new Types.ObjectId(input.documents.selfie), uploadedAt: now },
-      ],
-      livenessPassed: true,
-      bank,
-      consents: input.consents,
-      submittedAt: now,
-    });
-    await this.users.update(user.id, { $set: { identity: 'pending' } });
+    const uploadedAt = now.toISOString();
+    const [created] = await this.db
+      .insert(verifications)
+      .values({
+        userId: user.id,
+        status: 'pending',
+        idType: input.idType,
+        documents: [
+          { kind: 'id-front', mediaId: input.documents.idFront, uploadedAt },
+          ...(input.documents.idBack ? [{ kind: 'id-back' as const, mediaId: input.documents.idBack, uploadedAt }] : []),
+          { kind: 'selfie', mediaId: input.documents.selfie, uploadedAt },
+        ],
+        livenessPassed: true,
+        bank,
+        consents: input.consents,
+        submittedAt: now,
+      })
+      .returning();
+    await this.users.update(user.id, { identity: 'pending' });
 
     void this.mail.send(record.email, {
       subject: 'We are reviewing your documents',
@@ -141,25 +142,34 @@ export class VerificationService {
         link: `/users/${record.role === 'seller' ? 'sellers' : 'buyers'}/${user.id}`,
       });
     }
-    return { identity: 'pending', verification: this.view(created.toObject() as Lean<Verification>) };
+    return { identity: 'pending', verification: this.view(created) };
   }
 
   /* --- Console ----------------------------------------------------------------- */
 
-  async list(query: { status?: Verification['status']; page?: number; limit?: number }): Promise<Page<VerificationView & { userId: string; name: string; email: string; role: User['role'] }>> {
-    const filter: Record<string, unknown> = {};
-    if (query.status) filter.status = query.status;
-    const total = await this.verifications.countDocuments(filter);
+  async list(query: { status?: VerificationStatus; page?: number; limit?: number }): Promise<Page<VerificationView & { userId: string; name: string; email: string; role: UserRole | null }>> {
+    const where = query.status ? eq(verifications.status, query.status) : undefined;
+    const [{ total }] = await this.db.select({ total: count() }).from(verifications).where(where);
     const window = pageWindow(total, query.page, query.limit ?? 20);
-    const rows = await this.verifications.find(filter).sort({ submittedAt: -1 }).skip(window.skip).limit(window.size).lean<Lean<Verification>[]>();
-    const people = await this.userModel.find({ _id: { $in: rows.map((row) => row.userId) } }).select('firstName lastName email role').lean();
-    const byId = new Map(people.map((person) => [String(person._id), person]));
+    const rows = await this.db.select().from(verifications).where(where).orderBy(desc(verifications.submittedAt)).offset(window.skip).limit(window.size);
+    const people = rows.length
+      ? await this.db
+          .select({ id: users.id, firstName: users.firstName, lastName: users.lastName, email: users.email, role: users.role })
+          .from(users)
+          .where(
+            inArray(
+              users.id,
+              rows.map((row) => row.userId),
+            ),
+          )
+      : [];
+    const byId = new Map(people.map((person) => [person.id, person]));
     return toPage(
       rows.map((row) => {
-        const person = byId.get(String(row.userId));
+        const person = byId.get(row.userId);
         return {
           ...this.view(row),
-          userId: String(row.userId),
+          userId: row.userId,
           name: person ? `${person.firstName} ${person.lastName}` : 'Unknown',
           email: person?.email ?? '',
           role: person?.role ?? null,
@@ -171,35 +181,40 @@ export class VerificationService {
   }
 
   /** The documents behind a review, as short-lived signed links. */
-  async documentsFor(row: Lean<Verification>): Promise<KycDocumentView[]> {
+  async documentsFor(row: Verification): Promise<KycDocumentView[]> {
     const label: Record<string, string> = {
       'id-front': `ID Document (${ID_TYPE_LABEL[row.idType]})`,
       'id-back': `ID Document — back (${ID_TYPE_LABEL[row.idType]})`,
       selfie: 'Selfie Verification',
     };
     return row.documents.map((document) => ({
-      id: String(document.mediaId),
+      id: document.mediaId,
       kind: document.kind,
       label: label[document.kind],
       caption: `${document.kind === 'selfie' ? 'Completed' : 'Uploaded'}: ${longDate(document.uploadedAt)}`,
       action: document.kind === 'selfie' ? 'View Photo' : 'View Document',
-      asset: this.media.signedUrl(String(document.mediaId)),
+      asset: this.media.signedUrl(document.mediaId),
     }));
   }
 
-  async latestFor(userId: string, status?: Verification['status']): Promise<Lean<Verification> | null> {
-    const filter: Record<string, unknown> = { userId: new Types.ObjectId(userId) };
-    if (status) filter.status = status;
-    return this.verifications.findOne(filter).sort({ createdAt: -1 }).lean<Lean<Verification>>();
+  async latestFor(userId: string, status?: VerificationStatus): Promise<Verification | null> {
+    if (!isUuid(userId)) return null;
+    const [row] = await this.db
+      .select()
+      .from(verifications)
+      .where(and(eq(verifications.userId, userId), status ? eq(verifications.status, status) : undefined))
+      .orderBy(desc(verifications.createdAt))
+      .limit(1);
+    return row ?? null;
   }
 
   async get(id: string) {
-    const row = Types.ObjectId.isValid(id) ? await this.verifications.findById(id).lean<Lean<Verification>>() : null;
+    const [row] = isUuid(id) ? await this.db.select().from(verifications).where(eq(verifications.id, id)) : [];
     if (!row) throw Errors.notFound('That verification does not exist.', 'VERIFICATION_NOT_FOUND');
-    const person = await this.userModel.findById(row.userId).select('firstName lastName email phone role').lean();
+    const person = await this.users.findById(row.userId);
     return {
       ...this.view(row),
-      userId: String(row.userId),
+      userId: row.userId,
       name: person ? `${person.firstName} ${person.lastName}` : 'Unknown',
       email: person?.email ?? '',
       role: person?.role ?? null,
@@ -208,14 +223,24 @@ export class VerificationService {
     };
   }
 
-  async approve(staff: AuthStaff, id: string, level?: VerificationLevel) {
-    const row = await this.verifications
-      .findOneAndUpdate({ _id: id, status: 'pending' }, { $set: { status: 'approved', reviewedBy: staff.id, reviewedAt: new Date() } }, { returnDocument: 'after' })
-      .lean<Lean<Verification>>();
+  /** Moves a pending review to its outcome; only one reviewer can decide it. */
+  private async decide(id: string, set: Partial<Verification>): Promise<Verification> {
+    const [row] = isUuid(id)
+      ? await this.db
+          .update(verifications)
+          .set(set)
+          .where(and(eq(verifications.id, id), eq(verifications.status, 'pending')))
+          .returning()
+      : [];
     if (!row) throw Errors.conflict('This verification is not waiting for review.', 'VERIFICATION_NOT_PENDING');
-    const user = await this.users.update(String(row.userId), { $set: { identity: 'verified', ...(level ? { verificationLevel: level } : {}) } });
-    await this.products.syncSellerVerified(String(row.userId), true);
-    await this.audit.record(staff, { action: 'Approved an identity verification', target: `${user.firstName} ${user.lastName}`, targetType: 'user', targetId: String(row.userId) });
+    return row;
+  }
+
+  async approve(staff: AuthStaff, id: string, level?: VerificationLevel) {
+    const row = await this.decide(id, { status: 'approved', reviewedBy: staff.id, reviewedAt: new Date() });
+    const user = await this.users.update(row.userId, { identity: 'verified', ...(level ? { verificationLevel: level } : {}) });
+    await this.products.syncSellerVerified(row.userId, true);
+    await this.audit.record(staff, { action: 'Approved an identity verification', target: `${user.firstName} ${user.lastName}`, targetType: 'user', targetId: row.userId });
     void this.notifications.notifyUser(row.userId, {
       type: 'kyc.approved',
       title: 'You are verified',
@@ -228,12 +253,9 @@ export class VerificationService {
   }
 
   async reject(staff: AuthStaff, id: string, reason: string) {
-    const row = await this.verifications
-      .findOneAndUpdate({ _id: id, status: 'pending' }, { $set: { status: 'rejected', reviewedBy: staff.id, reviewedAt: new Date(), rejectionReason: reason } }, { returnDocument: 'after' })
-      .lean<Lean<Verification>>();
-    if (!row) throw Errors.conflict('This verification is not waiting for review.', 'VERIFICATION_NOT_PENDING');
-    const user = await this.users.update(String(row.userId), { $set: { identity: 'rejected' } });
-    await this.audit.record(staff, { action: 'Rejected an identity verification', target: `${user.firstName} ${user.lastName}`, targetType: 'user', targetId: String(row.userId), meta: { reason } });
+    const row = await this.decide(id, { status: 'rejected', reviewedBy: staff.id, reviewedAt: new Date(), rejectionReason: reason });
+    const user = await this.users.update(row.userId, { identity: 'rejected' });
+    await this.audit.record(staff, { action: 'Rejected an identity verification', target: `${user.firstName} ${user.lastName}`, targetType: 'user', targetId: row.userId, meta: { reason } });
     void this.notifications.notifyUser(row.userId, {
       type: 'kyc.rejected',
       title: 'Verification needs another try',
@@ -250,7 +272,7 @@ export class VerificationService {
   }
 
   async setLevel(staff: AuthStaff, userId: string, level: VerificationLevel) {
-    const user = await this.users.update(userId, { $set: { verificationLevel: level } });
+    const user = await this.users.update(userId, { verificationLevel: level });
     await this.audit.record(staff, { action: `Set seller verification to ${level === 'high-value' ? 'High-Value' : 'Normal'}`, target: `${user.firstName} ${user.lastName}`, targetType: 'user', targetId: userId });
     return { id: userId, verificationLevel: level };
   }
