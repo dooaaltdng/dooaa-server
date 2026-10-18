@@ -1,11 +1,10 @@
+import { eventually } from './utils/eventually';
 import request from 'supertest';
 import { createTestApp, type TestApp } from './utils/app';
 import { API, Http, data, failure } from './utils/http';
 import { codeFromMail, createProduct, model, registerSeller, registerUser, staffToken, uploadImage, type TestUser } from './utils/factories';
 import { completeOrder, paidOrder, settle } from './utils/commerce';
 import { FILES } from './utils/files';
-import { Product } from '../src/modules/products/schemas/product.schema';
-import { User } from '../src/modules/users/schemas/user.schema';
 
 describe('Reviews, identity verification and disputes (e2e)', () => {
   let t: TestApp;
@@ -83,7 +82,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       const moderator = await staffToken(t, 'moderator');
       data(await http.patch(`/admin/reviews/${review.id}`, { hidden: true }, moderator.token));
       expect(data(await http.get('/seller/reviews', seller.token)).summary).toMatchObject({ average: 0, total: 0 });
-      expect((await model<User>(t, User.name).findById(seller.id).lean())!.stats.ratingCount).toBe(0);
+      expect((await model(t, 'User').findById(seller.id).lean())!.statsRatingCount).toBe(0);
     });
 
     it('highlights real, visible, positive reviews with something to say, one per buyer', async () => {
@@ -164,7 +163,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       const approved = data(await http.post(`/admin/verifications/${row.id}/approve`, { level: 'high-value' }, admin.token));
       expect(approved.status).toBe('approved');
       expect(data(await http.get('/auth/me', seller.token))).toMatchObject({ identity: 'verified', verificationLevel: 'high-value' });
-      expect((await model<Product>(t, Product.name).findById(product.id).lean())!.sellerVerified).toBe(true);
+      expect((await model(t, 'Product').findById(product.id).lean())!.sellerVerified).toBe(true);
       failure(await http.post(`/admin/verifications/${row.id}/reject`, { reason: 'Too late now' }, admin.token), 409, 'VERIFICATION_NOT_PENDING');
     });
 
@@ -245,7 +244,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
         [policy, 'packaging-policy.pdf'],
       ]);
       const stranger = await staffUpload(FILES.png(), 'other.png');
-      await model<User>(t, User.name).db.collection('media').updateOne({ url: stranger }, { $set: { purpose: 'product' } });
+      await t.db.db.collection('media').updateOne({ url: stranger }, { $set: { purpose: 'product' } });
       failure(await http.post(`/admin/disputes/${dispute.id}/messages`, { body: 'Wrong kind of upload.', image: stranger }, moderator.token), 400, 'MEDIA_NOT_FOUND');
 
       const asked = data(await http.post(`/admin/disputes/${dispute.id}/resolve`, { outcome: 'evidence-requested' }, moderator.token));
@@ -316,7 +315,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       const dispute = data(await http.post(`/orders/${order.id}/dispute`, { reason: 'Wrong size was delivered to me.' }, buyer.token));
       data(await http.post(`/admin/disputes/${dispute.id}/resolve`, { outcome: 'closed' }, admin.token));
 
-      const disputes = model<any>(t, 'Dispute');
+      const disputes = model(t, 'Dispute');
       await disputes.updateOne({ _id: dispute.id }, { $set: { resolvedAt: new Date(Date.now() - 8 * 86_400_000) } });
       failure(await http.post(`/admin/disputes/${dispute.id}/reopen`, {}, admin.token), 409, 'REOPEN_WINDOW_PASSED');
 
@@ -338,7 +337,8 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       const superadmin = await staffToken(t, 'superadmin');
       data(await http.post(`/admin/escrows/${order.orderId}/settle`, { settlement: 'force-released' }, superadmin.token));
       await settle(t);
-      expect(data(await http.get(`/disputes/${dispute.id}`, buyer.token))).toMatchObject({ state: 'completed', outcome: 'released' });
+      // The ledger closes the dispute through an order event, a moment after the ruling.
+      await eventually(async () => expect(data(await http.get(`/disputes/${dispute.id}`, buyer.token))).toMatchObject({ state: 'completed', outcome: 'released' }));
     });
 
     it('keeps disputes private to their parties', async () => {

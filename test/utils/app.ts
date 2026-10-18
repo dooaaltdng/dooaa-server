@@ -2,7 +2,6 @@ import type { INestApplication } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { Test } from '@nestjs/testing';
 import { randomBytes } from 'node:crypto';
-import { Client } from 'pg';
 import { AppModule } from '../../src/app.module';
 import { configureApp } from '../../src/bootstrap';
 import { CACHE_STORE } from '../../src/cache/cache.store';
@@ -11,7 +10,6 @@ import { MailService } from '../../src/modules/mail/mail.service';
 import { MAIL_TRANSPORT } from '../../src/modules/mail/mail.transport';
 import { STORAGE_DRIVER } from '../../src/modules/media/storage/storage.driver';
 import { SmsService } from '../../src/modules/sms/sms.service';
-import { TEMPLATE_DATABASE } from '../setup/database';
 import { FAKE_BACHS_SECRET_KEY, FAKE_BACHS_WEBHOOK_SECRET, FakeBachs } from './fake-bachs';
 import { MailOutbox } from './mail-outbox';
 import { MemoryCacheStore } from './memory-cache.store';
@@ -23,7 +21,7 @@ export type TestApp = {
   /** Everything the app emailed. */
   mail: MailOutbox;
   sms: SmsService;
-  /** The Drizzle client on this app's own database. */
+  /** The database handle on this app's own database. */
   db: Database;
   /** The fake Bachs the app's payment provider talks to. */
   bachs: FakeBachs;
@@ -33,34 +31,21 @@ export type TestApp = {
   close(): Promise<void>;
 };
 
-async function admin<T>(work: (client: Client) => Promise<T>): Promise<T> {
-  const client = new Client({ connectionString: process.env.PG_TEST_ADMIN_URL });
-  await client.connect();
-  try {
-    return await work(client);
-  } finally {
-    await client.end();
-  }
-}
-
 /**
- * Boots the real AppModule against a private copy of the migrated template
- * database. Redis, Cloudinary and SMTP are swapped for in-memory doubles;
+ * Boots the real AppModule against its own database on the test MongoDB. Redis, Cloudinary and SMTP are swapped for in-memory doubles;
  * Bachs is a fake HTTP server the real provider calls. `env` overrides are
  * applied only while the app reads its configuration.
  */
 export async function createTestApp(options: { env?: Record<string, string>; /** Kept for callers; every test app listens now. */ listen?: boolean } = {}): Promise<TestApp> {
   const database = `t_${process.env.JEST_WORKER_ID ?? '0'}_${randomBytes(4).toString('hex')}`;
-  await admin((client) => client.query(`create database ${database} template ${TEMPLATE_DATABASE}`));
-  const databaseUrl = new URL(process.env.PG_TEST_ADMIN_URL!);
-  databaseUrl.pathname = `/${database}`;
 
   const bachs = new FakeBachs();
   const bachsUrl = await bachs.start();
 
   const saved: Record<string, string | undefined> = {};
   const env: Record<string, string> = {
-    DATABASE_URL: databaseUrl.toString(),
+    MONGODB_URI: process.env.TEST_MONGODB_URI!,
+    MONGODB_DB: database,
     DATABASE_POOL_MAX: '5',
     BACHS_SECRET_KEY: FAKE_BACHS_SECRET_KEY,
     BACHS_WEBHOOK_SECRET: FAKE_BACHS_WEBHOOK_SECRET,
@@ -74,15 +59,15 @@ export async function createTestApp(options: { env?: Record<string, string>; /**
 
   const mail = new MailOutbox();
   try {
-    const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+    let builder = Test.createTestingModule({ imports: [AppModule] })
       .overrideProvider(CACHE_STORE)
       .useValue(new MemoryCacheStore())
-      .overrideProvider(STORAGE_DRIVER)
-      .useValue(new MemoryStorage())
       .overrideProvider(MAIL_TRANSPORT)
-      .useValue(mail)
-      .compile();
-    const app = moduleRef.createNestApplication<NestExpressApplication>({ rawBody: true, logger: false });
+      .useValue(mail);
+    // Tests that exercise the Cloudinary driver ask for it (and mock its SDK); everyone else stores in memory.
+    if (env.STORAGE_DRIVER !== 'cloudinary') builder = builder.overrideProvider(STORAGE_DRIVER).useValue(new MemoryStorage());
+    const moduleRef = await builder.compile();
+    const app = moduleRef.createNestApplication<NestExpressApplication>({ rawBody: true, logger: process.env.TEST_LOGS ? ['error'] : false });
     configureApp(app);
     // Always listen on the loopback address itself. Left to supertest, each
     // request would bind a wildcard ephemeral port and dial 127.0.0.1 on it —
@@ -104,9 +89,10 @@ export async function createTestApp(options: { env?: Record<string, string>; /**
       get: <T>(token: unknown) => app.get(token as never) as T,
       close: async () => {
         await bachs.idle();
+        const db = app.get<Database>(DATABASE);
+        await db.db.dropDatabase().catch(() => undefined);
         await app.close();
         await bachs.stop();
-        await admin((client) => client.query(`drop database if exists ${database} with (force)`)).catch(() => undefined);
       },
     };
   } catch (error) {

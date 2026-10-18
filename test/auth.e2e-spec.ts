@@ -3,7 +3,6 @@ import request from 'supertest';
 import { createTestApp, type TestApp } from './utils/app';
 import { API, Http, data, failure } from './utils/http';
 import { PASSWORD, codeFromMail, codeFromSms, model, registerUser, uniqueEmail, uniquePhone } from './utils/factories';
-import { User } from '../src/modules/users/schemas/user.schema';
 import { UsersService } from '../src/modules/users/users.service';
 
 describe('Auth (e2e)', () => {
@@ -70,7 +69,7 @@ describe('Auth (e2e)', () => {
     it('stores a bcrypt hash, never the password', async () => {
       const body = signUpBody();
       data(await http.post('/auth/sign-up', body));
-      const stored = await model<User>(t, User.name).findOne({ email: body.email }).select('+passwordHash').lean();
+      const stored = await model(t, 'User').findOne({ email: body.email }).select('+passwordHash').lean();
       expect(stored?.passwordHash).toMatch(/^\$2[aby]\$/);
       expect(stored?.passwordHash).not.toContain(PASSWORD);
       expect(stored?.termsAcceptedAt).toBeInstanceOf(Date);
@@ -214,7 +213,7 @@ describe('Auth (e2e)', () => {
       const result = data(await http.post('/auth/sign-in', { email: user.email.toUpperCase(), password: PASSWORD }));
       expect(result.user.email).toBe(user.email);
       expect(result.tokens.accessToken).toEqual(expect.any(String));
-      const stored = await model<User>(t, User.name).findById(user.id).lean();
+      const stored = await model(t, 'User').findById(user.id).lean();
       expect(stored?.lastLoginAt).toBeInstanceOf(Date);
     });
 
@@ -238,8 +237,8 @@ describe('Auth (e2e)', () => {
     it('refuses banned and closed accounts', async () => {
       const banned = await registerUser(t);
       const closed = await registerUser(t);
-      await model<User>(t, User.name).updateOne({ _id: banned.id }, { $set: { status: 'banned' } });
-      await model<User>(t, User.name).updateOne({ _id: closed.id }, { $set: { status: 'closed' } });
+      await model(t, 'User').updateOne({ _id: banned.id }, { $set: { status: 'banned' } });
+      await model(t, 'User').updateOne({ _id: closed.id }, { $set: { status: 'closed' } });
       failure(await http.post('/auth/sign-in', { email: banned.email, password: PASSWORD }), 403, 'ACCOUNT_BANNED');
       failure(await http.post('/auth/sign-in', { email: closed.email, password: PASSWORD }), 401, 'ACCOUNT_CLOSED');
     });

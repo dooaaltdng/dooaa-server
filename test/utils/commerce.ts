@@ -27,6 +27,9 @@ export function bachsPay(t: TestApp, reference: string, outcome: 'success' | 'fa
   return t.bachs.pay(reference, outcome, options);
 }
 
+/** Older name for bachsPay. */
+export const sandboxPay = bachsPay;
+
 /** Pays and confirms, the way the client's callback page does. */
 export async function payAndVerify(t: TestApp, buyer: TestUser, reference: string, outcome: 'success' | 'failed' = 'success') {
   const http = new Http(t);

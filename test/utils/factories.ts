@@ -1,8 +1,9 @@
-import { eq } from 'drizzle-orm';
 import { randomBytes } from 'node:crypto';
 import request from 'supertest';
 import { type StaffRole, type StaffStatus } from '../../src/common/domain';
 import { uuidv7 } from '../../src/common/util/uuid';
+import type { Table } from '../../src/database/database';
+import * as schema from '../../src/database/schema';
 import { products, staff, users } from '../../src/database/schema';
 import { SettingsService } from '../../src/modules/settings/settings.service';
 import { PasswordService } from '../../src/modules/users/password.service';
@@ -88,23 +89,22 @@ export async function registerUser(
 /** A seller whose identity has been approved, so listings can go live. */
 export async function registerSeller(t: TestApp, options: { verifiedIdentity?: boolean; storeName?: string; level?: 'normal' | 'high-value' } = {}): Promise<TestUser> {
   const seller = await registerUser(t, { role: 'seller', firstName: 'Sola', lastName: 'Seller' });
-  await t.db
-    .update(users)
-    .set({
+  await t.db.update(
+    users,
+    { id: seller.id },
+    {
       identity: options.verifiedIdentity === false ? 'unverified' : 'verified',
       verificationLevel: options.level ?? 'normal',
       sellerStoreName: options.storeName ?? 'Sola Stores',
-    })
-    .where(eq(users.id, seller.id));
+    },
+  );
   return seller;
 }
 
 export async function createStaff(t: TestApp, role: StaffRole = 'superadmin', overrides: Partial<{ email: string; firstName: string; lastName: string; status: StaffStatus }> = {}) {
   const passwords = t.get<PasswordService>(PasswordService);
   const email = overrides.email ?? uniqueEmail(role);
-  const [created] = await t.db
-    .insert(staff)
-    .values({
+  const created = await t.db.insert(staff, {
       firstName: overrides.firstName ?? 'Nelson',
       lastName: overrides.lastName ?? 'Doe',
       email,
@@ -112,8 +112,7 @@ export async function createStaff(t: TestApp, role: StaffRole = 'superadmin', ov
       title: role[0].toUpperCase() + role.slice(1),
       status: overrides.status ?? 'active',
       passwordHash: await passwords.hash(PASSWORD),
-    })
-    .returning({ id: staff.id });
+    });
   return { id: created.id, email, password: PASSWORD, role };
 }
 
@@ -132,9 +131,7 @@ let productCounter = 0;
 export async function createProduct(t: TestApp, sellerId: string, overrides: Partial<typeof products.$inferInsert> = {}) {
   productCounter += 1;
   const title = overrides.title ?? `Apple iPhone 12 Pro 512 GB Blue #${productCounter}`;
-  const [created] = await t.db
-    .insert(products)
-    .values({
+  const created = await t.db.insert(products, {
       sellerId,
     title,
     description: `${title} — clean, tested and ready to go.`,
@@ -154,8 +151,7 @@ export async function createProduct(t: TestApp, sellerId: string, overrides: Par
     sellerVerified: true,
       publishedAt: new Date(Date.now() - productCounter * 1000),
       ...overrides,
-    })
-    .returning();
+    });
   return created;
 }
 
@@ -184,4 +180,66 @@ export async function setSettings(t: TestApp, section: string, patch: Record<str
     status: 'active',
     tokenVersion: 0,
   });
+}
+
+/* --- Direct database access ---------------------------------------------------- */
+
+const MODELS = {
+  User: users,
+  Staff: staff,
+  Product: products,
+  Order: schema.orders,
+  OrderItem: schema.orderItems,
+  Offer: schema.offers,
+  Coupon: schema.coupons,
+  Earning: schema.earnings,
+  Wallet: schema.wallets,
+  Payout: schema.payouts,
+  Payment: schema.payments,
+  WishlistItem: schema.wishlistItems,
+  Dispute: schema.disputes,
+  Conversation: schema.conversations,
+  Message: schema.messages,
+  Review: schema.reviews,
+  OAuthGrant: schema.oauthGrants,
+  UserOauthIdentity: schema.userOauthIdentities,
+  Notification: schema.notifications,
+  Verification: schema.verifications,
+  Session: schema.sessions,
+} as const;
+
+type Query<T> = Promise<T> & { lean(): Query<T>; select(...fields: unknown[]): Query<T>; exec(): Promise<T> };
+
+function query<T>(promise: Promise<T>): Query<T> {
+  const chained = promise as Query<T>;
+  chained.lean = () => chained;
+  chained.select = () => chained;
+  chained.exec = () => promise;
+  return chained;
+}
+
+/** Rows also carry `_id`, as specs written against documents expect. */
+const withId = <R>(row: R | null): any => (row ? { _id: (row as { id?: string }).id, ...row } : row);
+
+/**
+ * A small document-style handle on one collection for assertions and setup:
+ * `model(t, 'Product').findById(id)`, `.updateOne(filter, update)`. Filters
+ * may use `_id`; ids are plain strings.
+ */
+export function model(t: TestApp, name: keyof typeof MODELS) {
+  const table = MODELS[name] as Table;
+  const where = (filter: Record<string, unknown> = {}): any => {
+    const { _id, ...rest } = filter;
+    return _id === undefined ? rest : { ...rest, [table.key]: _id };
+  };
+  return {
+    findById: (id: string) => query(t.db.findOne(table, { [table.key]: String(id) }).then(withId)),
+    findOne: (filter?: Record<string, unknown>) => query(t.db.findOne(table, where(filter)).then(withId)),
+    find: (filter?: Record<string, unknown>) => query(t.db.find(table, where(filter)).then((rows) => rows.map(withId))),
+    countDocuments: (filter?: Record<string, unknown>) => t.db.count(table, where(filter)),
+    updateOne: (filter: Record<string, unknown>, update: Record<string, unknown>) => t.db.update(table, where(filter), update as never),
+    updateMany: (filter: Record<string, unknown>, update: Record<string, unknown>) => t.db.updateMany(table, where(filter), update as never),
+    deleteMany: (filter?: Record<string, unknown>) => t.db.deleteMany(table, where(filter)),
+    create: (values: Record<string, unknown>) => t.db.insert(table, values as never).then(withId),
+  };
 }

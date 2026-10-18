@@ -8,6 +8,11 @@ export class MailOutbox implements MailTransport {
   readonly sent: SentMail[] = [];
   private service: MailService | null = null;
 
+  /** Everything sent so far, oldest first. */
+  get outbox(): SentMail[] {
+    return this.sent;
+  }
+
   async sendMail(message: OutgoingMail): Promise<unknown> {
     this.sent.push({ ...message, at: new Date() });
     return { messageId: `<test-${this.sent.length}@dooaa.test>` };

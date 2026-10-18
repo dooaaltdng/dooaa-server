@@ -3,8 +3,6 @@ import { Http, data, failure } from './utils/http';
 import { eventually } from './utils/eventually';
 import { createProduct, model, registerSeller, registerUser, staffToken, uploadImage, type TestUser } from './utils/factories';
 import { DELIVERY, completeOrder, paidOrder, payAndVerify, settle } from './utils/commerce';
-import { Product } from '../src/modules/products/schemas/product.schema';
-import { Order } from '../src/modules/orders/schemas/order.schema';
 import { JobsService } from '../src/modules/jobs/jobs.service';
 
 describe('Console users, content, dashboard, support and jobs (e2e)', () => {
@@ -106,7 +104,7 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
 
       expect(data(await http.post(`/admin/sellers/${seller.id}/verify`, {}, superadmin.token))).toEqual({ id: seller.id, identity: 'verified' });
       expect(data(await http.get('/auth/me', seller.token)).identity).toBe('verified');
-      expect((await model<Product>(t, Product.name).findById(product.id).lean())?.sellerVerified).toBe(true);
+      expect((await model(t, 'Product').findById(product.id).lean())?.sellerVerified).toBe(true);
       await t.mail.idle();
       expect(t.mail.lastTo(seller.email)?.subject).toBe('Your DOOAA identity is verified');
       // Idempotent: a second click changes nothing and sends nothing new.
@@ -334,12 +332,12 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       data(await http.post('/cart/items', { productId: product.id, quantity: 2 }, buyer.token));
       data(await http.put('/cart/delivery', DELIVERY, buyer.token));
       const checkout = data(await http.post('/checkout', { method: 'transfer' }, buyer.token));
-      expect((await model<Product>(t, Product.name).findById(product.id).lean())!.stock).toBe(1);
+      expect((await model(t, 'Product').findById(product.id).lean())!.stock).toBe(1);
       const jobs = t.get<JobsService>(JobsService);
       const result = await jobs.paymentsJob(new Date(Date.now() + 2 * 3_600_000));
       expect(result.expired).toBeGreaterThanOrEqual(1);
-      expect((await model<Product>(t, Product.name).findById(product.id).lean())!.stock).toBe(3);
-      expect((await model<Order>(t, Order.name).findById(checkout.orders[0].orderId).lean())!.status).toBe('cancelled');
+      expect((await model(t, 'Product').findById(product.id).lean())!.stock).toBe(3);
+      expect((await model(t, 'Order').findById(checkout.orders[0].orderId).lean())!.status).toBe('cancelled');
     });
 
     it('does not lapse a checkout the provider says was paid', async () => {
@@ -350,17 +348,20 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       data(await http.put('/cart/delivery', DELIVERY, buyer.token));
       const checkout = data(await http.post('/checkout', { method: 'card' }, buyer.token));
       // Paid at the provider, but our webhook and the verify call never arrived.
-      await t.get<any>(require('../src/modules/payments/providers/payment-provider').PAYMENT_PROVIDER).complete(checkout.payment.reference, 'success');
+      const webhookUrl = t.bachs.webhookUrl;
+      t.bachs.webhookUrl = '';
+      t.bachs.pay(checkout.payment.reference, 'success');
+      t.bachs.webhookUrl = webhookUrl;
       await t.get<JobsService>(JobsService).paymentsJob(new Date(Date.now() + 2 * 3_600_000));
       await settle(t);
-      expect((await model<Order>(t, Order.name).findById(checkout.orders[0].orderId).lean())!.status).toBe('pending');
+      expect((await model(t, 'Order').findById(checkout.orders[0].orderId).lean())!.status).toBe('pending');
     });
 
     it('lets settings managers run the jobs on demand', async () => {
       const moderator = await staffToken(t, 'moderator');
       failure(await http.post('/admin/system/jobs/run', {}, moderator.token), 403, 'PERMISSION_DENIED');
       const result = data(await http.post('/admin/system/jobs/run', {}, superadmin.token));
-      expect(result).toEqual({ payments: expect.any(Object), escrow: expect.any(Object) });
+      expect(result).toEqual({ payments: expect.any(Object), escrow: expect.any(Object), housekeeping: expect.any(Object) });
     });
 
     it('keeps the full order through escrow purchase for a returning buyer', async () => {

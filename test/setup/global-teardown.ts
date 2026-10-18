@@ -1,6 +1,5 @@
-import type EmbeddedPostgres from 'embedded-postgres';
+import type { MongoMemoryReplSet } from 'mongodb-memory-server';
 
 export default async function globalTeardown(): Promise<void> {
-  const server = (globalThis as { __POSTGRES__?: EmbeddedPostgres }).__POSTGRES__;
-  await server?.stop();
+  await (globalThis as { __MONGO__?: MongoMemoryReplSet }).__MONGO__?.stop();
 }

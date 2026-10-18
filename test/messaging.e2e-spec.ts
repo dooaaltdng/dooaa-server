@@ -4,7 +4,6 @@ import { Http, data, failure } from './utils/http';
 import { eventually } from './utils/eventually';
 import { createProduct, model, registerSeller, registerUser, staffToken, uploadImage, type TestUser } from './utils/factories';
 import { DELIVERY, payAndVerify, settle } from './utils/commerce';
-import { Product } from '../src/modules/products/schemas/product.schema';
 
 describe('Messaging, offers, meetups and realtime (e2e)', () => {
   let t: TestApp;
@@ -21,13 +20,17 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
       socket.on('connect_error', (error) => reject(error));
     });
 
-  const next = <T = any>(socket: Socket, event: string, timeoutMs = 3000) =>
+  /** The next `event` on the socket (optionally the next one `matching`), ignoring stragglers from earlier tests. */
+  const next = <T = any>(socket: Socket, event: string, timeoutMs = 3000, matching: (payload: T) => boolean = () => true) =>
     new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`Timed out waiting for ${event}`)), timeoutMs);
-      socket.once(event, (payload: T) => {
+      const listener = (payload: T) => {
+        if (!matching(payload)) return;
         clearTimeout(timer);
+        socket.off(event, listener);
         resolve(payload);
-      });
+      };
+      socket.on(event, listener);
     });
 
   const ack = <T = any>(socket: Socket, event: string, payload: unknown) =>
@@ -64,7 +67,7 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
       const inbox = data(await http.get('/conversations', seller.token));
       expect(inbox.rows[0]).toMatchObject({ id: thread.id, viewerRole: 'seller', name: 'Ada Obi', store: 'Buyer', unread: 1, preview: 'Hello, is this item still available?' });
       expect(data(await http.get('/conversations/unread-count', seller.token))).toEqual({ threads: 1, messages: 1 });
-      expect((await model<Product>(t, Product.name).findById(product.id).lean())!.stats.inquiries).toBe(1);
+      expect((await model(t, 'Product').findById(product.id).lean())!.statsInquiries).toBe(1);
 
       // Asking again reuses the same thread.
       const again = data(await http.post('/conversations', { productId: product.id }, buyer.token));
@@ -214,12 +217,16 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
         productPrice: 549_000,
         fee: 2_745,
         shipping: 5_000,
-        buyer: { mask: '**** 4081' },
+        buyer: { mask: '****' },
         seller: { name: 'Nelson Stores' },
       });
       expect(detail.escrow.trackingSteps).toHaveLength(5);
       expect(detail.escrow.shipWithinSeconds).toBeGreaterThan(0);
-      expect(detail.messages.at(-1)).toMatchObject({ kind: 'system', systemLead: 'Escrow funded.' });
+      // The thread is narrated by an order event, a moment after the payment lands.
+      await eventually(async () => {
+        const narrated = data(await http.get(`/conversations/${thread.id}`, buyer.token));
+        expect(narrated.messages.at(-1)).toMatchObject({ kind: 'system', systemLead: 'Escrow funded.' });
+      });
 
       data(await http.post(`/seller/orders/${checkout.orders[0].id}/ship`, { carrier: 'Red Star Express', trackingNumber: 'RS-2211' }, seller.token));
       await settle(t);
@@ -241,8 +248,8 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
       const product = await createProduct(t, seller.id);
       const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       const sellerSocket = await connect(seller.token);
-      const incoming = next(sellerSocket, 'message:new');
-      const updated = next(sellerSocket, 'conversation:updated');
+      const incoming = next(sellerSocket, 'message:new', 3000, (payload: any) => payload.conversationId === thread.id);
+      const updated = next(sellerSocket, 'conversation:updated', 3000, (payload: any) => payload.id === thread.id);
       data(await http.post(`/conversations/${thread.id}/messages`, { body: 'Live hello' }, buyer.token));
       expect(await incoming).toMatchObject({ conversationId: thread.id, message: { body: 'Live hello', mine: false } });
       expect(await updated).toMatchObject({ id: thread.id, unread: 1, preview: 'Live hello' });

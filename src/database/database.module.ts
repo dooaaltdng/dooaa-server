@@ -35,8 +35,9 @@ export class SequencesService {
   constructor(@InjectDb() private readonly db: Database) {}
 
   async next(sequence: { name: string; startWith: number }): Promise<number> {
-    const row = await this.db.upsert(counters, { id: sequence.name }, { $inc: { value: 1 } }, { value: sequence.startWith - 1 } as never);
-    return row.value;
+    // The counter counts calls; the first one returns `startWith`.
+    const row = await this.db.upsert(counters, { id: sequence.name }, { $inc: { value: 1 } });
+    return sequence.startWith - 1 + row.value;
   }
 }
 
