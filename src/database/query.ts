@@ -36,3 +36,10 @@ export function or(...conditions: (Condition | undefined | null | false)[]): Con
   if (!present.length) return { _id: { $in: [] } };
   return present.length === 1 ? present[0] : { $or: present };
 }
+
+/** Sort keys, combined in order by Database-backed helpers that accept a list. */
+export type SortPart = Record<string, 1 | -1>;
+export const asc = (column: Column): SortPart => ({ [column.field]: 1 });
+export const desc = (column: Column): SortPart => ({ [column.field]: -1 });
+/** MongoDB sorts missing and null values lowest, so a descending sort already puts them last. */
+export const descNullsLast = desc;

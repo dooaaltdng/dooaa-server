@@ -25,15 +25,15 @@ describe('catalog filters', () => {
 
   it('searches by text or by substring, escaping what the visitor typed', () => {
     expect((buildCatalogFilter({ q: 'iphone' }, 'text') as Record<string, any>).$text).toEqual({ $search: 'iphone' });
-    const regex = buildCatalogFilter({ q: 'i(p' }, 'regex') as Record<string, any>;
-    expect(regex.$and[0].$or[0].title.source).toBe('i\\(p');
+    const regex = buildCatalogFilter({ q: 'i(p' }, 'partial') as Record<string, any>;
+    expect(regex.$and[0].$or[0].title.$regex).toBe('i\\(p');
   });
 
   it('sorts newest, oldest and by price, with a stable tie-breaker', () => {
     expect(catalogSort({ sort: 'newest' }, 'none')).toEqual({ publishedAt: -1, createdAt: -1, _id: -1 });
     expect(catalogSort({ sort: 'oldest' }, 'none')).toEqual({ publishedAt: 1, createdAt: 1, _id: 1 });
     expect(catalogSort({ sort: 'price-asc' }, 'text')).toEqual({ price: 1, _id: 1 });
-    expect(catalogSort({ collection: 'popular' }, 'none')).toEqual({ 'stats.views': -1, 'stats.wishlists': -1, _id: -1 });
+    expect(catalogSort({ collection: 'popular' }, 'none')).toEqual({ statsViews: -1, statsWishlists: -1, _id: -1 });
     expect(catalogSort({}, 'text')).toEqual({ score: { $meta: 'textScore' }, _id: -1 });
   });
 });

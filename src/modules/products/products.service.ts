@@ -1,6 +1,4 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { and, asc, count, desc, eq, gt, gte, inArray, isNull, lte, max, min, ne, notInArray, or, sql, type SQL } from 'drizzle-orm';
-import type { PgUpdateSetSource } from 'drizzle-orm/pg-core';
 import { CacheService } from '../../cache/cache.service';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
@@ -9,8 +7,10 @@ import { EventBus } from '../../common/events/event-bus';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
 import { excerpt } from '../../common/util/text';
 import { isUuid } from '../../common/util/uuid';
-import { containsText, InjectDb, isUniqueViolation, type Database, type Executor } from '../../database/database';
-import { products, users, wishlistItems } from '../../database/schema';
+import type { Sort } from 'mongodb';
+import { escapeRegex, InjectDb, isUniqueViolation, type Database, type Executor } from '../../database/database';
+import { and, contains, desc, descNullsLast, eq, gt, gte, inArray, isNull, lte, ne, notInArray, or, type Condition, type SortPart } from '../../database/query';
+import { products, users, wishlistItems, type ProductRow } from '../../database/schema';
 import { AuditService } from '../audit/audit.service';
 import { CategoriesService } from '../categories/categories.service';
 import { MediaService } from '../media/media.service';
@@ -19,7 +19,7 @@ import type { User } from '../users/user.model';
 import { UsersService } from '../users/users.service';
 import type { CreateProductDto, SellerStatusFilter, UpdateProductDto } from './dto/product.dto';
 import { PUBLIC_PRODUCT_FILTER, buildCatalogFilter, catalogSort, searchTerm, type CatalogQuery, type SearchMode } from './product.filters';
-import { productColumns, toProduct, type Product } from './product.model';
+import { toProduct, type Product } from './product.model';
 import {
   toAdminListing,
   toProductCard,
@@ -52,7 +52,7 @@ export type CatalogFacets = {
 
 export type SellerTabCounts = { all: number; active: number; inactive: number; draft: number };
 
-type ProductPatch = PgUpdateSetSource<typeof products>;
+type ProductPatch = Partial<ProductRow>;
 type HomeRails = { topSellers: Product[]; featured: Product[]; popular: Product[] };
 
 const OFFICIAL_STORE_EMAIL = 'store@dooaa.ng';
@@ -82,17 +82,14 @@ export class ProductsService {
 
   /* --- Lookups ----------------------------------------------------------------- */
 
-  private async select(where: SQL | undefined, orderBy: SQL[] = [], limit?: number, offset?: number): Promise<Product[]> {
-    let query = this.db.select(productColumns).from(products).where(where).$dynamic();
-    if (orderBy.length) query = query.orderBy(...orderBy);
-    if (limit !== undefined) query = query.limit(limit);
-    if (offset !== undefined) query = query.offset(offset);
-    return (await query).map(toProduct);
+  private async select(where: Condition, orderBy: SortPart[] | Sort = [], limit?: number, offset?: number): Promise<Product[]> {
+    const sort = Array.isArray(orderBy) ? Object.assign({}, ...orderBy) : orderBy;
+    const rows = await this.db.find(products, where, { sort, limit, skip: offset });
+    return rows.map(toProduct);
   }
 
-  private async countWhere(where: SQL | undefined): Promise<number> {
-    const [row] = await this.db.select({ total: count() }).from(products).where(where);
-    return row.total;
+  private countWhere(where: Condition): Promise<number> {
+    return this.db.count(products, where);
   }
 
   async findById(id: string): Promise<Product | null> {
@@ -115,10 +112,7 @@ export class ProductsService {
 
   private async wishlistedSet(viewer: Viewer, ids: string[]): Promise<Set<string>> {
     if (!viewer || !ids.length) return new Set();
-    const rows = await this.db
-      .select({ productId: wishlistItems.productId })
-      .from(wishlistItems)
-      .where(and(eq(wishlistItems.userId, viewer.id), inArray(wishlistItems.productId, ids)));
+    const rows = await this.db.find(wishlistItems, and(eq(wishlistItems.userId, viewer.id), inArray(wishlistItems.productId, ids)));
     return new Set(rows.map((row) => row.productId));
   }
 
@@ -162,19 +156,25 @@ export class ProductsService {
     return { ...toPage(await this.toCards(rows, viewer), total, window), facets };
   }
 
-  private async facets(filter: SQL): Promise<CatalogFacets> {
-    const [brands, conditions, sellers, [price]] = await Promise.all([
-      this.db
-        .select({ value: products.brand, count: count() })
-        .from(products)
-        .where(and(filter, sql`coalesce(${products.brand}, '') <> ''`))
-        .groupBy(products.brand)
-        .orderBy(desc(count()), asc(products.brand))
-        .limit(20),
-      this.db.select({ value: products.condition, count: count() }).from(products).where(filter).groupBy(products.condition).orderBy(asc(products.condition)),
-      this.db.select({ verified: products.sellerVerified, count: count() }).from(products).where(filter).groupBy(products.sellerVerified),
-      this.db.select({ min: min(products.price), max: max(products.price) }).from(products).where(filter),
+  private async facets(filter: Condition): Promise<CatalogFacets> {
+    const grouped = <T>(match: Condition, field: string, sort: Sort, limit?: number) =>
+      this.db.aggregate<{ value: T; count: number }>(products, [
+        { $match: match },
+        { $group: { _id: `$${field}`, count: { $sum: 1 } } },
+        { $project: { _id: 0, value: '$_id', count: 1 } },
+        { $sort: sort },
+        ...(limit ? [{ $limit: limit }] : []),
+      ]);
+    const [brands, conditions, sellerRows, [price]] = await Promise.all([
+      grouped<string>(and(filter, { brand: { $nin: [null, ''] } }), 'brand', { count: -1, value: 1 }, 20),
+      grouped<Product['condition']>(filter, 'condition', { value: 1 }),
+      grouped<boolean>(filter, 'sellerVerified', { value: 1 }),
+      this.db.aggregate<{ min: number | null; max: number | null }>(products, [
+        { $match: filter },
+        { $group: { _id: null, min: { $min: '$price' }, max: { $max: '$price' } } },
+      ]),
     ]);
+    const sellers = sellerRows.map((row) => ({ verified: row.value, count: row.count }));
     return {
       brands: brands.map((row) => ({ value: row.value!, count: row.count })),
       conditions: conditions.map((row) => ({ value: row.value, count: row.count })),
@@ -188,21 +188,18 @@ export class ProductsService {
 
   /** Header search-as-you-type: words in titles and brands that start with what was typed. */
   async suggest(q: string): Promise<{ id: string; title: string; categoryId: string; image: string | null }[]> {
-    const term = escapeLike(q.trim());
-    const startsWord = (column: typeof products.title | typeof products.brand) => or(sql`${column} ilike ${`${term}%`}`, sql`${column} ilike ${`% ${term}%`}`)!;
-    const rows = await this.db
-      .select({ id: products.id, title: products.title, categoryId: products.categoryId, images: products.images })
-      .from(products)
-      .where(and(PUBLIC_PRODUCT_FILTER, or(startsWord(products.title), startsWord(products.brand))))
-      .orderBy(desc(products.statsViews), desc(products.id))
-      .limit(8);
+    const startsWord = { $regex: `(^|\\s)${escapeRegex(q.trim())}`, $options: 'i' };
+    const rows = await this.db.find(products, and(PUBLIC_PRODUCT_FILTER, or({ title: startsWord }, { brand: startsWord })), {
+      sort: { statsViews: -1, id: -1 },
+      limit: 8,
+    });
     return rows.map((row) => ({ id: row.id, title: row.title, categoryId: row.categoryId, image: row.images[0] ?? null }));
   }
 
   /** The landing page: category tiles and the three rails. */
   async homepage(viewer?: Viewer) {
     const rails = await this.cache.wrap<HomeRails>(HOME_KEY, HOME_TTL_MS, async () => {
-      const base = and(PUBLIC_PRODUCT_FILTER, gt(products.stock, 0))!;
+      const base = and(PUBLIC_PRODUCT_FILTER, gt(products.stock, 0));
       const [topSellers, featuredFlagged, popular] = await Promise.all([
         this.select(base, [desc(products.statsUnitsSold), desc(products.statsRatingAverage), descNullsLast(products.publishedAt)], 8),
         this.select(and(base, eq(products.featured, true)), [descNullsLast(products.publishedAt)], 8),
@@ -238,11 +235,7 @@ export class ProductsService {
       this.select(and(PUBLIC_PRODUCT_FILTER, eq(products.categoryId, product.categoryId), ne(products.id, product.id)), [desc(products.statsViews), descNullsLast(products.publishedAt)], 3),
     ]);
     if (!viewer || viewer.id !== product.sellerId) {
-      void this.db
-        .update(products)
-        .set({ statsViews: sql`${products.statsViews} + 1` })
-        .where(eq(products.id, product.id))
-        .catch(() => undefined);
+      void this.db.update(products, eq(products.id, product.id), { $inc: { statsViews: 1 } }).catch(() => undefined);
       this.events.publish<ProductViewed>(PRODUCT_EVENTS.viewed, { productId: product.id, sellerId: product.sellerId });
     }
     return {
@@ -269,13 +262,7 @@ export class ProductsService {
       const where = and(PUBLIC_PRODUCT_FILTER, eq(products.categoryId, categoryId));
       const total = await this.countWhere(where);
       if (total < MIN_LISTINGS_FOR_OUTLIER) return null;
-      const [middle] = await this.db
-        .select({ price: products.price })
-        .from(products)
-        .where(where)
-        .orderBy(asc(products.price))
-        .offset(Math.floor(total / 2))
-        .limit(1);
+      const middle = await this.db.findOne(products, where, { sort: { price: 1 }, skip: Math.floor(total / 2) });
       return middle?.price ?? null;
     });
   }
@@ -332,12 +319,8 @@ export class ProductsService {
     }
   }
 
-  private async patch(id: string, set: ProductPatch, condition?: SQL): Promise<Product | null> {
-    const [row] = await this.db
-      .update(products)
-      .set(set)
-      .where(and(eq(products.id, id), condition))
-      .returning(productColumns);
+  private async patch(id: string, set: ProductPatch, condition?: Condition): Promise<Product | null> {
+    const row = await this.db.update(products, and(eq(products.id, id), condition), set);
     return row ? toProduct(row) : null;
   }
 
@@ -381,8 +364,8 @@ export class ProductsService {
     seller: AuthUser,
     query: { tab?: 'all' | 'active' | 'inactive' | 'draft'; q?: string; status?: SellerStatusFilter; page?: number; limit?: number },
   ): Promise<Page<SellerProductView> & { counts: SellerTabCounts }> {
-    const base = and(eq(products.sellerId, seller.id), isNull(products.deletedAt), query.q?.trim() ? containsText(products.title, query.q) : undefined)!;
-    const tabs: Record<'all' | 'active' | 'inactive' | 'draft', SQL | undefined> = {
+    const base = and(eq(products.sellerId, seller.id), isNull(products.deletedAt), query.q?.trim() ? contains(products.title, query.q) : undefined);
+    const tabs: Record<'all' | 'active' | 'inactive' | 'draft', Condition | undefined> = {
       all: undefined,
       active: and(eq(products.status, 'active'), gt(products.stock, 0)),
       // "Inactive Products" gathers everything a buyer cannot purchase right now.
@@ -390,7 +373,7 @@ export class ProductsService {
       draft: eq(products.status, 'draft'),
     };
     // The pill a listing shows: flagged listings wait on review like new ones.
-    const statuses: Record<SellerStatusFilter, SQL | undefined> = {
+    const statuses: Record<SellerStatusFilter, Condition | undefined> = {
       active: and(eq(products.status, 'active'), gt(products.stock, 0)),
       'out-of-stock': and(eq(products.status, 'active'), lte(products.stock, 0)),
       pending: inArray(products.status, ['pending', 'suspicious']),
@@ -436,9 +419,7 @@ export class ProductsService {
     }
 
     const decision = input.publish ? await this.moderationDecision(record, input) : { status: 'draft' as ListingStatus, flags: [] };
-    const [row] = await this.db
-      .insert(products)
-      .values({
+    const row = await this.db.insert(products, {
         sellerId: seller.id,
         title: input.title,
         description: input.description,
@@ -460,8 +441,7 @@ export class ProductsService {
         sellerVerified: record.identity === 'verified',
         listedAs: 'seller',
         publishedAt: decision.status === 'active' ? new Date() : null,
-      })
-      .returning(productColumns);
+      });
     const product = toProduct(row);
     await this.afterChange(product);
     this.flagIfSuspicious(product);
@@ -594,6 +574,9 @@ export class ProductsService {
     sellerId?: string;
   }): Promise<Page<AdminListingView>> {
     const search = query.search?.trim();
+    const sellerMatches = search
+      ? await this.db.distinct(users, 'id', or(contains(users.firstName, search), contains(users.lastName, search), contains(users.email, search), contains(users.sellerStoreName, search)))
+      : [];
     const where = and(
       isNull(products.deletedAt),
       query.statuses?.length ? inArray(products.status, query.statuses) : undefined,
@@ -605,14 +588,8 @@ export class ProductsService {
       query.maxStock !== undefined ? lte(products.stock, query.maxStock) : undefined,
       search
         ? or(
-            containsText(products.title, search),
-            inArray(
-              products.sellerId,
-              this.db
-                .select({ id: users.id })
-                .from(users)
-                .where(or(containsText(users.firstName, search), containsText(users.lastName, search), containsText(users.email, search), containsText(users.sellerStoreName, search))),
-            ),
+            contains(products.title, search),
+            inArray(products.sellerId, sellerMatches),
           )
         : undefined,
     );
@@ -693,7 +670,7 @@ export class ProductsService {
     const existing = await this.users.findByEmail(OFFICIAL_STORE_EMAIL);
     if (existing) return existing;
     try {
-      await this.db.insert(users).values({
+      await this.db.insert(users, {
         firstName: 'DOOAA',
         lastName: 'Official Store',
         email: OFFICIAL_STORE_EMAIL,
@@ -730,9 +707,7 @@ export class ProductsService {
     if ((status === 'active' || status === 'pending') && !images.length) throw Errors.badRequest('Add at least one photo before publishing.', 'IMAGES_REQUIRED');
     const store = await this.officialStore();
     const now = new Date();
-    const [row] = await this.db
-      .insert(products)
-      .values({
+    const row = await this.db.insert(products, {
         sellerId: store.id,
         title: input.title,
         description: input.description,
@@ -756,8 +731,7 @@ export class ProductsService {
         moderationReviewedBy: staff.id,
         moderationReviewedAt: now,
         publishedAt: status === 'active' ? now : null,
-      })
-      .returning(productColumns);
+      });
     const product = toProduct(row);
     await this.afterChange(product);
     await this.audit.record(staff, { action: 'Created a listing', target: product.title, targetType: 'listing', targetId: product.id });
@@ -772,21 +746,17 @@ export class ProductsService {
    * so a failed checkout gives the stock back on rollback.
    */
   async reserveStock(productId: string, quantity: number, executor: Executor = this.db): Promise<Product | null> {
-    const [row] = await executor
-      .update(products)
-      .set({ stock: sql`${products.stock} - ${quantity}` })
-      .where(and(eq(products.id, productId), eq(products.status, 'active'), isNull(products.deletedAt), gte(products.stock, quantity)))
-      .returning(productColumns);
+    const row = await executor.update(
+      products,
+      and(eq(products.id, productId), eq(products.status, 'active'), isNull(products.deletedAt), gte(products.stock, quantity)),
+      { $inc: { stock: -quantity } },
+    );
     if (row && row.stock === 0) await this.cache.delete(HOME_KEY);
     return row ? toProduct(row) : null;
   }
 
   async releaseStock(productId: string, quantity: number): Promise<void> {
-    const [row] = await this.db
-      .update(products)
-      .set({ stock: sql`${products.stock} + ${quantity}` })
-      .where(eq(products.id, productId))
-      .returning({ id: products.id, title: products.title, stock: products.stock, status: products.status, deletedAt: products.deletedAt });
+    const row = await this.db.update(products, eq(products.id, productId), { $inc: { stock: quantity } });
     // Back from nothing: anyone waiting on a restock hears about it.
     if (row && row.stock - quantity <= 0 && row.status === 'active' && !row.deletedAt) {
       this.events.publish<ProductRestocked>(PRODUCT_EVENTS.restocked, { productId: row.id, title: row.title });
@@ -794,75 +764,51 @@ export class ProductsService {
   }
 
   async recordSale(productId: string, quantity: number, revenue: number, at: Date): Promise<void> {
-    await this.db
-      .update(products)
-      .set({
-        statsUnitsSold: sql`${products.statsUnitsSold} + ${quantity}`,
-        statsRevenue: sql`${products.statsRevenue} + ${revenue}`,
-        statsLastSaleAt: sql`greatest(${products.statsLastSaleAt}, ${at.toISOString()}::timestamptz)`,
-      })
-      .where(eq(products.id, productId));
+    await this.db.update(products, eq(products.id, productId), { $inc: { statsUnitsSold: quantity, statsRevenue: revenue }, $max: { statsLastSaleAt: at } });
     await this.cache.delete(HOME_KEY);
   }
 
   async reverseSale(productId: string, quantity: number, revenue: number): Promise<void> {
-    await this.db
-      .update(products)
-      .set({ statsUnitsSold: sql`${products.statsUnitsSold} - ${quantity}`, statsRevenue: sql`${products.statsRevenue} - ${revenue}` })
-      .where(eq(products.id, productId));
+    await this.db.update(products, eq(products.id, productId), { $inc: { statsUnitsSold: -quantity, statsRevenue: -revenue } });
   }
 
   async incrementInquiries(productId: string): Promise<void> {
-    await this.db
-      .update(products)
-      .set({ statsInquiries: sql`${products.statsInquiries} + 1` })
-      .where(eq(products.id, productId));
+    await this.db.update(products, eq(products.id, productId), { $inc: { statsInquiries: 1 } });
   }
 
   async setRating(productId: string, average: number, total: number): Promise<void> {
-    await this.db.update(products).set({ statsRatingAverage: average, statsRatingCount: total }).where(eq(products.id, productId));
+    await this.db.update(products, eq(products.id, productId), { statsRatingAverage: average, statsRatingCount: total });
   }
 
   async adjustWishlistCount(productId: string, delta: number): Promise<void> {
-    await this.db
-      .update(products)
-      .set({ statsWishlists: sql`${products.statsWishlists} + ${delta}` })
-      .where(eq(products.id, productId));
+    await this.db.update(products, eq(products.id, productId), { $inc: { statsWishlists: delta } });
   }
 
   /** Keeps the "Verified sellers" facet true to the seller's identity check. */
   async syncSellerVerified(sellerId: string, verified: boolean): Promise<void> {
-    await this.db.update(products).set({ sellerVerified: verified }).where(eq(products.sellerId, sellerId));
+    await this.db.updateMany(products, eq(products.sellerId, sellerId), { sellerVerified: verified });
     await this.cache.delete(HOME_KEY);
   }
 
   /** Takes a banned or suspended seller's listings off the storefront, remembering which to bring back. */
   async restrictSeller(sellerId: string): Promise<number> {
-    const changed = await this.db
-      .update(products)
-      .set({ status: 'inactive', moderationFlags: sql`array_append(array_remove(${products.moderationFlags}, 'seller-restricted'), 'seller-restricted')` })
-      .where(and(eq(products.sellerId, sellerId), eq(products.status, 'active'), isNull(products.deletedAt)))
-      .returning({ id: products.id });
+    const changed = await this.db.updateMany(products, and(eq(products.sellerId, sellerId), eq(products.status, 'active'), isNull(products.deletedAt)), {
+      $set: { status: 'inactive' },
+      $addToSet: { moderationFlags: 'seller-restricted' },
+    });
     await Promise.all([this.categories.invalidateCounts(), this.cache.delete(HOME_KEY)]);
     await this.recountActiveListings(sellerId);
-    return changed.length;
+    return changed;
   }
 
   async unrestrictSeller(sellerId: string): Promise<number> {
-    const changed = await this.db
-      .update(products)
-      .set({ status: 'active', moderationFlags: sql`array_remove(${products.moderationFlags}, 'seller-restricted')` })
-      .where(
-        and(
-          eq(products.sellerId, sellerId),
-          eq(products.status, 'inactive'),
-          sql`'seller-restricted' = any(${products.moderationFlags})`,
-          isNull(products.deletedAt),
-        ),
-      )
-      .returning({ id: products.id });
+    const changed = await this.db.updateMany(
+      products,
+      and(eq(products.sellerId, sellerId), eq(products.status, 'inactive'), eq({ field: 'moderationFlags' }, 'seller-restricted'), isNull(products.deletedAt)),
+      { $set: { status: 'active' }, $pull: { moderationFlags: 'seller-restricted' } },
+    );
     await Promise.all([this.categories.invalidateCounts(), this.cache.delete(HOME_KEY)]);
     await this.recountActiveListings(sellerId);
-    return changed.length;
+    return changed;
   }
 }
