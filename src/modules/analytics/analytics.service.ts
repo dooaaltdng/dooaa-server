@@ -1,11 +1,10 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
-import { and, count, eq, gte, inArray, isNull, lt, lte, ne, sql, sum, type SQL } from 'drizzle-orm';
 import type { StatScope } from '../../common/domain';
 import { EventBus } from '../../common/events/event-bus';
 import { dayKey, startOfLagosDay, TIME_ZONE } from '../../common/util/dates';
 import { formatNairaCompact } from '../../common/util/money';
-import { InjectDb, type Database } from '../../database/database';
-import { dailyStats, orders, products, users, visitorDays } from '../../database/schema';
+import { InjectDb, isUniqueViolation, type Database, type Table, type Where } from '../../database/database';
+import { dailyStats, orders, products, users, visitorDays, type OrderRow } from '../../database/schema';
 import { PRODUCT_EVENTS, type ProductViewed } from '../products/products.service';
 import { buildBuckets, compactCount, fold, percentChange, type RangeId } from './buckets';
 
@@ -28,24 +27,16 @@ export class AnalyticsService implements OnModuleInit {
 
   /** Adds to a day's counters, creating the row on the day's first count. */
   private async bumpDay(scope: StatScope, sellerId: string | null, day: string, field: 'visits' | 'productViews'): Promise<void> {
-    await this.db
-      .insert(dailyStats)
-      .values({ scope, sellerId, day, [field]: 1 })
-      .onConflictDoUpdate({
-        target: [dailyStats.scope, dailyStats.sellerId, dailyStats.day],
-        set: { [field]: sql`${dailyStats[field]} + 1` },
-      });
+    const bump = () => this.db.upsert(dailyStats, { scope, sellerId, day }, { $inc: { [field]: 1 } });
+    // Two first counts of a day can race to create the row; the loser just increments it.
+    await bump().catch((error) => (isUniqueViolation(error) ? bump() : Promise.reject(error)));
   }
 
   /** One visit per visitor per Lagos day. */
   async recordVisit(visitorId: string): Promise<{ counted: boolean }> {
     const day = dayKey();
-    const inserted = await this.db
-      .insert(visitorDays)
-      .values({ visitorId, day })
-      .onConflictDoNothing()
-      .returning({ visitorId: visitorDays.visitorId });
-    if (!inserted.length) return { counted: false };
+    const inserted = await this.db.insertIgnoringDuplicates(visitorDays, [{ visitorId, day }]);
+    if (!inserted) return { counted: false };
     await this.bumpDay('site', null, day, 'visits');
     return { counted: true };
   }
@@ -56,33 +47,31 @@ export class AnalyticsService implements OnModuleInit {
   }
 
   /** Paid amounts grouped by Lagos day (or month). */
-  private async moneyByKey(match: SQL | undefined, from: Date, to: Date, field: 'total' | 'sellerEarning', monthly: boolean): Promise<Map<string, number>> {
-    // Constants inlined (not bound): GROUP BY must see the very same expression as the select list.
-    const key = sql<string>`to_char(${orders.paymentPaidAt} at time zone '${sql.raw(TIME_ZONE)}', '${sql.raw(monthly ? 'YYYY-MM' : 'YYYY-MM-DD')}')`;
-    const rows = await this.db
-      .select({ key, amount: sum(orders[field]).mapWith(Number) })
-      .from(orders)
-      .where(and(match, eq(orders.paymentStatus, 'paid'), gte(orders.paymentPaidAt, from), lte(orders.paymentPaidAt, to)))
-      .groupBy(key);
-    return new Map(rows.map((row) => [row.key, row.amount ?? 0]));
+  private async moneyByKey(match: Where<OrderRow>, from: Date, to: Date, field: 'total' | 'sellerEarning', monthly: boolean): Promise<Map<string, number>> {
+    const rows = await this.db.aggregate<{ _id: string; amount: number }>(orders, [
+      { $match: { ...match, paymentStatus: 'paid', paymentPaidAt: { $gte: from, $lte: to } } },
+      {
+        $group: {
+          _id: { $dateToString: { date: '$paymentPaidAt', format: monthly ? '%Y-%m' : '%Y-%m-%d', timezone: TIME_ZONE } },
+          amount: { $sum: `$${field}` },
+        },
+      },
+    ]);
+    return new Map(rows.map((row) => [row._id, row.amount ?? 0]));
   }
 
   private async countsByKey(field: 'visits' | 'productViews', scope: StatScope, sellerId: string | null, fromDay: string, monthly: boolean): Promise<Map<string, number>> {
-    const rows = await this.db
-      .select({ day: dailyStats.day, value: dailyStats[field] })
-      .from(dailyStats)
-      .where(and(eq(dailyStats.scope, scope), sellerId ? eq(dailyStats.sellerId, sellerId) : isNull(dailyStats.sellerId), gte(dailyStats.day, fromDay)));
+    const rows = await this.db.find(dailyStats, { scope, sellerId, day: { $gte: fromDay } });
     const out = new Map<string, number>();
     for (const row of rows) {
       const key = monthly ? row.day.slice(0, 7) : row.day;
-      out.set(key, (out.get(key) ?? 0) + row.value);
+      out.set(key, (out.get(key) ?? 0) + row[field]);
     }
     return out;
   }
 
-  private async countOf(table: typeof users | typeof products | typeof orders, where: SQL | undefined): Promise<number> {
-    const [row] = await this.db.select({ total: count() }).from(table).where(where);
-    return row.total;
+  private countOf(table: Table, where: Where<any>): Promise<number> {
+    return this.db.count(table, where);
   }
 
   /** Seller Analytics: revenue against the previous period, orders by status and store views. */
@@ -90,13 +79,13 @@ export class AnalyticsService implements OnModuleInit {
     const monthly = range === '12m';
     const { current, previous, from, previousFrom, to } = buildBuckets(range, new Date());
     const [money, views, statuses] = await Promise.all([
-      this.moneyByKey(eq(orders.sellerId, sellerId), previousFrom, to, 'sellerEarning', monthly),
+      this.moneyByKey({ sellerId }, previousFrom, to, 'sellerEarning', monthly),
       this.countsByKey('productViews', 'seller', sellerId, dayKey(previousFrom), monthly),
-      this.db
-        .select({ status: orders.status, count: count() })
-        .from(orders)
-        .where(and(eq(orders.sellerId, sellerId), eq(orders.paymentStatus, 'paid'), gte(orders.paymentPaidAt, from)))
-        .groupBy(orders.status),
+      this.db.aggregate<{ status: string; count: number }>(orders, [
+        { $match: { sellerId, paymentStatus: 'paid', paymentPaidAt: { $gte: from } } },
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+        { $project: { _id: 0, status: '$_id', count: 1 } },
+      ]),
     ]);
     const currentRevenue = fold(current, money);
     const previousRevenue = fold(previous, money);
@@ -130,20 +119,21 @@ export class AnalyticsService implements OnModuleInit {
     const monthStart = new Date(`${dayKey().slice(0, 7)}-01T00:00:00+01:00`);
     const lastMonthStart = new Date(monthStart.getTime());
     lastMonthStart.setUTCMonth(lastMonthStart.getUTCMonth() - 1);
-    const people = and(ne(users.email, OFFICIAL_STORE_EMAIL), ne(users.status, 'closed'));
+    const people = { email: { $ne: OFFICIAL_STORE_EMAIL }, status: { $ne: 'closed' } };
     // Accounts without a role yet count as buyers, as on the storefront.
-    const buyer = sql`${users.role} is distinct from 'seller'`;
-    const live = and(eq(products.status, 'active'), isNull(products.deletedAt));
+    const buyer = { ...people, role: { $ne: 'seller' } };
+    const seller = { ...people, role: 'seller' };
+    const live = { status: 'active', deletedAt: null };
     const [buyers, buyersNew, sellers, sellersNew, items, itemsNew, active, fundedThis, fundedLast] = await Promise.all([
-      this.countOf(users, and(people, buyer)),
-      this.countOf(users, and(people, buyer, gte(users.createdAt, monthStart))),
-      this.countOf(users, and(people, eq(users.role, 'seller'))),
-      this.countOf(users, and(people, eq(users.role, 'seller'), gte(users.createdAt, monthStart))),
+      this.countOf(users, buyer),
+      this.countOf(users, { ...buyer, createdAt: { $gte: monthStart } }),
+      this.countOf(users, seller),
+      this.countOf(users, { ...seller, createdAt: { $gte: monthStart } }),
       this.countOf(products, live),
-      this.countOf(products, and(live, gte(products.publishedAt, monthStart))),
-      this.countOf(orders, inArray(orders.escrowStatus, ['pending', 'dispute'])),
-      this.countOf(orders, gte(orders.escrowFundedAt, monthStart)),
-      this.countOf(orders, and(gte(orders.escrowFundedAt, lastMonthStart), lt(orders.escrowFundedAt, monthStart))),
+      this.countOf(products, { ...live, publishedAt: { $gte: monthStart } }),
+      this.countOf(orders, { escrowStatus: { $in: ['pending', 'dispute'] } }),
+      this.countOf(orders, { escrowFundedAt: { $gte: monthStart } }),
+      this.countOf(orders, { escrowFundedAt: { $gte: lastMonthStart, $lt: monthStart } }),
     ]);
     const growth = (total: number, added: number) => percentChange(total, total - added);
     return [
@@ -159,7 +149,7 @@ export class AnalyticsService implements OnModuleInit {
     const { current, previous, previousFrom, to } = buildBuckets(range, new Date());
     const values =
       id === 'transactions'
-        ? await this.moneyByKey(undefined, previousFrom, to, 'total', false)
+        ? await this.moneyByKey({}, previousFrom, to, 'total', false)
         : await this.countsByKey('visits', 'site', null, dayKey(previousFrom), false);
     const currentPoints = fold(current, values);
     const previousPoints = fold(previous, values);
@@ -182,10 +172,7 @@ export class AnalyticsService implements OnModuleInit {
 
   /** Housekeeping for tests and reports: today's site counters. */
   async today() {
-    const [row] = await this.db
-      .select({ visits: dailyStats.visits, productViews: dailyStats.productViews })
-      .from(dailyStats)
-      .where(and(eq(dailyStats.scope, 'site'), isNull(dailyStats.sellerId), eq(dailyStats.day, dayKey(startOfLagosDay()))));
+    const row = await this.db.findOne(dailyStats, { scope: 'site', sellerId: null, day: dayKey(startOfLagosDay()) });
     return { visits: row?.visits ?? 0, productViews: row?.productViews ?? 0 };
   }
 }

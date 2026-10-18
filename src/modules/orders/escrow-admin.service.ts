@@ -1,13 +1,12 @@
 import { Injectable } from '@nestjs/common';
-import { and, count, desc, eq, exists, inArray, isNotNull, or, sql, type SQL } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff } from '../../common/auth/principal';
 import type { EscrowStatus, Permission, Settlement } from '../../common/domain';
 import { formatNaira } from '../../common/util/money';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
 import { isUuid } from '../../common/util/uuid';
-import { containsText, InjectDb, type Database } from '../../database/database';
-import { orderItems, orders, products, users } from '../../database/schema';
+import { containsText, InjectDb, type Database, type Where } from '../../database/database';
+import { orderItems, orders, products, users, type OrderRow } from '../../database/schema';
 import { AuditService } from '../audit/audit.service';
 import { SettingsService } from '../settings/settings.service';
 import { UsersService } from '../users/users.service';
@@ -44,7 +43,7 @@ export class EscrowAdminService {
     const firstProducts = rows.map((row) => row.items[0]?.productId).filter((id): id is string => Boolean(id));
     const [people, categories] = await Promise.all([
       this.users.findByIds(rows.flatMap((row) => [row.buyerId, row.sellerId])),
-      firstProducts.length ? this.db.select({ id: products.id, categoryId: products.categoryId }).from(products).where(inArray(products.id, firstProducts)) : [],
+      firstProducts.length ? this.db.find(products, { id: { $in: firstProducts } }) : [],
     ]);
     const byId = new Map(people.map((person) => [person.id, person]));
     const category = new Map(categories.map((product) => [product.id, product.categoryId]));
@@ -54,39 +53,26 @@ export class EscrowAdminService {
   }
 
   async list(query: { search?: string; status?: EscrowStatus | 'all'; page?: number; limit?: number }): Promise<Page<EscrowTransactionView>> {
-    const conditions: SQL[] = [isNotNull(orders.escrowReference)];
-    if (query.status && query.status !== 'all') conditions.push(eq(orders.escrowStatus, query.status));
+    const where: Where<OrderRow> = { escrowReference: { $ne: null } };
+    if (query.status && query.status !== 'all') where.escrowStatus = query.status;
     const search = query.search?.trim();
     if (search) {
-      const people = this.db
-        .select({ id: users.id })
-        .from(users)
-        .where(or(containsText(users.firstName, search), containsText(users.lastName, search), containsText(users.email, search), containsText(users.sellerStoreName, search)));
-      conditions.push(
-        or(
-          containsText(orders.escrowReference, search),
-          containsText(orders.reference, search),
-          exists(
-            this.db
-              .select({ one: sql`1` })
-              .from(orderItems)
-              .where(and(eq(orderItems.orderId, orders.id), containsText(orderItems.title, search))),
-          ),
-          inArray(orders.buyerId, people),
-          inArray(orders.sellerId, people),
-        )!,
-      );
+      const match = containsText(search);
+      const [people, itemOrders] = await Promise.all([
+        this.db.distinct(users, 'id', { $or: [{ firstName: match }, { lastName: match }, { email: match }, { sellerStoreName: match }] }),
+        this.db.distinct(orderItems, 'orderId', { title: match }),
+      ]);
+      where.$or = [
+        { escrowReference: match },
+        { reference: match },
+        { id: { $in: itemOrders } },
+        { buyerId: { $in: people } },
+        { sellerId: { $in: people } },
+      ];
     }
-    const where = and(...conditions);
-    const [{ total }] = await this.db.select({ total: count() }).from(orders).where(where);
+    const total = await this.db.count(orders, where);
     const window = pageWindow(total, query.page, query.limit ?? 8);
-    const rows = await this.db
-      .select()
-      .from(orders)
-      .where(where)
-      .orderBy(descNullsLast(orders.escrowFundedAt), desc(orders.id))
-      .offset(window.skip)
-      .limit(window.size);
+    const rows = await this.db.find(orders, where, { sort: { escrowFundedAt: -1, id: -1 }, skip: window.skip, limit: window.size });
     return toPage(await this.views(await this.orderService.withItems(rows)), total, window);
   }
 
