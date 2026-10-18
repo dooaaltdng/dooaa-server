@@ -34,6 +34,6 @@ describe('catalog filters', () => {
     expect(catalogSort({ sort: 'oldest' }, 'none')).toEqual({ publishedAt: 1, createdAt: 1, _id: 1 });
     expect(catalogSort({ sort: 'price-asc' }, 'text')).toEqual({ price: 1, _id: 1 });
     expect(catalogSort({ collection: 'popular' }, 'none')).toEqual({ statsViews: -1, statsWishlists: -1, _id: -1 });
-    expect(catalogSort({}, 'text')).toEqual({ score: { $meta: 'textScore' }, _id: -1 });
+    expect(catalogSort({ q: 'iphone' }, 'text')).toEqual({ score: { $meta: 'textScore' }, _id: -1 });
   });
 });

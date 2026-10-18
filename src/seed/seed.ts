@@ -1,6 +1,5 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
-import { and, eq } from 'drizzle-orm';
 import { AppModule } from '../app.module';
 import { regionFor } from '../common/domain';
 import { excerpt, normalizePhone } from '../common/util/text';
@@ -14,7 +13,7 @@ import { PasswordService } from '../modules/users/password.service';
 import { DEMO_BUYER, DEMO_LISTINGS, DEMO_PASSWORD, DEMO_SELLER } from './demo-data';
 
 /**
- * Seeds a database whose schema is current (`npm run db:migrate` first).
+ * Seeds the MongoDB database (indexes are created when the app starts).
  * Safe to run repeatedly: nothing that exists is changed.
  *
  *   npm run seed                      # superadmin + reference data
@@ -52,9 +51,8 @@ async function main(): Promise<void> {
 
       const ensureUser = async (person: typeof DEMO_BUYER & { storeName?: string }, role: 'buyer' | 'seller') => {
         const now = new Date();
-        await db
-          .insert(users)
-          .values({
+        await db.insertIgnoringDuplicates(users, [
+          {
             firstName: person.firstName,
             lastName: person.lastName,
             email: person.email,
@@ -76,10 +74,9 @@ async function main(): Promise<void> {
                   sellerDeliveryLabel: 'Nationwide Delivery (1-3 business days within Lagos)',
                 }
               : {}),
-          })
-          .onConflictDoNothing({ target: users.email });
-        const [row] = await db.select({ id: users.id, email: users.email }).from(users).where(eq(users.email, person.email));
-        return row;
+          },
+        ]);
+        return (await db.findOne(users, { email: person.email }))!;
       };
 
       const buyer = await ensureUser(DEMO_BUYER, 'buyer');
@@ -89,12 +86,8 @@ async function main(): Promise<void> {
 
       let created = 0;
       for (const [index, listing] of DEMO_LISTINGS.entries()) {
-        const [existing] = await db
-          .select({ id: products.id })
-          .from(products)
-          .where(and(eq(products.sellerId, seller.id), eq(products.title, listing.title)));
-        if (existing) continue;
-        await db.insert(products).values({
+        if (await db.exists(products, { sellerId: seller.id, title: listing.title })) continue;
+        await db.insert(products, {
           sellerId: seller.id,
           title: listing.title,
           description: listing.description,
