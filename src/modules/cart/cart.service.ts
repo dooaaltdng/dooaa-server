@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import { and, asc, count, eq, inArray } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthUser } from '../../common/auth/principal';
 import { isUuid } from '../../common/util/uuid';
@@ -67,15 +66,11 @@ export class CartService {
 
   /** The user's cart, created on first use. */
   private async load(userId: string): Promise<Cart> {
-    await this.db.insert(carts).values({ userId }).onConflictDoNothing({ target: carts.userId });
-    const [[cart], lines] = await Promise.all([
-      this.db.select().from(carts).where(eq(carts.userId, userId)),
-      this.db
-        .select({ productId: cartItems.productId, quantity: cartItems.quantity, addedAt: cartItems.addedAt })
-        .from(cartItems)
-        .where(eq(cartItems.userId, userId))
-        .orderBy(asc(cartItems.addedAt)),
+    const [cart, rows] = await Promise.all([
+      this.db.upsert(carts, { userId }, {}),
+      this.db.find(cartItems, { userId }, { sort: { addedAt: 1 } }),
     ]);
+    const lines = rows.map((row) => ({ productId: row.productId, quantity: row.quantity, addedAt: row.addedAt }));
     return { userId, lines, couponCode: cart.couponCode, delivery: cart.delivery };
   }
 
@@ -138,10 +133,7 @@ export class CartService {
     const next = (existing?.quantity ?? 0) + quantity;
     await this.assertBuyable(user, productId, next);
     if (!existing && cart.lines.length >= MAX_LINES) throw Errors.conflict('Your cart is full. Check out or remove something first.', 'CART_FULL');
-    await this.db
-      .insert(cartItems)
-      .values({ userId: user.id, productId, quantity: next })
-      .onConflictDoUpdate({ target: [cartItems.userId, cartItems.productId], set: { quantity: next } });
+    await this.db.upsert(cartItems, { userId: user.id, productId }, { quantity: next });
     return this.view(user);
   }
 
@@ -151,22 +143,19 @@ export class CartService {
       throw Errors.notFound('That item is not in your cart.', 'CART_ITEM_NOT_FOUND');
     }
     await this.assertBuyable(user, productId, quantity);
-    await this.db
-      .update(cartItems)
-      .set({ quantity })
-      .where(and(eq(cartItems.userId, user.id), eq(cartItems.productId, productId)));
+    await this.db.update(cartItems, { userId: user.id, productId }, { quantity });
     return this.view(user);
   }
 
   async remove(user: AuthUser, productId: string): Promise<CartView> {
-    if (isUuid(productId)) await this.db.delete(cartItems).where(and(eq(cartItems.userId, user.id), eq(cartItems.productId, productId)));
+    if (isUuid(productId)) await this.db.delete(cartItems, { userId: user.id, productId });
     return this.view(user);
   }
 
   async clear(user: AuthUser): Promise<CartView> {
     await this.db.transaction(async (tx) => {
-      await tx.delete(cartItems).where(eq(cartItems.userId, user.id));
-      await tx.update(carts).set({ couponCode: null }).where(eq(carts.userId, user.id));
+      await tx.deleteMany(cartItems, { userId: user.id });
+      await tx.update(carts, { userId: user.id }, { couponCode: null });
     });
     return this.view(user);
   }
@@ -182,20 +171,17 @@ export class CartService {
         'COUPON_NOT_APPLICABLE',
       );
     }
-    await this.db.update(carts).set({ couponCode: coupon.code }).where(eq(carts.userId, cart.userId));
+    await this.db.update(carts, { userId: cart.userId }, { couponCode: coupon.code });
     return view;
   }
 
   async removeCoupon(user: AuthUser): Promise<CartView> {
-    await this.db.update(carts).set({ couponCode: null }).where(eq(carts.userId, user.id));
+    await this.db.update(carts, { userId: user.id }, { couponCode: null });
     return this.view(user);
   }
 
   async setDelivery(user: AuthUser, input: DeliveryInfoDto): Promise<CartView> {
-    await this.db
-      .insert(carts)
-      .values({ userId: user.id, delivery: { ...input, state: input.state ?? '', zip: input.zip ?? '' } })
-      .onConflictDoUpdate({ target: carts.userId, set: { delivery: { ...input, state: input.state ?? '', zip: input.zip ?? '' } } });
+    await this.db.upsert(carts, { userId: user.id }, { delivery: { ...input, state: input.state ?? '', zip: input.zip ?? '' } });
     return this.view(user);
   }
 
@@ -218,14 +204,13 @@ export class CartService {
 
   async emptyAfterCheckout(userId: string, productIds: string[]): Promise<void> {
     await this.db.transaction(async (tx) => {
-      if (productIds.length) await tx.delete(cartItems).where(and(eq(cartItems.userId, userId), inArray(cartItems.productId, productIds)));
-      await tx.update(carts).set({ couponCode: null }).where(eq(carts.userId, userId));
+      if (productIds.length) await tx.deleteMany(cartItems, { userId, productId: { $in: productIds } });
+      await tx.update(carts, { userId }, { couponCode: null });
     });
   }
 
   /** How many lines are in the cart (the header badge). */
   async countLines(userId: string): Promise<number> {
-    const [row] = await this.db.select({ total: count() }).from(cartItems).where(eq(cartItems.userId, userId));
-    return row.total;
+    return this.db.count(cartItems, { userId });
   }
 }

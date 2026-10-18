@@ -1,11 +1,10 @@
 import { Injectable } from '@nestjs/common';
-import { and, avg, count, desc, eq, exists, gte, inArray, ne, sql, type SQL } from 'drizzle-orm';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
 import { REVIEW_ASPECTS, REVIEW_ASPECT_LABEL, type ReviewAspect } from '../../common/domain';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
 import { isUuid } from '../../common/util/uuid';
-import { InjectDb, isUniqueViolation, type Database } from '../../database/database';
+import { InjectDb, isUniqueViolation, type Database, type Where } from '../../database/database';
 import { orderItems, orders, products, reviews, users } from '../../database/schema';
 import { AuditService } from '../audit/audit.service';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -51,13 +50,6 @@ export type ReviewHighlight = {
 
 const round1 = (value: number) => Math.round(value * 10) / 10;
 
-/** Reviews of orders that included the product (a review covers its order's items). */
-function aboutProduct(productId: string): SQL {
-  return exists(
-    sql`(select 1 from ${orderItems} where ${orderItems.orderId} = ${reviews.orderId} and ${orderItems.productId} = ${productId})`,
-  );
-}
-
 @Injectable()
 export class ReviewsService {
   constructor(
@@ -69,24 +61,8 @@ export class ReviewsService {
   private async views(rows: Review[]): Promise<ReviewView[]> {
     if (!rows.length) return [];
     const [buyers, orderRows] = await Promise.all([
-      this.db
-        .select({ id: users.id, firstName: users.firstName, lastName: users.lastName, avatarUrl: users.avatarUrl })
-        .from(users)
-        .where(
-          inArray(
-            users.id,
-            rows.map((row) => row.buyerId),
-          ),
-        ),
-      this.db
-        .select({ id: orders.id, reference: orders.reference })
-        .from(orders)
-        .where(
-          inArray(
-            orders.id,
-            rows.map((row) => row.orderId),
-          ),
-        ),
+      this.db.find(users, { id: { $in: rows.map((row) => row.buyerId) } }),
+      this.db.find(orders, { id: { $in: rows.map((row) => row.orderId) } }),
     ]);
     const buyerById = new Map(buyers.map((buyer) => [buyer.id, buyer]));
     const orderById = new Map(orderRows.map((order) => [order.id, order]));
@@ -112,28 +88,29 @@ export class ReviewsService {
 
   /** The products a review covers: its order's items. */
   private async productIdsOf(orderId: string): Promise<string[]> {
-    const rows = await this.db.select({ productId: orderItems.productId }).from(orderItems).where(eq(orderItems.orderId, orderId)).orderBy(orderItems.position);
+    const rows = await this.db.find(orderItems, { orderId }, { sort: { position: 1 } });
     return rows.map((row) => row.productId);
   }
 
   /** "Write a review" on a completed order (escrow released). One per order. */
   async create(user: AuthUser, orderIdOrReference: string, input: { rating: number; aspects?: Partial<Record<ReviewAspect, number>>; body?: string }): Promise<ReviewView> {
     const reference = orderIdOrReference.replace(/^#/, '');
-    const [order] = await this.db
-      .select()
-      .from(orders)
-      .where(and(isUuid(reference) ? eq(orders.id, reference) : eq(orders.reference, reference), eq(orders.buyerId, user.id)));
+    const order = await this.db.findOne(orders, { ...(isUuid(reference) ? { id: reference } : { reference }), buyerId: user.id });
     if (!order) throw Errors.notFound("We couldn't find that order.", 'ORDER_NOT_FOUND');
     if (order.escrowPhase !== 'released') throw Errors.conflict('You can review an order once it is complete.', 'ORDER_NOT_COMPLETE');
     if (order.reviewId) throw Errors.conflict('You have already reviewed this order.', 'ALREADY_REVIEWED');
     let created: Review;
     try {
       created = await this.db.transaction(async (tx) => {
-        const [review] = await tx
-          .insert(reviews)
-          .values({ orderId: order.id, buyerId: order.buyerId, sellerId: order.sellerId, rating: input.rating, aspects: input.aspects ?? {}, body: input.body?.trim() ?? '' })
-          .returning();
-        await tx.update(orders).set({ reviewId: review.id }).where(eq(orders.id, order.id));
+        const review = await tx.insert(reviews, {
+          orderId: order.id,
+          buyerId: order.buyerId,
+          sellerId: order.sellerId,
+          rating: input.rating,
+          aspects: input.aspects ?? {},
+          body: input.body?.trim() ?? '',
+        });
+        await tx.update(orders, { id: order.id }, { reviewId: review.id });
         return review;
       });
     } catch (error) {
@@ -154,38 +131,41 @@ export class ReviewsService {
 
   /** Recomputes the seller's and the products' averages from the visible reviews. */
   async recompute(sellerId: string, productIds: string[]): Promise<void> {
-    const [seller] = await this.db
-      .select({ average: avg(reviews.rating).mapWith(Number), total: count() })
-      .from(reviews)
-      .where(and(eq(reviews.sellerId, sellerId), eq(reviews.hidden, false)));
-    await this.db
-      .update(users)
-      .set({ statsRatingAverage: round1(seller?.average ?? 0), statsRatingCount: seller?.total ?? 0 })
-      .where(eq(users.id, sellerId));
+    const seller = await this.ratingOf({ sellerId, hidden: false });
+    await this.db.update(users, { id: sellerId }, { statsRatingAverage: round1(seller.average), statsRatingCount: seller.total });
     for (const productId of productIds) {
-      const [product] = await this.db
-        .select({ average: avg(reviews.rating).mapWith(Number), total: count() })
-        .from(reviews)
-        .where(and(aboutProduct(productId), eq(reviews.hidden, false)));
-      await this.db
-        .update(products)
-        .set({ statsRatingAverage: round1(product?.average ?? 0), statsRatingCount: product?.total ?? 0 })
-        .where(eq(products.id, productId));
+      const product = await this.ratingOf({ ...(await this.aboutProduct(productId)), hidden: false });
+      await this.db.update(products, { id: productId }, { statsRatingAverage: round1(product.average), statsRatingCount: product.total });
     }
+  }
+
+  /** Reviews of orders that included the product (a review covers its order's items). */
+  private async aboutProduct(productId: string): Promise<Where<Review>> {
+    return { orderId: { $in: await this.db.distinct(orderItems, 'orderId', { productId }) } };
+  }
+
+  private async ratingOf(where: Where<Review>): Promise<{ average: number; total: number }> {
+    const [row] = await this.db.aggregate<{ average: number | null; total: number }>(reviews, [
+      { $match: where },
+      { $group: { _id: null, average: { $avg: '$rating' }, total: { $sum: 1 } } },
+    ]);
+    return { average: row?.average ?? 0, total: row?.total ?? 0 };
   }
 
   /** The Ratings page's summary cards: average, distribution and per-aspect scores. */
   async summary(sellerId: string): Promise<RatingSummary> {
-    const visible = and(eq(reviews.sellerId, sellerId), eq(reviews.hidden, false));
-    const aspectAverages = Object.fromEntries(
-      REVIEW_ASPECTS.map((key) => [key, sql<number | null>`avg((${reviews.aspects}->>${key})::numeric)`.mapWith(Number)]),
-    ) as Record<ReviewAspect, SQL.Aliased<number | null> | SQL<number | null>>;
+    const visible = { sellerId, hidden: false };
+    const aspectAverages = Object.fromEntries(REVIEW_ASPECTS.map((key) => [key, { $avg: `$aspects.${key}` }]));
     const [[totals], distribution] = await Promise.all([
-      this.db
-        .select({ average: avg(reviews.rating).mapWith(Number), total: count(), ...aspectAverages })
-        .from(reviews)
-        .where(visible),
-      this.db.select({ stars: reviews.rating, count: count() }).from(reviews).where(visible).groupBy(reviews.rating),
+      this.db.aggregate<Record<string, number | null> & { average: number | null; total: number }>(reviews, [
+        { $match: visible },
+        { $group: { _id: null, average: { $avg: '$rating' }, total: { $sum: 1 }, ...aspectAverages } },
+      ]),
+      this.db.aggregate<{ stars: number; count: number }>(reviews, [
+        { $match: visible },
+        { $group: { _id: '$rating', count: { $sum: 1 } } },
+        { $project: { _id: 0, stars: '$_id', count: 1 } },
+      ]),
     ]);
     const byStars = new Map(distribution.map((row) => [row.stars, row.count]));
     const aspectScore = (key: ReviewAspect) => Number((totals as Record<string, unknown> | undefined)?.[key] ?? 0) || 0;
@@ -197,21 +177,21 @@ export class ReviewsService {
     };
   }
 
-  private async pageOf(where: SQL, page: number, limit: number): Promise<Page<ReviewView>> {
-    const [{ total }] = await this.db.select({ total: count() }).from(reviews).where(where);
+  private async pageOf(where: Where<Review>, page: number, limit: number): Promise<Page<ReviewView>> {
+    const total = await this.db.count(reviews, where);
     const window = pageWindow(total, page, limit);
-    const rows = await this.db.select().from(reviews).where(where).orderBy(desc(reviews.createdAt), desc(reviews.id)).offset(window.skip).limit(window.size);
+    const rows = await this.db.find(reviews, where, { sort: { createdAt: -1, id: -1 }, skip: window.skip, limit: window.size });
     return toPage(await this.views(rows), total, window);
   }
 
   async forSeller(sellerId: string, page = 1, limit = 10): Promise<Page<ReviewView>> {
     if (!isUuid(sellerId)) return toPage([], 0, pageWindow(0, 1, limit));
-    return this.pageOf(and(eq(reviews.sellerId, sellerId), eq(reviews.hidden, false))!, page, limit);
+    return this.pageOf({ sellerId, hidden: false }, page, limit);
   }
 
   async forProduct(productId: string, page = 1, limit = 10): Promise<Page<ReviewView>> {
     if (!isUuid(productId)) return toPage([], 0, pageWindow(0, 1, limit));
-    return this.pageOf(and(aboutProduct(productId), eq(reviews.hidden, false))!, page, limit);
+    return this.pageOf({ ...(await this.aboutProduct(productId)), hidden: false }, page, limit);
   }
 
   /**
@@ -219,29 +199,40 @@ export class ReviewsService {
    * for the landing page. Only real reviews from paid orders appear.
    */
   async highlights(limit = 3): Promise<ReviewHighlight[]> {
-    const latestPerBuyer = this.db
-      .selectDistinctOn([reviews.buyerId])
-      .from(reviews)
-      .where(and(eq(reviews.hidden, false), gte(reviews.rating, 4), sql`char_length(${reviews.body}) >= 40`))
-      .orderBy(reviews.buyerId, desc(reviews.rating), desc(reviews.createdAt))
-      .as('latest');
-    const rows = await this.db
-      .select({
-        id: latestPerBuyer.id,
-        rating: latestPerBuyer.rating,
-        body: latestPerBuyer.body,
-        createdAt: latestPerBuyer.createdAt,
-        firstName: users.firstName,
-        lastName: users.lastName,
-        location: users.location,
-        region: users.region,
-        avatarUrl: users.avatarUrl,
-        title: sql<string | null>`(select ${orderItems.title} from ${orderItems} where ${orderItems.orderId} = ${latestPerBuyer.orderId} order by ${orderItems.position} limit 1)`,
-      })
-      .from(latestPerBuyer)
-      .innerJoin(users, and(eq(users.id, latestPerBuyer.buyerId), ne(users.status, 'closed')))
-      .orderBy(desc(latestPerBuyer.rating), desc(latestPerBuyer.createdAt))
-      .limit(limit);
+    const latest = await this.db.aggregate<Review>(reviews, [
+      { $match: { hidden: false, rating: { $gte: 4 }, $expr: { $gte: [{ $strLenCP: '$body' }, 40] } } },
+      { $sort: { buyerId: 1, rating: -1, createdAt: -1 } },
+      { $group: { _id: '$buyerId', review: { $first: '$$ROOT' } } },
+      { $replaceRoot: { newRoot: '$review' } },
+      { $sort: { rating: -1, createdAt: -1 } },
+      { $limit: limit * 4 },
+      { $set: { id: '$_id' } },
+    ]);
+    const [buyers, items] = await Promise.all([
+      this.db.find(users, { id: { $in: latest.map((row) => row.buyerId) }, status: { $ne: 'closed' } }),
+      this.db.find(orderItems, { orderId: { $in: latest.map((row) => row.orderId) } }, { sort: { position: 1 } }),
+    ]);
+    const buyerById = new Map(buyers.map((buyer) => [buyer.id, buyer]));
+    const titleByOrder = new Map<string, string>();
+    for (const item of items) if (!titleByOrder.has(item.orderId)) titleByOrder.set(item.orderId, item.title);
+    const rows = latest
+      .filter((review) => buyerById.has(review.buyerId))
+      .slice(0, limit)
+      .map((review) => {
+        const buyer = buyerById.get(review.buyerId)!;
+        return {
+          id: review.id,
+          rating: review.rating,
+          body: review.body,
+          createdAt: review.createdAt,
+          firstName: buyer.firstName,
+          lastName: buyer.lastName,
+          location: buyer.location,
+          region: buyer.region,
+          avatarUrl: buyer.avatarUrl,
+          title: titleByOrder.get(review.orderId) ?? null,
+        };
+      });
     return rows.map((row) => {
       const place = [row.location, row.region].filter((value): value is string => Boolean(value));
       return {
@@ -259,13 +250,9 @@ export class ReviewsService {
 
   /** The seller's public reply under a review. */
   async reply(user: AuthUser, reviewId: string, body: string): Promise<ReviewView> {
-    const [updated] = isUuid(reviewId)
-      ? await this.db
-          .update(reviews)
-          .set({ response: { body, at: new Date().toISOString() } })
-          .where(and(eq(reviews.id, reviewId), eq(reviews.sellerId, user.id), eq(reviews.hidden, false)))
-          .returning()
-      : [];
+    const updated = isUuid(reviewId)
+      ? await this.db.update(reviews, { id: reviewId, sellerId: user.id, hidden: false }, { response: { body, at: new Date().toISOString() } })
+      : null;
     if (!updated) throw Errors.notFound('That review does not exist.', 'REVIEW_NOT_FOUND');
     void this.notifications.notifyUser(updated.buyerId, {
       type: 'review.reply',
@@ -277,7 +264,7 @@ export class ReviewsService {
   }
 
   async setHidden(staff: AuthStaff, reviewId: string, hidden: boolean): Promise<ReviewView> {
-    const [updated] = isUuid(reviewId) ? await this.db.update(reviews).set({ hidden }).where(eq(reviews.id, reviewId)).returning() : [];
+    const updated = isUuid(reviewId) ? await this.db.update(reviews, { id: reviewId }, { hidden }) : null;
     if (!updated) throw Errors.notFound('That review does not exist.', 'REVIEW_NOT_FOUND');
     await this.recompute(updated.sellerId, await this.productIdsOf(updated.orderId));
     await this.audit.record(staff, { action: hidden ? 'Hid a review' : 'Restored a review', target: updated.body.slice(0, 60) || `${updated.rating}-star review`, targetType: 'review', targetId: reviewId });
