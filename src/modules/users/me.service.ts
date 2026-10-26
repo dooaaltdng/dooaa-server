@@ -1,9 +1,12 @@
+import { randomBytes } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import { Errors } from '../../common/api/app-error';
 import type { AuthUser } from '../../common/auth/principal';
 import { EventBus } from '../../common/events/event-bus';
-import { type OtpChannel, regionFor } from '../../common/domain';
-import { normalizePhone } from '../../common/util/text';
+import { ALWAYS_ON_NOTIFICATIONS, type OtpChannel, regionFor } from '../../common/domain';
+import { maskPhone, normalizePhone } from '../../common/util/text';
+import { InjectConfig } from '../../config/config.module';
+import type { AppConfig } from '../../config/configuration';
 import { users } from '../../database/schema';
 import { TokenService, type SessionMeta, type TokenPair } from '../auth/token.service';
 import { MailService } from '../mail/mail.service';
@@ -26,6 +29,7 @@ export class MeService {
     private readonly media: MediaService,
     private readonly mail: MailService,
     private readonly events: EventBus,
+    @InjectConfig() private readonly config: AppConfig,
   ) {}
 
   async profile(user: AuthUser): Promise<PublicUser & { stats: UserStats }> {
@@ -37,6 +41,11 @@ export class MeService {
     const patch: UserPatch = {};
     if (input.firstName !== undefined) patch.firstName = input.firstName;
     if (input.lastName !== undefined) patch.lastName = input.lastName;
+    if (input.name !== undefined) {
+      const [first, ...rest] = input.name.replace(/\s+/g, ' ').trim().split(' ');
+      patch.firstName = first;
+      patch.lastName = rest.join(' ');
+    }
     if (input.gender !== undefined) patch.gender = input.gender;
     if (input.location !== undefined) {
       patch.location = input.location;
@@ -54,7 +63,21 @@ export class MeService {
     if (input.responseLabel !== undefined) patch.sellerResponseLabel = input.responseLabel;
     if (input.deliveryLabel !== undefined) patch.sellerDeliveryLabel = input.deliveryLabel;
     if (!Object.keys(patch).length) return toPublicUser(await this.users.getById(user.id));
-    return toPublicUser(await this.users.update(user.id, patch));
+    const updated = await this.users.update(user.id, patch);
+    if (patch.phone !== undefined) {
+      // A security notice, so it is sent whatever the notification switches say.
+      void this.mail.send(updated.email, {
+        subject: 'Your DOOAA phone number was changed',
+        heading: 'Phone number updated',
+        paragraphs: [
+          `Hi ${updated.firstName}, the phone number on your DOOAA account was just changed${patch.phone ? ` to ${maskPhone(patch.phone)}` : ''}.`,
+          'If you made this change, there is nothing else to do.',
+          'If this was not you, contact DOOAA support straight away so we can secure your account.',
+        ],
+        cta: { label: 'Review your profile', url: `${this.config.clientUrl}/settings` },
+      });
+    }
+    return toPublicUser(updated);
   }
 
   /** The profile photo: an image already uploaded through the media endpoint. */
@@ -70,6 +93,12 @@ export class MeService {
   async setNotificationPrefs(user: AuthUser, input: NotificationPrefsDto): Promise<PublicUser['notificationPrefs']> {
     const changes: Record<string, boolean> = {};
     for (const [key, value] of Object.entries(input)) if (typeof value === 'boolean') changes[key] = value;
+    // Email notifications cannot be switched off.
+    for (const [key, value] of Object.entries(ALWAYS_ON_NOTIFICATIONS)) {
+      if (key in changes && changes[key] !== value) {
+        throw Errors.badRequest('Email notifications are always on, so we can keep you updated about your account.', 'NOTIFICATION_REQUIRED');
+      }
+    }
     const updated = Object.keys(changes).length
       ? await this.users.update(user.id, { $set: Object.fromEntries(Object.entries(changes).map(([key, value]) => [`notificationPrefs.${key}`, value])) })
       : await this.users.getById(user.id);
@@ -108,21 +137,49 @@ export class MeService {
     return { changed: true, tokens: await this.tokens.issue('user', user.id, fresh.tokenVersion, meta) };
   }
 
-  /** Close Account. Other modules can veto (open orders, held funds) before anything changes. */
-  async close(user: AuthUser, input: { reason: string; notes?: string; password: string }): Promise<{ closed: true }> {
-    if (!(await this.passwords.verify(input.password, await this.users.passwordHashOf(user.id)))) {
-      throw Errors.badRequest('That password is incorrect.', 'INVALID_PASSWORD');
-    }
+  /** Emails the code that confirms deleting the account. */
+  async sendCloseCode(user: AuthUser): Promise<IssuedOtp> {
+    const record = await this.users.getById(user.id);
+    return this.otp.issue({ key: `user:${user.id}`, purpose: 'close-account', channel: 'email', to: record.email, userId: user.id });
+  }
+
+  /**
+   * Delete my account, permanently. Confirmed with the emailed code (sign-in
+   * is passwordless). Other modules can veto first (open orders, held funds).
+   * Then every session ends and the personal details are erased; orders and
+   * payments stay, attached to an anonymous "Deleted user", for disputes and
+   * the books. The email address is freed, so the person can sign up afresh.
+   */
+  async close(user: AuthUser, input: { reason: string; notes?: string; code: string }): Promise<{ closed: true }> {
+    await this.otp.verify({ key: `user:${user.id}`, purpose: 'close-account', code: input.code });
     await this.events.emit<AccountClosing>(ACCOUNT_EVENTS.closing, { userId: user.id });
+
+    const before = await this.users.getById(user.id);
     await this.users.update(user.id, { closedAt: new Date(), closeReason: input.reason, closeNotes: input.notes ?? null });
-    const closed = await this.users.setStatus(user.id, 'closed', 'Closed by the account holder');
-    await this.events.emit<AccountClosed>(ACCOUNT_EVENTS.closed, { userId: user.id, email: closed.email, firstName: closed.firstName });
-    void this.mail.send(closed.email, {
-      subject: 'Your DOOAA account has been closed',
-      heading: 'Account closed',
+    await this.users.setStatus(user.id, 'closed', 'Deleted by the account holder');
+    await this.events.emit<AccountClosed>(ACCOUNT_EVENTS.closed, { userId: user.id, email: before.email, firstName: before.firstName });
+
+    await this.users.update(user.id, {
+      firstName: 'Deleted',
+      lastName: 'user',
+      email: `deleted-${user.id}@deleted.dooaa.invalid`,
+      phone: '',
+      avatarUrl: null,
+      gender: null,
+      location: null,
+      region: null,
+      sellerStoreName: null,
+      emailVerified: false,
+      phoneVerified: false,
+      passwordHash: await this.passwords.hash(randomBytes(32).toString('base64url')),
+    });
+
+    void this.mail.send(before.email, {
+      subject: 'Your DOOAA account has been deleted',
+      heading: 'Account deleted',
       paragraphs: [
-        `Hi ${closed.firstName}, your DOOAA account is closed and you have been signed out everywhere.`,
-        'Thank you for the time you spent with us. If you change your mind, contact support and we will help.',
+        `Hi ${before.firstName}, your DOOAA account has been deleted and you have been signed out everywhere.`,
+        'Your name, email, phone number and photo have been removed. You are welcome to sign up again at any time.',
       ],
     });
     return { closed: true };

@@ -283,7 +283,9 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
       expect(await ack(socket, 'typing', { conversationId: thread.id, typing: true })).toMatchObject({ ok: false, code: 'NOT_JOINED' });
     });
 
-    it('pushes notifications live and reports presence', async () => {
+    it('pushes notifications live (once switched on) and reports presence', async () => {
+      // Web notifications start off for every account; the buyer opts in.
+      data(await http.patch('/me/notification-preferences', { web: true }, buyer.token));
       const buyerSocket = await connect(buyer.token);
       const product = await createProduct(t, seller.id, { pricing: 'negotiable', title: 'Live Offer Phone' });
       const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
@@ -328,7 +330,7 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
 
     it('turns message alerts off when the user asks', async () => {
       const quiet = await registerUser(t);
-      data(await http.patch('/me/notification-preferences', { web: false, email: false }, quiet.token));
+      data(await http.patch('/me/notification-preferences', { web: false, messages: false }, quiet.token));
       const product = await createProduct(t, seller.id);
       const thread = data(await http.post('/conversations', { productId: product.id }, quiet.token));
       const before = t.mail.outbox.length;

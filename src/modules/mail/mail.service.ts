@@ -3,6 +3,7 @@ import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
 import { renderMail, type MailContent } from './mail.templates';
 import { MAIL_TRANSPORT, type MailTransport } from './mail.transport';
+import { explain } from '../../common/util/explain-error';
 
 const RETRY_DELAYS_MS = [1_000, 5_000, 20_000];
 
@@ -42,7 +43,7 @@ export class MailService implements OnModuleDestroy {
         return;
       } catch (error) {
         if (attempt >= RETRY_DELAYS_MS.length) {
-          this.logger.error(`Giving up on mail to ${mail.to} (${mail.subject}): ${(error as Error).message}`);
+          this.logger.error(explain(`Could not send the email "${mail.subject}" to ${mail.to} after several tries, so it was dropped`, error));
           return;
         }
         await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]).unref?.());

@@ -15,6 +15,7 @@ import { UsersService } from '../../users/users.service';
 import { AuthService, type AuthResult } from '../auth.service';
 import { TokenService, hashToken, type SessionMeta } from '../token.service';
 import { OAUTH_PROVIDER_REGISTRY, type OAuthProfile, type OAuthProviderRegistry } from './oauth-provider';
+import { explain } from '../../../common/util/explain-error';
 
 const STATE_TTL_SECONDS = 10 * 60;
 const GRANT_TTL_MS = 2 * 60 * 1000;
@@ -112,7 +113,7 @@ export class OAuthService {
       profile = await provider.exchange({ code: query.code, redirectUri: this.redirectUri(provider.id) });
     } catch (error) {
       if (error instanceof AppError) throw error;
-      this.logger.warn(`${provider.id} sign-in failed: ${(error as Error).message}`);
+      this.logger.warn(explain(`Sign-in with ${provider.id} did not work`, error));
       throw Errors.badGateway(`We could not reach ${provider.id === 'google' ? 'Google' : 'Facebook'}. Try again.`, 'OAUTH_FAILED');
     }
 

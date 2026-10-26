@@ -14,6 +14,7 @@ import { SettingsService } from '../settings/settings.service';
 import { WALLET_EVENTS, type PayoutUpdated } from '../wallet/wallet.service';
 import { WISHLIST_EVENTS, type RestockAlert } from '../wishlist/wishlist.service';
 import { NotificationsService } from './notifications.service';
+import { explain } from '../../common/util/explain-error';
 
 const MESSAGE_EMAIL_COOLDOWN_MS = 30 * 60_000;
 
@@ -48,7 +49,7 @@ export class NotificationsListener implements OnModuleInit {
     try {
       await work();
     } catch (error) {
-      this.logger.warn(`Notification side effect failed: ${(error as Error).message}`);
+      this.logger.warn(explain('Could not send a notification (the action it was about still succeeded)', error));
     }
   }
 

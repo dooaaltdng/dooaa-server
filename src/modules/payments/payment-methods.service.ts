@@ -7,6 +7,7 @@ import { isUuid } from '../../common/util/uuid';
 import { InjectDb, type Database } from '../../database/database';
 import { payoutAccounts } from '../../database/schema';
 import { PAYMENT_PROVIDER, type Bank, type PaymentProvider } from './providers/payment-provider';
+import { explain } from '../../common/util/explain-error';
 
 export type PayoutAccount = typeof payoutAccounts.$inferSelect;
 
@@ -136,7 +137,7 @@ export class PaymentMethodsService {
   async ensureUsable(account: PayoutAccount): Promise<boolean> {
     if (account.verified) return true;
     const destination = await this.provider.getPayoutDestination(account.recipientCode).catch((error: Error) => {
-      this.logger.warn(`Could not check payout destination ${account.recipientCode}: ${error.message}`);
+      this.logger.warn(explain(`Could not confirm the payout bank account ${account.recipientCode} with the payment provider`, error));
       return null;
     });
     if (!destination?.usable) return false;

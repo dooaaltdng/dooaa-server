@@ -31,7 +31,7 @@ export type OAuthProviderId = (typeof OAUTH_PROVIDERS)[number];
 export const SUBJECT_TYPES = ['user', 'staff'] as const;
 export type SubjectType = (typeof SUBJECT_TYPES)[number];
 
-export const OTP_PURPOSES = ['verify-email', 'reset-password', 'change-password', 'confirm-release', 'verify-phone'] as const;
+export const OTP_PURPOSES = ['verify-email', 'reset-password', 'change-password', 'confirm-release', 'verify-phone', 'sign-in', 'close-account'] as const;
 export type OtpPurpose = (typeof OTP_PURPOSES)[number];
 
 export const OTP_CHANNELS = ['email', 'sms', 'whatsapp'] as const;
@@ -57,21 +57,32 @@ export function regionFor(location?: string | null): string | undefined {
   const direct = LOCATION_REGION[location.trim()];
   if (direct) return direct;
   const match = Object.keys(LOCATION_REGION).find((city) => location.toLowerCase().includes(city.toLowerCase()));
-  return match ? LOCATION_REGION[match] : location.trim();
+  if (match) return LOCATION_REGION[match];
+  // "City, State" from the location search: the state is the part after the last comma.
+  const parts = location.split(',').map((part) => part.trim()).filter(Boolean);
+  return parts.length > 1 ? parts[parts.length - 1] : location.trim();
 }
 
 export const NOTIFICATION_PREF_KEYS = ['email', 'deals', 'sms', 'messages', 'feedback', 'web'] as const;
 export type NotificationPrefKey = (typeof NOTIFICATION_PREF_KEYS)[number];
 export type NotificationPrefs = Record<NotificationPrefKey, boolean>;
-/** Defaults as drawn on the settings panel. */
+/**
+ * Email notifications are always on (ALWAYS_ON_NOTIFICATIONS); every other
+ * notification starts off and the account holder opts in from Settings →
+ * Manage Notifications. Transactional mail (orders, payments, sign-in codes,
+ * security) is sent regardless — see NotificationsService.
+ */
 export const DEFAULT_NOTIFICATION_PREFS: NotificationPrefs = {
   email: true,
-  deals: true,
+  deals: false,
   sms: false,
-  messages: true,
+  messages: false,
   feedback: false,
-  web: true,
+  web: false,
 };
+
+/** Preferences the account holder cannot switch off; stored, read and applied as true. */
+export const ALWAYS_ON_NOTIFICATIONS: Partial<NotificationPrefs> = { email: true };
 
 /** Exit survey on the close-account panel, in the order drawn. */
 export const CLOSE_REASONS = [

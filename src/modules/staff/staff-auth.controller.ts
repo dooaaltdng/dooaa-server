@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, Param, Post, Req, Res } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Put, Req, Res } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import type { CookieOptions, Request, Response } from 'express';
 import { CurrentStaff, Public, RequestMeta, StaffOnly, type RequestMetaValue } from '../../common/auth/decorators';
@@ -6,7 +6,17 @@ import type { AuthStaff } from '../../common/auth/principal';
 import { AuthThrottle } from '../../common/auth/throttle';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
-import { AcceptInviteDto, ChangeStaffPasswordDto, StaffRefreshDto, StaffSignInDto } from './dto/staff.dto';
+import {
+  AcceptInviteDto,
+  ChangeStaffPasswordDto,
+  StaffForgotPasswordDto,
+  StaffRefreshDto,
+  StaffResetPasswordDto,
+  StaffAvatarDto,
+  StaffSignInDto,
+  StaffVerifyResetCodeDto,
+  UpdateStaffProfileDto,
+} from './dto/staff.dto';
 import { StaffService } from './staff.service';
 
 export const STAFF_REFRESH_COOKIE = 'dooaa_admin_rt';
@@ -68,6 +78,22 @@ export class StaffAuthController {
     return this.staff.me(actor);
   }
 
+  /** Your own name — the only profile field staff edit themselves. */
+  @Patch('me')
+  updateMe(@CurrentStaff() actor: AuthStaff, @Body() body: UpdateStaffProfileDto) {
+    return this.staff.updateOwnProfile(actor, body);
+  }
+
+  @Put('me/avatar')
+  setAvatar(@CurrentStaff() actor: AuthStaff, @Body() body: StaffAvatarDto) {
+    return this.staff.setOwnAvatar(actor, body.url);
+  }
+
+  @Delete('me/avatar')
+  removeAvatar(@CurrentStaff() actor: AuthStaff) {
+    return this.staff.setOwnAvatar(actor, null);
+  }
+
   /** Your own password. Every other session ends; this one gets fresh tokens. */
   @AuthThrottle()
   @HttpCode(200)
@@ -97,5 +123,29 @@ export class StaffAuthController {
     const result = await this.staff.acceptInvite(body.token, body.password, meta);
     response.cookie(STAFF_REFRESH_COOKIE, result.tokens.refreshToken, this.cookieOptions(new Date(result.tokens.refreshExpiresAt)));
     return result;
+  }
+
+  @Public()
+  @AuthThrottle()
+  @HttpCode(200)
+  @Post('forgot-password')
+  forgotPassword(@Body() body: StaffForgotPasswordDto) {
+    return this.staff.requestPasswordReset(body.email);
+  }
+
+  @Public()
+  @AuthThrottle()
+  @HttpCode(200)
+  @Post('forgot-password/verify')
+  verifyResetCode(@Body() body: StaffVerifyResetCodeDto) {
+    return this.staff.verifyResetCode(body.email, body.code);
+  }
+
+  @Public()
+  @AuthThrottle()
+  @HttpCode(200)
+  @Post('reset-password')
+  resetPassword(@Body() body: StaffResetPasswordDto) {
+    return this.staff.resetPassword(body.token, body.password);
   }
 }

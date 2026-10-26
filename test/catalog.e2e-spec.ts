@@ -19,7 +19,7 @@ describe('Catalog (e2e)', () => {
     // A small, varied catalogue.
     await createProduct(t, seller.id, { title: 'Apple iPhone 12 Pro 512 GB Blue', price: 400_000, condition: 'used', brand: 'Apple', categoryId: 'gatdgets' });
     await createProduct(t, seller.id, { title: 'Samsung Galaxy S23 Ultra 5G Phantom Black', price: 1_280_000, condition: 'new', brand: 'Samsung', categoryId: 'gatdgets', statsUnitsSold: 40, statsViews: 10 });
-    await createProduct(t, seller.id, { title: 'Tecno Camon 20 Pro', price: 250_000, condition: 'new', brand: 'Tecno', categoryId: 'gatdgets', statsViews: 500 });
+    await createProduct(t, seller.id, { title: 'Tecno Camon 20 Pro', price: 250_000, condition: 'new', brand: 'Tecno', categoryId: 'gatdgets', statsViews: 500, statsCartAdds: 12, statsPopularity: 12 });
     await createProduct(t, unverifiedSeller.id, { title: 'Itel A70 budget phone', price: 95_000, condition: 'refurbished', brand: 'Itel', sellerVerified: false, location: 'Wuse, Abuja' });
     await createProduct(t, seller.id, { title: 'Toyota Corolla 2016 Neat', price: 9_800_000, condition: 'used', brand: 'Toyota', categoryId: 'automative', featured: true });
     await createProduct(t, seller.id, { title: 'Nike Air Force 1 White 43', price: 95_000, condition: 'new', brand: 'Nike', categoryId: 'fashion', stock: 0 });
@@ -40,6 +40,21 @@ describe('Catalog (e2e)', () => {
     it('gets one category and 404s on unknown slugs', async () => {
       expect(data(await http.get('/categories/fashion'))).toMatchObject({ name: 'Fashion', productCount: 1 });
       failure(await http.get('/categories/spaceships'), 404, 'CATEGORY_NOT_FOUND');
+    });
+  });
+
+  describe('popular', () => {
+    it('counts a product as popular once it is added to a cart (a quantity bump does not count twice)', async () => {
+      const product = await createProduct(t, seller.id, { title: 'Popular Test Blender', price: 30_000, condition: 'new', categoryId: 'home-appliances' });
+      const buyer = await registerUser(t);
+      data(await http.post('/cart/items', { productId: product.id, quantity: 1 }, buyer.token));
+      data(await http.post('/cart/items', { productId: product.id, quantity: 1 }, buyer.token));
+      await eventually(async () => {
+        const row = await model(t, 'Product').findById(product.id);
+        expect(row).toMatchObject({ statsCartAdds: 1, statsPopularity: 1 });
+      });
+      const popular = data(await http.get('/products?collection=popular&limit=60')).rows.map((r: any) => r.id);
+      expect(popular).toContain(product.id);
     });
   });
 
@@ -127,9 +142,12 @@ describe('Catalog (e2e)', () => {
   });
 
   describe('home and detail', () => {
-    it('builds the landing page: six tiles and three rails', async () => {
+    it('builds the landing page: the managed categories (A–Z) and three rails', async () => {
       const home = data(await http.get('/catalog/home'));
-      expect(home.categories.map((tile: any) => tile.name)).toEqual(['Vehicles', 'Electronics', 'Fashion', 'Property', 'Gadget', 'Home Appliances']);
+      const shop = data(await http.get('/categories'));
+      // The rail is exactly the visible categories the console manages, in the same A–Z order.
+      expect(home.categories.map((tile: any) => tile.name)).toEqual(shop.map((category: any) => category.name));
+      expect(home.categories.length).toBeGreaterThan(0);
       expect(home.topSellers[0].brand).toBe('Samsung');
       expect(home.popular[0].brand).toBe('Tecno');
       expect(home.featured[0].brand).toBe('Toyota');

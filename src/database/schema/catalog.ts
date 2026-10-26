@@ -51,6 +51,10 @@ export type ProductRow = Timestamps & {
   /** Conversations started about the listing — the console's "inquiries". */
   statsInquiries: number;
   statsWishlists: number;
+  /** Times a shopper put it in their cart (a new line, not a quantity bump). */
+  statsCartAdds: number;
+  /** Popular ranking: cart adds + units sold, kept in step with both. */
+  statsPopularity: number;
   statsUnitsSold: number;
   statsRevenue: number;
   statsLastSaleAt: Date | null;
@@ -81,6 +85,8 @@ export const products = table<ProductRow>()('products', {
     statsViews: 0,
     statsInquiries: 0,
     statsWishlists: 0,
+    statsCartAdds: 0,
+    statsPopularity: 0,
     statsUnitsSold: 0,
     statsRevenue: 0,
     statsRatingAverage: 0,
@@ -102,6 +108,7 @@ export const products = table<ProductRow>()('products', {
     index('products_public_category_idx', { categoryId: 1, createdAt: -1 }, { partialFilterExpression: PUBLIC }),
     index('products_public_price_idx', { status: 1, price: 1 }),
     index('products_public_units_sold_idx', { status: 1, statsUnitsSold: -1 }),
+    index('products_public_popularity_idx', { status: 1, statsPopularity: -1 }),
     index('products_public_views_idx', { status: 1, statsViews: -1 }),
     index('products_public_published_idx', { status: 1, publishedAt: -1 }),
     index('products_public_featured_idx', { status: 1, featured: 1, publishedAt: -1 }),

@@ -252,25 +252,31 @@ export function loadConfig(): AppConfig {
 }
 
 /**
- * Fails fast at boot when something the app cannot run without is missing.
- * The services are required in every environment; production additionally
- * needs real secrets. The test suite replaces the services with in-memory
+ * Fails fast at boot only when something the app cannot run without is
+ * missing: the database everywhere, and real secrets in production. Missing
+ * integration keys (Redis, SMTP, Cloudinary, Bachs, Termii) are logged as
+ * warnings instead: the server still starts and only the features that need
+ * them fail when used. The test suite replaces the services with in-memory
  * doubles, so it only needs the database.
  */
 export function assertConfig(config: AppConfig): void {
   const missing: string[] = [];
+  const optional: string[] = [];
   const need = (value: unknown, name: string) => {
     if (!value) missing.push(name);
   };
+  const want = (value: unknown, name: string) => {
+    if (!value) optional.push(name);
+  };
   need(config.database.url, 'MONGODB_URI');
   if (config.env !== 'test') {
-    need(config.redis.url, 'REDIS_URL');
-    need(config.mail.smtp.host, 'SMTP_HOST');
-    need(config.storage.cloudinary.cloudName, 'CLOUDINARY_CLOUD_NAME');
-    need(config.storage.cloudinary.apiKey, 'CLOUDINARY_API_KEY');
-    need(config.storage.cloudinary.apiSecret, 'CLOUDINARY_API_SECRET');
-    need(config.payments.bachs.secretKey, 'BACHS_SECRET_KEY');
-    need(config.payments.bachs.webhookSecret, 'BACHS_WEBHOOK_SECRET');
+    want(config.redis.url, 'REDIS_URL');
+    want(config.mail.smtp.host, 'SMTP_HOST');
+    want(config.storage.cloudinary.cloudName, 'CLOUDINARY_CLOUD_NAME');
+    want(config.storage.cloudinary.apiKey, 'CLOUDINARY_API_KEY');
+    want(config.storage.cloudinary.apiSecret, 'CLOUDINARY_API_SECRET');
+    want(config.payments.bachs.secretKey, 'BACHS_SECRET_KEY');
+    want(config.payments.bachs.webhookSecret, 'BACHS_WEBHOOK_SECRET');
   }
   if (config.env === 'production') {
     need(config.jwt.accessSecret, 'JWT_ACCESS_SECRET');
@@ -278,7 +284,7 @@ export function assertConfig(config: AppConfig): void {
     need(config.jwt.staffSecret, 'JWT_STAFF_SECRET');
     need(config.otp.pepper, 'OTP_PEPPER');
     need(config.storage.signingSecret, 'MEDIA_SIGNING_SECRET');
-    if (config.sms.driver === 'termii') need(config.sms.termii.apiKey, 'TERMII_API_KEY');
+    if (config.sms.driver === 'termii') want(config.sms.termii.apiKey, 'TERMII_API_KEY');
     if (config.payments.bachs.secretKey && !config.payments.bachs.secretKey.startsWith('sk_live_')) {
       missing.push('BACHS_SECRET_KEY (production needs a live key, sk_live_…)');
     }
@@ -291,6 +297,9 @@ export function assertConfig(config: AppConfig): void {
     ] as const) {
       if (secret && secret.length < 32) missing.push(`${name} (must be at least 32 characters)`);
     }
+  }
+  if (optional.length) {
+    console.warn(`[config] The server is starting without some settings, so a few features will not work until they are added to the .env file: ${optional.join(', ')}.`);
   }
   if (missing.length) {
     throw new Error(`Missing ${config.env} configuration: ${missing.join(', ')}`);

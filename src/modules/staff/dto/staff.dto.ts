@@ -1,4 +1,4 @@
-import { IsEmail, IsIn, IsOptional, IsString, Length, MaxLength, MinLength } from 'class-validator';
+import { IsEmail, IsIn, IsOptional, IsString, IsUrl, Length, MaxLength, MinLength } from 'class-validator';
 import { STAFF_ROLES, type StaffRole } from '../../../common/domain';
 import { ToLowerTrim, Trim } from '../../../common/util/transforms';
 import { IsPersonName, IsStrongPassword } from '../../../common/util/validators';
@@ -32,4 +32,28 @@ export class UpdateStaffRoleDto {
 export class ChangeStaffPasswordDto {
   @IsString() @MinLength(1, { message: 'Enter your current password.' }) @MaxLength(128) currentPassword: string;
   @IsStrongPassword() newPassword: string;
+}
+
+export class StaffForgotPasswordDto {
+  @ToLowerTrim() @IsEmail({}, { message: 'Enter a valid email address.' }) email: string;
+}
+
+export class StaffVerifyResetCodeDto {
+  @ToLowerTrim() @IsEmail({}, { message: 'Enter a valid email address.' }) email: string;
+  @IsString() @Length(6, 6, { message: 'Enter the 6-digit code.' }) code: string;
+}
+
+export class StaffResetPasswordDto {
+  @IsString() @Length(20, 200) token: string;
+  @IsStrongPassword() password: string;
+}
+
+/** The only profile fields staff may change about themselves. */
+export class UpdateStaffProfileDto {
+  @Trim() @IsPersonName('First name') firstName: string;
+  @Trim() @IsPersonName('Last name') lastName: string;
+}
+
+export class StaffAvatarDto {
+  @IsUrl({ require_tld: false, require_protocol: true }) url: string;
 }

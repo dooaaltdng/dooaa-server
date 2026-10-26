@@ -15,6 +15,7 @@ import {
   type PaymentRail,
   type ProviderEvent,
 } from './providers/payment-provider';
+import { explain } from '../../common/util/explain-error';
 
 export const PAYMENT_EVENTS = {
   /** A charge was confirmed by the provider: fulfil the orders it paid for. */
@@ -272,7 +273,7 @@ export class PaymentsService {
     );
     const latest = await this.reload(payment.id);
     if (changed) {
-      this.logger.error(`Amount mismatch on ${payment.reference}: expected ${payment.amount}, provider reported ${status.amount} ${status.currency}`);
+      this.logger.error(`Payment ${payment.reference} was not accepted because the amount paid does not match: we expected ${payment.amount}, but the payment provider reported ${status.amount} ${status.currency}.`);
       if (status.amount > 0 && status.chargeId) {
         // Everything that was collected goes back: the refund takes the whole remaining balance of the charge.
         const reference = refundReference();
@@ -281,7 +282,7 @@ export class PaymentsService {
           .refund({ chargeId: status.chargeId, reference, reason: 'Payment amount did not match the order' })
           .then((result) => this.db.update(paymentRefunds, { refundReference: reference }, { providerRefundId: result.providerRefundId }))
           .catch(async (error: Error) => {
-            this.logger.error(`Mismatch refund failed for ${payment.reference}: ${error.message}`);
+            this.logger.error(explain(`Could not refund payment ${payment.reference} after its amount did not match; it needs a manual refund`, error));
             await this.db.update(paymentRefunds, { refundReference: reference }, { status: 'failed', failureReason: error.message });
           });
       }
@@ -451,7 +452,7 @@ export class PaymentsService {
   async retryUnfulfilled(): Promise<number> {
     const stuck = await this.db.find(payments, { status: 'paid', fulfilledAt: null, paidAt: { $lt: new Date(Date.now() - 60_000) } }, { limit: 100 });
     for (const row of stuck) {
-      await this.fulfil(await this.reload(row.id)).catch((error: Error) => this.logger.error(`Fulfilment retry failed for ${row.reference}: ${error.message}`));
+      await this.fulfil(await this.reload(row.id)).catch((error: Error) => this.logger.error(explain(`Payment ${row.reference} went through, but completing the order failed again; it will be retried`, error)));
     }
     return stuck.length;
   }

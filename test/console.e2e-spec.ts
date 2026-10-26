@@ -201,6 +201,35 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
     });
   });
 
+  describe('categories', () => {
+    it('creates, edits, hides and deletes categories (listed A–Z), and the shop follows', async () => {
+      const admin = await staffToken(t, 'superadmin');
+      const created = data(await http.post('/admin/categories', { name: 'Kitchen & Dining', description: 'Pots and pans' }, admin.token));
+      expect(created).toMatchObject({ slug: 'kitchen-and-dining', name: 'Kitchen & Dining', active: true });
+      failure(await http.post('/admin/categories', { name: 'kitchen & dining' }, admin.token), 409, 'CATEGORY_EXISTS');
+
+      const shop = () => http.get('/categories').then((r) => data(r) as Array<{ slug: string }>);
+      expect((await shop()).some((c) => c.slug === 'kitchen-and-dining')).toBe(true);
+
+      data(await http.patch('/admin/categories/kitchen-and-dining', { name: 'Kitchen', active: false }, admin.token));
+      expect((await shop()).some((c) => c.slug === 'kitchen-and-dining')).toBe(false);
+      data(await http.patch('/admin/categories/kitchen-and-dining', { active: true }, admin.token));
+
+      const list = data(await http.get('/admin/categories', admin.token)) as Array<{ slug: string; totalListings: number }>;
+      const names = list.map((c: any) => c.name);
+      expect(names).toEqual([...names].sort((a: string, b: string) => a.localeCompare(b, 'en', { sensitivity: 'base' })));
+
+      // A category with listings cannot be deleted; an empty one can.
+      const used = list.find((c) => c.totalListings > 0);
+      if (used) failure(await http.delete(`/admin/categories/${used.slug}`, admin.token), 409, 'CATEGORY_IN_USE');
+      data(await http.delete('/admin/categories/kitchen-and-dining', admin.token));
+      expect((await shop()).some((c) => c.slug === 'kitchen-and-dining')).toBe(false);
+
+      const moderator = await staffToken(t, 'moderator');
+      failure(await http.post('/admin/categories', { name: 'Nope' }, moderator.token), 403);
+    });
+  });
+
   describe('content', () => {
     it('serves the six published pages, including under the client’s route names', async () => {
       const pages = data(await http.get('/content'));

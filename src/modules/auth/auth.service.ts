@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { randomBytes } from 'node:crypto';
 import { JwtService } from '@nestjs/jwt';
 import { Errors } from '../../common/api/app-error';
 import type { AuthUser } from '../../common/auth/principal';
@@ -13,7 +14,7 @@ import { PasswordService } from '../users/password.service';
 import type { User } from '../users/user.model';
 import { toPublicUser, type PublicUser } from '../users/user.presenter';
 import { UsersService } from '../users/users.service';
-import type { ForgotPasswordDto, SendOtpDto, SignInDto, SignUpDto, VerifyOtpDto } from './dto/auth.dto';
+import type { ForgotPasswordDto, SendOtpDto, SignInDto, SignUpDto, StartSignInDto, StartSignUpDto, VerifyCodeDto, VerifyOtpDto } from './dto/auth.dto';
 import { TokenService, type SessionMeta, type TokenPair } from './token.service';
 
 export type AuthResult = { user: PublicUser; tokens: TokenPair };
@@ -80,6 +81,71 @@ export class AuthService {
     const tokens = await this.tokens.issue('user', user.id, user.tokenVersion, meta);
     const fresh = await this.users.getById(user.id);
     return { user: toPublicUser(fresh), tokens };
+  }
+
+  /* --- Passwordless (email code) --------------------------------------- */
+
+  /**
+   * Sign-up, step 1: creates the account and emails a code. Someone who
+   * started but never entered their code can start again with the same email
+   * (their details are updated); a confirmed account is told to sign in.
+   */
+  async startSignUp(input: StartSignUpDto): Promise<IssuedOtp> {
+    const name = input.name.trim().replace(/\s+/g, ' ');
+    const [firstName, ...rest] = name.split(' ');
+    const lastName = rest.join(' ');
+    const existing = await this.users.findByEmail(input.email);
+    let user: User;
+    if (existing) {
+      if (existing.emailVerified) {
+        throw Errors.conflict('An account with that email already exists. Sign in instead.', 'EMAIL_TAKEN');
+      }
+      user = await this.users.update(existing.id, { firstName, lastName, phone: input.phone });
+    } else {
+      user = await this.users.create({
+        firstName,
+        lastName,
+        email: input.email,
+        phone: input.phone,
+        // Passwordless: a random secret nobody knows, so password sign-in can never match.
+        passwordHash: await this.passwords.hash(randomBytes(32).toString('base64url')),
+      });
+    }
+    return this.otp.issue({ key: AuthService.otpKey(user.id), purpose: 'verify-email', channel: 'email', to: user.email, userId: user.id });
+  }
+
+  /** Sign-in, step 1: emails a code to an existing account. */
+  async startSignIn(input: StartSignInDto): Promise<IssuedOtp> {
+    const user = await this.users.findByEmail(input.email);
+    if (!user) throw Errors.notFound('We could not find an account with that email. Sign up instead.', 'USER_NOT_FOUND');
+    this.assertCanSignIn(user);
+    // An account that never confirmed its email gets the sign-up code; entering it confirms and signs in.
+    const purpose = user.emailVerified ? 'sign-in' : 'verify-email';
+    return this.otp.issue({ key: AuthService.otpKey(user.id), purpose, channel: 'email', to: user.email, userId: user.id });
+  }
+
+  /** Step 2 for both: a correct code signs the person in (and confirms the email on sign-up). */
+  async verifyCode(input: VerifyCodeDto, meta: SessionMeta): Promise<AuthResult> {
+    const user = await this.users.findByEmail(input.email);
+    if (!user) throw Errors.badRequest('That code has expired. Request a new one.', 'OTP_EXPIRED');
+    this.assertCanSignIn(user);
+    const purpose = user.emailVerified ? 'sign-in' : 'verify-email';
+    await this.otp.verify({ key: AuthService.otpKey(user.id), purpose, code: input.code });
+    if (!user.emailVerified) {
+      await this.users.update(user.id, { emailVerified: true });
+      void this.mail.send(user.email, {
+        subject: 'Welcome to DOOAA',
+        heading: `Welcome, ${user.firstName}!`,
+        paragraphs: [
+          'Your email is confirmed and your account is ready.',
+          'Every purchase on DOOAA can be held in escrow until you confirm the item arrived as described — keep payments and chats on DOOAA so we can protect you.',
+        ],
+        cta: { label: 'Start exploring', url: this.config.clientUrl },
+      });
+    }
+    await this.users.recordSignIn(user.id);
+    const tokens = await this.tokens.issue('user', user.id, user.tokenVersion, meta);
+    return { user: toPublicUser(await this.users.getById(user.id)), tokens };
   }
 
   /** Closed and banned accounts cannot start a session, whatever the sign-in method. */

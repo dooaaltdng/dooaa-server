@@ -1,3 +1,4 @@
+import { explain } from '../util/explain-error';
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import type { Response } from 'express';
 import { AppError } from './app-error';
@@ -114,9 +115,11 @@ export class AllExceptionsFilter implements ExceptionFilter {
   catch(exception: unknown, host: ArgumentsHost): void {
     if (host.getType() !== 'http') return;
     const response = host.switchToHttp().getResponse<Response>();
+    const request = host.switchToHttp().getRequest<{ method?: string; originalUrl?: string }>();
     const { status, body } = toFailure(exception);
     if (status >= 500) {
-      this.logger.error(exception instanceof Error ? exception.stack ?? exception.message : String(exception));
+      const stack = exception instanceof Error ? exception.stack ?? '' : '';
+      this.logger.error(`${explain(`A request to ${request.method} ${request.originalUrl} crashed and the user got an error`, exception)}${stack ? `\n${stack}` : ''}`);
     }
     if (response.headersSent) return;
     response.status(status).json(body);

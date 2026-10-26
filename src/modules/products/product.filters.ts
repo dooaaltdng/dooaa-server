@@ -2,6 +2,7 @@ import type { Sort } from 'mongodb';
 import { CONDITIONS, PRICE_BANDS, type Condition, type PriceBand, type SortKey } from '../../common/domain';
 import { containsText, type Where } from '../../database/database';
 import type { ProductRow } from '../../database/schema';
+import { expandSearch } from './search-synonyms';
 
 /** What a buyer can see: live, not deleted. */
 export const PUBLIC_PRODUCT_FILTER = { status: 'active', deletedAt: null } as const satisfies Where<ProductRow>;
@@ -40,6 +41,7 @@ export function sellerVerificationFilter(values: string[] | undefined): boolean 
   return verified === unverified ? null : verified;
 }
 
+
 /** The search term as the catalog uses it: trimmed and bounded. */
 export function searchTerm(query: Pick<CatalogQuery, 'q'>): string | undefined {
   return query.q?.trim().slice(0, 80) || undefined;
@@ -55,7 +57,8 @@ export function buildCatalogFilter(query: CatalogQuery, mode: SearchMode = 'text
   const and: Where<ProductRow>[] = [];
 
   const term = searchTerm(query);
-  if (term && mode === 'text') filter.$text = { $search: term };
+  // Synonyms widen the full-text match ("phone" also finds Galaxy and Tecno listings); ranking still uses textScore.
+  if (term && mode === 'text') filter.$text = { $search: expandSearch(term) };
   if (term && mode === 'partial') {
     const match = containsText(term);
     and.push({ $or: [{ title: match }, { brand: match }, { summary: match }, { location: match }] });
@@ -63,7 +66,8 @@ export function buildCatalogFilter(query: CatalogQuery, mode: SearchMode = 'text
 
   if (query.category?.length) filter.categoryId = { $in: query.category };
   if (query.collection === 'featured') filter.featured = true;
-  if (query.collection === 'top-sellers') filter.statsUnitsSold = { $gt: 0 };
+  // Top sellers lists everything, best-selling first (see the sort); popular needs a cart add or a sale.
+  if (query.collection === 'popular') filter.statsPopularity = { $gt: 0 };
 
   if (query.condition?.length) {
     const conditionValues = query.condition.map(normalizeCondition).filter((value): value is Condition => Boolean(value));
@@ -116,7 +120,7 @@ export function catalogSort(query: CatalogQuery, mode: SearchMode): Sort {
       break;
   }
   if (query.collection === 'top-sellers') return { statsUnitsSold: -1, statsRatingAverage: -1, _id: -1 };
-  if (query.collection === 'popular') return { statsViews: -1, statsWishlists: -1, _id: -1 };
+  if (query.collection === 'popular') return { statsPopularity: -1, statsUnitsSold: -1, statsViews: -1, _id: -1 };
   const term = searchTerm(query);
   if (mode === 'text' && term) return { score: { $meta: 'textScore' }, _id: -1 };
   return { featured: -1, publishedAt: -1, createdAt: -1, _id: -1 };

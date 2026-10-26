@@ -10,6 +10,7 @@ import { media } from '../../database/schema';
 import { sniff } from './sniff';
 import { CLOUDINARY_ALLOWED_FORMATS, CLOUDINARY_DIRECT_UPLOAD_TTL_SECONDS } from './storage/cloudinary.storage';
 import { STORAGE_DRIVER, type DirectUploadTicket, type StorageDriver, type StoredObject } from './storage/storage.driver';
+import { explain } from '../../common/util/explain-error';
 
 export type UploadedFile = { buffer: Buffer; originalname: string; size: number; mimetype?: string };
 export type MediaRecord = typeof media.$inferSelect;
@@ -133,7 +134,7 @@ export class MediaService {
     try {
       stored = await this.storage.put(storageKey, file.buffer, detected.mime, visibility);
     } catch (error) {
-      this.logger.error(`Storage upload failed: ${(error as Error).message}`);
+      this.logger.error(explain('Could not upload the file to Cloudinary (file storage)', error));
       throw Errors.badGateway('We could not store that file. Please try again.', 'STORAGE_ERROR');
     }
     return this.record({
@@ -329,7 +330,7 @@ export class MediaService {
     const record = isUuid(id) ? await this.db.findOne(media, { id, ownerId: owner.id, ownerType: owner.type }) : null;
     if (!record) throw Errors.notFound();
     await this.storage.delete(record.storageKey, record.visibility, record.mimeType).catch((error) => {
-      this.logger.warn(`Could not delete ${record.storageKey}: ${(error as Error).message}`);
+      this.logger.warn(explain(`Could not delete the file ${record.storageKey} from Cloudinary (file storage)`, error));
     });
     await this.db.delete(media, { id });
     return { deleted: true };

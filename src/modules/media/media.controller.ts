@@ -25,7 +25,7 @@ import { MediaService, type UploadedFile as Upload } from './media.service';
 /** Purposes a marketplace account may upload for. */
 const USER_PURPOSES: MediaPurpose[] = ['product', 'avatar', 'kyc', 'message', 'evidence', 'support', 'meetup', 'shipment'];
 /** Purposes the console uploads for. */
-const STAFF_PURPOSES: MediaPurpose[] = ['product', 'content', 'message', 'evidence'];
+const STAFF_PURPOSES: MediaPurpose[] = ['product', 'content', 'message', 'evidence', 'avatar'];
 
 class UploadBodyDto {
   @IsIn(USER_PURPOSES) purpose: MediaPurpose;

@@ -22,6 +22,7 @@ import type { EscrowState } from './dto/orders.dto';
 import { toOrder, type Order, type OrderRow } from './order.model';
 import { HELD_PHASES, phasesLeadingTo } from './order-state';
 import { toBuyerOrderView, toSellerOrderView, type BuyerOrderView, type SellerOrderView } from './order.presenter';
+import { explain } from '../../common/util/explain-error';
 
 export const ORDER_EVENTS = { updated: 'order.updated' } as const;
 
@@ -701,7 +702,7 @@ export class OrdersService implements OnModuleInit {
         await this.releaseEscrow(order, { kind: 'system', name: 'Auto-release' }, 'released', 'Inspection period ended');
         released += 1;
       } catch (error) {
-        this.logger.warn(`Auto-release skipped ${order.reference}: ${(error as Error).message}`);
+        this.logger.warn(explain(`Could not automatically release the money for order ${order.reference}; it will be tried again`, error));
       }
     }
     return released;
@@ -719,7 +720,7 @@ export class OrdersService implements OnModuleInit {
         await this.refundEscrow(order, { kind: 'system', name: 'Dispatch deadline' }, 'The seller did not ship the order in time.', ['funded']);
         cancelled += 1;
       } catch (error) {
-        this.logger.warn(`Overdue cancel skipped ${order.reference}: ${(error as Error).message}`);
+        this.logger.warn(explain(`Could not cancel overdue order ${order.reference}; it will be tried again`, error));
       }
     }
     return cancelled;

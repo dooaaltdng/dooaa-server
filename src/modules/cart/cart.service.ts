@@ -134,6 +134,8 @@ export class CartService {
     await this.assertBuyable(user, productId, next);
     if (!existing && cart.lines.length >= MAX_LINES) throw Errors.conflict('Your cart is full. Check out or remove something first.', 'CART_FULL');
     await this.db.upsert(cartItems, { userId: user.id, productId }, { quantity: next });
+    // A new line (not a quantity bump) counts towards the product's Popular ranking.
+    if (!existing) void this.products.recordCartAdd(productId).catch(() => undefined);
     return this.view(user);
   }
 

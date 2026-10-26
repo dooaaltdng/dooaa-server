@@ -1,5 +1,5 @@
 import type { IdentityStatus, NotificationPrefs, UserRole } from '../../common/domain';
-import { DEFAULT_NOTIFICATION_PREFS } from '../../common/domain';
+import { ALWAYS_ON_NOTIFICATIONS, DEFAULT_NOTIFICATION_PREFS } from '../../common/domain';
 import type { User } from './user.model';
 
 /** The signed-in account as the client renders it (`PublicUser` in its auth api). */
@@ -41,7 +41,7 @@ export function toPublicUser(user: User): PublicUser {
     gender: user.gender ?? null,
     location: user.location ?? null,
     storeName: user.seller.storeName,
-    notificationPrefs: { ...DEFAULT_NOTIFICATION_PREFS, ...(user.notificationPrefs ?? {}) },
+    notificationPrefs: { ...DEFAULT_NOTIFICATION_PREFS, ...(user.notificationPrefs ?? {}), ...ALWAYS_ON_NOTIFICATIONS },
     createdAt: new Date(user.createdAt).toISOString(),
   };
 }

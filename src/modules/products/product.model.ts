@@ -14,6 +14,8 @@ export type ProductStats = {
   /** Conversations started about the listing — the console's "inquiries". */
   inquiries: number;
   wishlists: number;
+  cartAdds: number;
+  popularity: number;
   unitsSold: number;
   revenue: number;
   lastSaleAt: Date | null;
@@ -98,6 +100,8 @@ export function toProduct(row: ProductRow): Product {
       views: row.statsViews,
       inquiries: row.statsInquiries,
       wishlists: row.statsWishlists,
+      cartAdds: row.statsCartAdds ?? 0,
+      popularity: row.statsPopularity ?? 0,
       unitsSold: row.statsUnitsSold,
       revenue: row.statsRevenue,
       lastSaleAt: row.statsLastSaleAt,

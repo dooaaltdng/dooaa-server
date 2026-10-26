@@ -1,5 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { CACHE_STORE, type CacheStore } from './cache.store';
+import { explain } from '../common/util/explain-error';
 
 const DATE_TAG = '$date';
 
@@ -103,6 +104,6 @@ export class CacheService {
   private warn(action: string, error: unknown): void {
     if (Date.now() - this.lastWarning < 60_000) return;
     this.lastWarning = Date.now();
-    this.logger.warn(`Cache ${action} failed, using the database: ${(error as Error).message}`);
+    this.logger.warn(explain(`Could not ${action} the cache, so the database was used instead`, error));
   }
 }

@@ -13,12 +13,20 @@ import { AuditService } from '../audit/audit.service';
 import { PrincipalService } from '../auth/principal.service';
 import { TokenService, type SessionMeta, type TokenPair } from '../auth/token.service';
 import { MailService } from '../mail/mail.service';
+import { MediaService } from '../media/media.service';
+import { OtpService, type IssuedOtp } from '../otp/otp.service';
 import { PasswordService } from '../users/password.service';
 import { PRESENCE, PresenceRegistry } from './presence';
 import { staffOmit, toStaff, type StaffMember } from './staff.model';
 import { toStaffSession, type StaffSession } from './staff.presenter';
 
 const INVITE_TTL_DAYS = 7;
+/** How long the reset token handed out after a correct code stays usable. */
+const RESET_TOKEN_MINUTES = 15;
+/** OTP context that keeps console reset codes apart from marketplace ones. */
+const STAFF_OTP_CONTEXT = 'staff';
+/** The one message every failed forgot-password step shows, so it never says why. */
+const RESET_FAILED = "We couldn't complete that request.";
 
 function hashInvite(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -33,6 +41,8 @@ export class StaffService {
     private readonly principals: PrincipalService,
     private readonly audit: AuditService,
     private readonly mail: MailService,
+    private readonly otp: OtpService,
+    private readonly media: MediaService,
     @Inject(PRESENCE) private readonly presence: PresenceRegistry,
     @InjectConfig() private readonly config: AppConfig,
   ) {}
@@ -88,6 +98,23 @@ export class StaffService {
     const member = await this.findById(actor.id);
     if (!member) throw Errors.unauthorized();
     return this.session(member);
+  }
+
+  /** Your own name. Role, email and title stay with a superadmin. */
+  async updateOwnProfile(actor: AuthStaff, input: { firstName: string; lastName: string }): Promise<StaffSession> {
+    const updated = await this.db.update(staff, { id: actor.id }, { firstName: input.firstName, lastName: input.lastName });
+    if (!updated) throw Errors.unauthorized();
+    await this.principals.invalidateStaff(actor.id);
+    return this.session(toStaff(updated));
+  }
+
+  /** Your own photo: a URL you uploaded with purpose "avatar", or null to remove it. */
+  async setOwnAvatar(actor: AuthStaff, url: string | null): Promise<StaffSession> {
+    if (url) await this.media.assertOwnedUrls([url], { id: actor.id, type: 'staff' }, ['avatar']);
+    const updated = await this.db.update(staff, { id: actor.id }, { avatarUrl: url });
+    if (!updated) throw Errors.unauthorized();
+    await this.principals.invalidateStaff(actor.id);
+    return this.session(toStaff(updated));
   }
 
   /** The whole team: active and invited members by seniority, then anyone removed (so they can be restored). */
@@ -218,6 +245,58 @@ export class StaffService {
     }
     const tokens = await this.tokens.issue('staff', member.id, member.tokenVersion, meta);
     return { session: this.session(member), tokens };
+  }
+
+  /**
+   * Forgot password, step 1: emails a 6-digit code to a console account.
+   * Invited members may use it too (it doubles as accepting the invitation);
+   * unknown and disabled addresses get the same bare failure.
+   */
+  async requestPasswordReset(rawEmail: string): Promise<IssuedOtp> {
+    const email = normalizeEmail(rawEmail);
+    const member = await this.db.findOne(staff, { email, status: { $in: ['active', 'invited'] } });
+    if (!member) throw Errors.badRequest(RESET_FAILED, 'RESET_FAILED');
+    return this.otp.issue({ key: email, purpose: 'reset-password', channel: 'email', to: email, context: STAFF_OTP_CONTEXT });
+  }
+
+  /**
+   * Step 2: a correct code is swapped for a short-lived reset token, stored
+   * like a reset link so step 3 can reuse the same one-time check.
+   */
+  async verifyResetCode(rawEmail: string, code: string): Promise<{ resetToken: string; expiresAt: string }> {
+    const email = normalizeEmail(rawEmail);
+    const member = await this.db.findOne(staff, { email, status: { $in: ['active', 'invited'] } });
+    if (!member) throw Errors.badRequest(RESET_FAILED, 'RESET_FAILED');
+    await this.otp.verify({ key: email, purpose: 'reset-password', code, context: STAFF_OTP_CONTEXT });
+    const token = randomBytes(32).toString('base64url');
+    const expiresAt = new Date(Date.now() + RESET_TOKEN_MINUTES * 60_000);
+    await this.db.update(staff, { id: member.id }, { inviteTokenHash: hashInvite(token), inviteExpiresAt: expiresAt });
+    return { resetToken: token, expiresAt: expiresAt.toISOString() };
+  }
+
+  /**
+   * Step 3: sets the new password and ends every session. It does not sign in;
+   * the console sends the member back to the sign-in page.
+   */
+  async resetPassword(token: string, password: string): Promise<{ reset: true }> {
+    const current = await this.byLinkToken(token);
+    if (!current) throw Errors.badRequest('This reset has expired. Start again.', 'RESET_EXPIRED');
+    const updated = await this.db.update(
+      staff,
+      { id: current.id, inviteTokenHash: hashInvite(token) },
+      {
+        $set: { status: 'active', passwordHash: await this.passwords.hash(password), failedSignIns: 0, lockedUntil: null, inviteTokenHash: null, inviteExpiresAt: null },
+        $inc: { tokenVersion: 1 },
+      },
+    );
+    if (!updated) throw Errors.badRequest('This reset has expired. Start again.', 'RESET_EXPIRED');
+    await this.principals.invalidateStaff(current.id);
+    await this.tokens.revokeAll('staff', current.id);
+    await this.audit.record(
+      { kind: 'system', name: `${current.firstName} ${current.lastName}` },
+      { action: 'Reset their console password with an emailed code', target: current.email, targetType: 'staff', targetId: current.id },
+    );
+    return { reset: true };
   }
 
   /**

@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Errors } from '../../common/api/app-error';
-import { DEFAULT_NOTIFICATION_PREFS, type NotificationPrefKey, type NotificationTone, type SubjectType } from '../../common/domain';
+import { ALWAYS_ON_NOTIFICATIONS, DEFAULT_NOTIFICATION_PREFS, type NotificationPrefKey, type NotificationTone, type SubjectType } from '../../common/domain';
 import { pageWindow, toPage, type Page } from '../../common/util/pagination';
 import { isUuid } from '../../common/util/uuid';
 import { InjectDb, type Database, type Where } from '../../database/database';
@@ -10,6 +10,7 @@ import type { MailContent } from '../mail/mail.templates';
 import { SERVER_EVENTS } from '../realtime/realtime.events';
 import { RealtimeService } from '../realtime/realtime.service';
 import { SmsService } from '../sms/sms.service';
+import { explain } from '../../common/util/explain-error';
 
 export type NotifyInput = {
   type: string;
@@ -77,7 +78,7 @@ export class NotificationsService {
     if (!isUuid(userId)) return null;
     const user = await this.db.findOne(users, { id: userId });
     if (!user || user.status === 'closed') return null;
-    const prefs = { ...DEFAULT_NOTIFICATION_PREFS, ...user.notificationPrefs };
+    const prefs = { ...DEFAULT_NOTIFICATION_PREFS, ...user.notificationPrefs, ...ALWAYS_ON_NOTIFICATIONS };
     const category = input.category ?? 'transactional';
 
     const created = await this.db.insert(notifications, {
@@ -101,7 +102,7 @@ export class NotificationsService {
 
   async notifyUsers(userIds: string[], input: NotifyInput): Promise<void> {
     for (const id of userIds) {
-      await this.notifyUser(id, input).catch((error) => this.logger.warn(`Notify ${id} failed: ${(error as Error).message}`));
+      await this.notifyUser(id, input).catch((error) => this.logger.warn(explain(`Could not send a notification to user ${id}`, error)));
     }
   }
 

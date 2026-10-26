@@ -18,6 +18,7 @@ import { SettingsService } from '../settings/settings.service';
 import type { User } from '../users/user.model';
 import { UsersService } from '../users/users.service';
 import type { CreateProductDto, SellerStatusFilter, UpdateProductDto } from './dto/product.dto';
+import { expandSearch } from './search-synonyms';
 import { PUBLIC_PRODUCT_FILTER, buildCatalogFilter, catalogSort, searchTerm, type CatalogQuery, type SearchMode } from './product.filters';
 import { toProduct, type Product } from './product.model';
 import {
@@ -187,13 +188,29 @@ export class ProductsService {
   }
 
   /** Header search-as-you-type: words in titles and brands that start with what was typed. */
-  async suggest(q: string): Promise<{ id: string; title: string; categoryId: string; image: string | null }[]> {
-    const startsWord = { $regex: `(^|\\s)${escapeRegex(q.trim())}`, $options: 'i' };
-    const rows = await this.db.find(products, and(PUBLIC_PRODUCT_FILTER, or({ title: startsWord }, { brand: startsWord })), {
-      sort: { statsViews: -1, id: -1 },
-      limit: 8,
-    });
-    return rows.map((row) => ({ id: row.id, title: row.title, categoryId: row.categoryId, image: row.images[0] ?? null }));
+  /**
+   * Type-ahead: up to three matching categories, then up to eight products.
+   * Both match the start of any word, including the term's synonyms, so
+   * "phone" suggests Gadgets and the Galaxy and Tecno listings.
+   */
+  async suggest(q: string): Promise<{ kind: 'category' | 'product'; id: string; title: string; categoryId: string; image: string | null }[]> {
+    const words = expandSearch(q.trim()).split(' ').filter((word) => word.length >= 2).slice(0, 12);
+    if (!words.length) return [];
+    const startsWord = { $regex: `(^|[\\s(-])(${words.map(escapeRegex).join('|')})`, $options: 'i' };
+    const [rows, categoryRows] = await Promise.all([
+      this.db.find(products, and(PUBLIC_PRODUCT_FILTER, or({ title: startsWord }, { brand: startsWord })), { sort: { statsViews: -1, id: -1 }, limit: 8 }),
+      this.categories.list(),
+    ]);
+    const typed = new RegExp(`(^|[\\s&-])(${words.map(escapeRegex).join('|')})`, 'i');
+    const productCategories = new Set(rows.map((row) => row.categoryId));
+    const categories = categoryRows
+      .filter((category) => typed.test(category.name) || (productCategories.has(category.slug) && rows.filter((row) => row.categoryId === category.slug).length >= 2))
+      .slice(0, 3)
+      .map((category) => ({ kind: 'category' as const, id: category.slug, title: category.name, categoryId: category.slug, image: category.image || null }));
+    return [
+      ...categories,
+      ...rows.map((row) => ({ kind: 'product' as const, id: row.id, title: row.title, categoryId: row.categoryId, image: row.images[0] ?? null })),
+    ];
   }
 
   /** The landing page: category tiles and the three rails. */
@@ -203,7 +220,9 @@ export class ProductsService {
       const [topSellers, featuredFlagged, popular] = await Promise.all([
         this.select(base, [desc(products.statsUnitsSold), desc(products.statsRatingAverage), descNullsLast(products.publishedAt)], 8),
         this.select(and(base, eq(products.featured, true)), [descNullsLast(products.publishedAt)], 8),
-        this.select(base, [desc(products.statsViews), desc(products.statsWishlists), descNullsLast(products.publishedAt)], 8),
+        // Popular = most added to cart + most bought (statsPopularity); only products with some of either count.
+        // The landing page shows the rail once more than three qualify.
+        this.select(and(base, gt(products.statsPopularity, 0)), [desc(products.statsPopularity), desc(products.statsUnitsSold), desc(products.statsViews)], 8),
       ]);
       // Until enough listings are curated, the Featured rail tops up with the newest verified ones.
       let featured = featuredFlagged;
@@ -226,20 +245,38 @@ export class ProductsService {
     return { categories: categoryTiles, topSellers, featured, popular };
   }
 
-  async detail(id: string, viewer?: Viewer): Promise<ProductDetail & { alsoViewed: ProductCard[] }> {
+  /**
+   * How this listing is bought, decided here so every client agrees:
+   *  - "direct": DOOAA's own listings — Buy Now, DOOAA delivers.
+   *  - "escrow": a marketplace seller while escrow is on — pay into escrow,
+   *    the seller ships, the buyer confirms and the money is released.
+   *  - "contact": a marketplace seller while escrow is off (Settings → Escrow
+   *    & Fees) — no platform payment; the buyer chats or calls the seller.
+   */
+  async purchaseMode(product: Pick<Product, 'listedAs'>): Promise<'direct' | 'escrow' | 'contact'> {
+    if (product.listedAs !== 'seller') return 'direct';
+    return (await this.settings.get()).escrow.enabled ? 'escrow' : 'contact';
+  }
+
+  async detail(id: string, viewer?: Viewer): Promise<ProductDetail & { alsoViewed: ProductCard[]; purchaseMode: 'direct' | 'escrow' | 'contact' }> {
     const product = await this.findPublic(id);
-    const [seller, categoryNames, wishlisted, related] = await Promise.all([
+    const [seller, categoryNames, wishlisted, related, purchaseMode] = await Promise.all([
       this.users.findById(product.sellerId),
       this.categories.names(),
       this.wishlistedSet(viewer, [product.id]),
       this.select(and(PUBLIC_PRODUCT_FILTER, eq(products.categoryId, product.categoryId), ne(products.id, product.id)), [desc(products.statsViews), descNullsLast(products.publishedAt)], 3),
+      this.purchaseMode(product),
     ]);
     if (!viewer || viewer.id !== product.sellerId) {
       void this.db.update(products, eq(products.id, product.id), { $inc: { statsViews: 1 } }).catch(() => undefined);
       this.events.publish<ProductViewed>(PRODUCT_EVENTS.viewed, { productId: product.id, sellerId: product.sellerId });
     }
+    const detail = toProductDetail(product, seller, { categoryNames, wishlisted });
     return {
-      ...toProductDetail(product, seller, { categoryNames, wishlisted }),
+      ...detail,
+      // Contact details are shared only when buyers deal with the seller directly (escrow off).
+      seller: purchaseMode === 'contact' ? { ...detail.seller, phone: seller?.phone || null } : detail.seller,
+      purchaseMode,
       alsoViewed: await this.toCards(related, viewer),
     };
   }
@@ -763,13 +800,18 @@ export class ProductsService {
     }
   }
 
+  /** A shopper put this product in their cart: counts towards Popular. */
+  async recordCartAdd(productId: string): Promise<void> {
+    await this.db.update(products, eq(products.id, productId), { $inc: { statsCartAdds: 1, statsPopularity: 1 } });
+  }
+
   async recordSale(productId: string, quantity: number, revenue: number, at: Date): Promise<void> {
-    await this.db.update(products, eq(products.id, productId), { $inc: { statsUnitsSold: quantity, statsRevenue: revenue }, $max: { statsLastSaleAt: at } });
+    await this.db.update(products, eq(products.id, productId), { $inc: { statsUnitsSold: quantity, statsPopularity: quantity, statsRevenue: revenue }, $max: { statsLastSaleAt: at } });
     await this.cache.delete(HOME_KEY);
   }
 
   async reverseSale(productId: string, quantity: number, revenue: number): Promise<void> {
-    await this.db.update(products, eq(products.id, productId), { $inc: { statsUnitsSold: -quantity, statsRevenue: -revenue } });
+    await this.db.update(products, eq(products.id, productId), { $inc: { statsUnitsSold: -quantity, statsPopularity: -quantity, statsRevenue: -revenue } });
   }
 
   async incrementInquiries(productId: string): Promise<void> {

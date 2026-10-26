@@ -626,16 +626,22 @@ describe('Cart, checkout, orders and escrow (e2e)', () => {
       const buyer = await registerUser(t);
       const product = await newProduct(sellerA);
       await paidOrder(t, buyer, product.id);
-      failure(await http.post('/me/close', { reason: "I'm not currently buying or selling anything", password: 'Dooaa@123' }, buyer.token), 409, 'OPEN_ORDERS');
+      data(await http.post('/me/close/code', {}, buyer.token));
+      const code = await codeFromMail(t, buyer.email);
+      failure(await http.post('/me/close', { reason: "I'm not currently buying or selling anything", code }, buyer.token), 409, 'OPEN_ORDERS');
     });
 
-    it('closes an idle account and signs it out everywhere', async () => {
+    it('deletes an idle account: confirmed by code, signed out everywhere, personal data erased', async () => {
       const user = await registerUser(t);
-      failure(await http.post('/me/close', { reason: 'Not a listed reason', password: 'Dooaa@123' }, user.token), 400, 'VALIDATION_FAILED');
-      failure(await http.post('/me/close', { reason: "I don't recall creating an account", password: 'Wrong@123' }, user.token), 400, 'INVALID_PASSWORD');
-      data(await http.post('/me/close', { reason: "I don't recall creating an account", notes: 'Testing', password: 'Dooaa@123' }, user.token));
+      data(await http.post('/me/close/code', {}, user.token));
+      const code = await codeFromMail(t, user.email);
+      failure(await http.post('/me/close', { reason: 'Not a listed reason', code }, user.token), 400, 'VALIDATION_FAILED');
+      failure(await http.post('/me/close', { reason: "I don't recall creating an account", code: '000000' === code ? '111111' : '000000' }, user.token), 400, 'OTP_INVALID');
+      data(await http.post('/me/close', { reason: "I don't recall creating an account", notes: 'Testing', code }, user.token));
       failure(await http.get('/me', user.token), 401, 'ACCOUNT_CLOSED');
-      failure(await http.post('/auth/sign-in', { email: user.email, password: 'Dooaa@123' }), 401, 'ACCOUNT_CLOSED');
+      // The email is freed: nothing signs in with it, and it can sign up again.
+      failure(await http.post('/auth/code/sign-in', { email: user.email }), 404, 'USER_NOT_FOUND');
+      data(await http.post('/auth/code/sign-up', { name: 'Fresh Start', email: user.email, phone: '08035550199', acceptedTerms: true }));
     });
   });
 });

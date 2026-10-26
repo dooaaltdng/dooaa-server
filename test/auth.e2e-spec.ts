@@ -207,6 +207,22 @@ describe('Auth (e2e)', () => {
     });
   });
 
+  describe('profile', () => {
+    it('emails the account holder when their phone number changes', async () => {
+      const user = await registerUser(t);
+      await t.mail.idle();
+      data(await http.patch('/me', { location: 'Ikeja, Lagos' }, user.token));
+      await t.mail.idle();
+      expect(t.mail.lastTo(user.email)?.subject).not.toBe('Your DOOAA phone number was changed');
+
+      data(await http.patch('/me', { phone: uniquePhone() }, user.token));
+      await t.mail.idle();
+      const mail = t.mail.lastTo(user.email);
+      expect(mail?.subject).toBe('Your DOOAA phone number was changed');
+      expect(mail?.text).toContain('If this was not you');
+    });
+  });
+
   describe('sign in', () => {
     it('signs in case-insensitively and records the login', async () => {
       const user = await registerUser(t);

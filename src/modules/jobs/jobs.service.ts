@@ -8,6 +8,7 @@ import { notifications, oauthGrants, otps, providerEvents, sessions, visitorDays
 import { OrdersService } from '../orders/orders.service';
 import { PaymentsService } from '../payments/payments.service';
 import { SettingsService } from '../settings/settings.service';
+import { explain } from '../../common/util/explain-error';
 
 type JobName = 'payments' | 'escrow' | 'housekeeping';
 
@@ -87,7 +88,7 @@ export class JobsService implements OnApplicationBootstrap, OnModuleDestroy {
       this.logger.debug(`Job ${name}: ${JSON.stringify(result)}`);
       return result;
     } catch (error) {
-      this.logger.error(`Job ${name} failed: ${(error as Error).message}`);
+      this.logger.error(explain(`The background task "${name}" failed; it will run again on its next schedule`, error));
       return { error: (error as Error).message };
     } finally {
       this.running.delete(name);

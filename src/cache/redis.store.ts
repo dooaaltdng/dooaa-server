@@ -1,6 +1,7 @@
 import { Logger } from '@nestjs/common';
 import Redis from 'ioredis';
 import type { CacheStore } from './cache.store';
+import { explain } from '../common/util/explain-error';
 
 /**
  * The Redis-backed cache store. Commands fail fast while Redis is
@@ -20,13 +21,13 @@ export class RedisCacheStore implements CacheStore {
       maxRetriesPerRequest: 1,
       connectTimeout: 5_000,
     });
-    this.client.on('error', (error: Error) => this.logError(`Redis error: ${error.message}`));
+    this.client.on('error', (error: Error) => this.logError(explain('Cannot reach Redis (the cache server), so caching is off and requests are served from the database', error)));
     this.client.on('ready', () => this.logger.log('Connected to Redis'));
   }
 
   /** Connects at boot. A failure is logged, not thrown: the app serves from the database meanwhile. */
   async connect(): Promise<void> {
-    await this.client.connect().catch((error: Error) => this.logError(`Redis unavailable, caching is off until it reconnects: ${error.message}`));
+    await this.client.connect().catch((error: Error) => this.logError(explain('Could not connect to Redis (the cache server) at startup; caching stays off until it reconnects', error)));
   }
 
   async get(key: string): Promise<string | null> {

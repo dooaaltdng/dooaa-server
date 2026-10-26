@@ -19,6 +19,7 @@ import type {
   RefundResult,
   ResolvedAccount,
 } from './payment-provider';
+import { explain } from '../../../common/util/explain-error';
 
 export type BachsOptions = {
   secretKey: string;
@@ -123,7 +124,7 @@ export class BachsProvider implements PaymentProvider {
           await this.pause(RETRY_DELAYS_MS[attempt]);
           continue;
         }
-        this.logger.error(`${method} ${path} failed: ${(error as Error).message}`);
+        this.logger.error(explain(`Could not reach Bachs (the payment provider) for ${method} ${path}`, error));
         throw Errors.badGateway('The payment provider is not responding. Please try again.', 'PAYMENT_PROVIDER_UNAVAILABLE');
       }
 
@@ -138,7 +139,7 @@ export class BachsProvider implements PaymentProvider {
       if (!response.ok) {
         const detail = typeof payload?.detail === 'string' ? payload.detail : `HTTP ${response.status}`;
         const code = typeof payload?.error_code === 'string' ? payload.error_code : `HTTP_${response.status}`;
-        this.logger.warn(`${method} ${path} → ${response.status} ${code}: ${detail}${requestId ? ` (request ${requestId})` : ''}`);
+        this.logger.warn(`Bachs (the payment provider) refused ${method} ${path}: ${detail}. Details: HTTP ${response.status} ${code}${requestId ? `, request ${requestId}` : ''}`);
         throw new BachsError(response.status, code, detail, requestId);
       }
       return payload as T;

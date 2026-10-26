@@ -21,6 +21,10 @@ export type ProductCard = {
   createdAt: string;
   sellerId: string;
   verifiedSeller: boolean;
+  /** Listed by DOOAA itself (the official store or an admin), not a marketplace seller. */
+  official: boolean;
+  /** Picked by the console for the Featured rail. */
+  featured: boolean;
   stock: number;
   inStock: boolean;
   pricing: Product['pricing'];
@@ -43,6 +47,8 @@ export type SellerPanel = {
   /** "Typically responds within an hour". */
   response: string;
   location: string;
+  /** Only present while escrow is off and buyers deal with the seller directly. */
+  phone?: string | null;
   /** "Nationwide Delivery (1-3 business days within Lagos)". */
   delivery: string;
   rating: number;
@@ -91,6 +97,8 @@ export type SellerProductView = {
   revenue: number;
   views: number;
   wishlists: number;
+  /** Times buyers put it in their cart. */
+  cartAdds: number;
   lastSaleAt: string | null;
   createdAt: string;
   publishedAt: string | null;
@@ -143,7 +151,7 @@ function collectionsOf(product: Product): Collection[] {
   const out: Collection[] = [];
   if (product.featured) out.push('featured');
   if (product.stats.unitsSold > 0) out.push('top-sellers');
-  if (product.stats.views > 0) out.push('popular');
+  if (product.stats.popularity > 0) out.push('popular');
   return out;
 }
 
@@ -171,6 +179,8 @@ export function toProductCard(product: Product, context: PresenterContext): Prod
     createdAt: (product.publishedAt ?? product.createdAt).toISOString(),
     sellerId: product.sellerId,
     verifiedSeller: product.sellerVerified,
+    official: product.listedAs !== 'seller',
+    featured: product.featured,
     stock: product.stock,
     inStock: product.status === 'active' && product.stock > 0,
     pricing: product.pricing,
@@ -261,6 +271,7 @@ export function toSellerProduct(product: Product, categoryNames: Map<string, str
     revenue: product.stats.revenue,
     views: product.stats.views,
     wishlists: product.stats.wishlists,
+    cartAdds: product.stats.cartAdds,
     lastSaleAt: product.stats.lastSaleAt?.toISOString() ?? null,
     createdAt: product.createdAt.toISOString(),
     publishedAt: product.publishedAt?.toISOString() ?? null,

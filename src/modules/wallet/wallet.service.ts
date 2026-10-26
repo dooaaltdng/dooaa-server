@@ -16,6 +16,7 @@ import { PAYMENT_PROVIDER, type PaymentProvider } from '../payments/providers/pa
 import { SettingsService } from '../settings/settings.service';
 import { PasswordService } from '../users/password.service';
 import { UsersService } from '../users/users.service';
+import { explain } from '../../common/util/explain-error';
 
 export const WALLET_EVENTS = {
   payoutUpdated: 'wallet.payout-updated',
@@ -118,7 +119,7 @@ export class WalletService implements OnModuleInit {
     const commerce = await this.settings.section('commerce');
     if (commerce.autoPayout) {
       await this.startPayout(order.sellerId, earning.amount, undefined, true).catch((error: Error) =>
-        this.logger.warn(`Auto-payout for ${order.sellerId} not started: ${error.message}`),
+        this.logger.warn(explain(`The automatic payout to seller ${order.sellerId} did not start`, error)),
       );
     }
   }

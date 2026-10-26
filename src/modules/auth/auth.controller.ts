@@ -23,6 +23,9 @@ import {
   SignUpDto,
   VerifyOtpDto,
   VerifyPasswordDto,
+  StartSignInDto,
+  StartSignUpDto,
+  VerifyCodeDto,
 } from './dto/auth.dto';
 import type { TokenPair } from './token.service';
 
@@ -60,6 +63,32 @@ export class AuthController {
   @Post('sign-up')
   async signUp(@Body() body: SignUpDto, @RequestMeta() meta: RequestMetaValue, @Res({ passthrough: true }) response: Response) {
     const result = await this.auth.signUp(body, meta);
+    this.setRefreshCookie(response, result.tokens);
+    return result;
+  }
+
+  @Public()
+  @AuthThrottle()
+  @HttpCode(200)
+  @Post('code/sign-up')
+  startSignUp(@Body() body: StartSignUpDto) {
+    return this.auth.startSignUp(body);
+  }
+
+  @Public()
+  @AuthThrottle()
+  @HttpCode(200)
+  @Post('code/sign-in')
+  startSignIn(@Body() body: StartSignInDto) {
+    return this.auth.startSignIn(body);
+  }
+
+  @Public()
+  @AuthThrottle()
+  @HttpCode(200)
+  @Post('code/verify')
+  async verifyCode(@Body() body: VerifyCodeDto, @RequestMeta() meta: RequestMetaValue, @Res({ passthrough: true }) response: Response) {
+    const result = await this.auth.verifyCode(body, meta);
     this.setRefreshCookie(response, result.tokens);
     return result;
   }
