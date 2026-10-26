@@ -1,7 +1,6 @@
 import type { IdentityStatus, NotificationPrefs, UserRole } from '../../common/domain';
-import { DEFAULT_NOTIFICATION_PREFS } from '../../common/domain';
-import type { Lean } from '../../common/util/mongo';
-import type { User } from './schemas/user.schema';
+import { ALWAYS_ON_NOTIFICATIONS, DEFAULT_NOTIFICATION_PREFS } from '../../common/domain';
+import type { User } from './user.model';
 
 /** The signed-in account as the client renders it (`PublicUser` in its auth api). */
 export type PublicUser = {
@@ -25,13 +24,13 @@ export type PublicUser = {
   createdAt: string;
 };
 
-export function toPublicUser(user: Lean<User> | (User & { _id: unknown; createdAt: Date })): PublicUser {
+export function toPublicUser(user: User): PublicUser {
   return {
-    id: String(user._id),
+    id: user.id,
     firstName: user.firstName,
     lastName: user.lastName,
     email: user.email,
-    phone: user.phone ?? '',
+    phone: user.phone,
     role: user.role ?? null,
     verified: Boolean(user.emailVerified),
     phoneVerified: Boolean(user.phoneVerified),
@@ -41,8 +40,8 @@ export function toPublicUser(user: Lean<User> | (User & { _id: unknown; createdA
     avatarUrl: user.avatarUrl ?? null,
     gender: user.gender ?? null,
     location: user.location ?? null,
-    storeName: user.seller?.storeName ?? null,
-    notificationPrefs: { ...DEFAULT_NOTIFICATION_PREFS, ...(user.notificationPrefs ?? {}) },
+    storeName: user.seller.storeName,
+    notificationPrefs: { ...DEFAULT_NOTIFICATION_PREFS, ...(user.notificationPrefs ?? {}), ...ALWAYS_ON_NOTIFICATIONS },
     createdAt: new Date(user.createdAt).toISOString(),
   };
 }
@@ -61,17 +60,17 @@ export type SellerCard = {
   ratingCount: number;
 };
 
-export function toSellerCard(user: Lean<User>): SellerCard {
+export function toSellerCard(user: User): SellerCard {
   return {
-    id: String(user._id),
+    id: user.id,
     name: `${user.firstName} ${user.lastName}`.trim(),
-    storeName: user.seller?.storeName ?? null,
+    storeName: user.seller.storeName,
     avatarUrl: user.avatarUrl ?? null,
     verified: user.identity === 'verified',
     verificationLevel: user.verificationLevel,
     location: user.location ?? null,
     joinedAt: new Date(user.createdAt).toISOString(),
-    rating: user.stats?.ratingAverage ?? 0,
-    ratingCount: user.stats?.ratingCount ?? 0,
+    rating: user.stats.ratingAverage,
+    ratingCount: user.stats.ratingCount,
   };
 }

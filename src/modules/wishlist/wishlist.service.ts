@@ -1,12 +1,11 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
 import { Errors } from '../../common/api/app-error';
 import type { AuthUser } from '../../common/auth/principal';
 import { EventBus } from '../../common/events/event-bus';
-import { PRODUCT_EVENTS, ProductsService, type ProductRestocked } from '../products/products.service';
+import { InjectDb, isUniqueViolation, type Database } from '../../database/database';
+import { wishlistItems } from '../../database/schema';
 import type { ProductCard } from '../products/product.presenter';
-import { WishlistItem } from './wishlist.schema';
+import { PRODUCT_EVENTS, ProductsService, type ProductRestocked } from '../products/products.service';
 
 export const WISHLIST_EVENTS = { restockAlert: 'wishlist.restock-alert' } as const;
 export type RestockAlert = { userIds: string[]; productId: string; title: string };
@@ -14,7 +13,7 @@ export type RestockAlert = { userIds: string[]; productId: string; title: string
 @Injectable()
 export class WishlistService implements OnModuleInit {
   constructor(
-    @InjectModel(WishlistItem.name) private readonly items: Model<WishlistItem>,
+    @InjectDb() private readonly db: Database,
     private readonly products: ProductsService,
     private readonly events: EventBus,
   ) {}
@@ -24,63 +23,66 @@ export class WishlistService implements OnModuleInit {
   }
 
   async list(user: AuthUser): Promise<ProductCard[]> {
-    const rows = await this.items.find({ userId: new Types.ObjectId(user.id) }).sort({ createdAt: -1 }).limit(500).lean();
-    return this.products.cardsByIds(rows.map((row) => row.productId), user, true);
+    return this.products.cardsByIds(await this.ids(user, 500), user, true);
   }
 
-  async ids(user: AuthUser): Promise<string[]> {
-    const rows = await this.items.find({ userId: new Types.ObjectId(user.id) }).sort({ createdAt: -1 }).select('productId').lean();
-    return rows.map((row) => String(row.productId));
+  async ids(user: AuthUser, limit?: number): Promise<string[]> {
+    const rows = await this.db.find(wishlistItems, { userId: user.id }, { sort: { createdAt: -1 }, limit });
+    return rows.map((row) => row.productId);
   }
 
   async count(userId: string): Promise<number> {
-    return this.items.countDocuments({ userId: new Types.ObjectId(userId) });
+    return this.db.count(wishlistItems, { userId });
   }
 
   async add(user: AuthUser, productId: string): Promise<{ wishlisted: true; count: number }> {
     await this.products.findPublic(productId);
-    const result = await this.items.updateOne(
-      { userId: new Types.ObjectId(user.id), productId: new Types.ObjectId(productId) },
-      { $setOnInsert: { restockAlert: false } },
-      { upsert: true },
-    );
-    if (result.upsertedCount) await this.products.adjustWishlistCount(productId, 1);
+    const inserted = await this.db.insertIgnoringDuplicates(wishlistItems, [{ userId: user.id, productId }]);
+    if (inserted) await this.products.adjustWishlistCount(productId, 1);
     return { wishlisted: true, count: await this.count(user.id) };
   }
 
   async remove(user: AuthUser, productId: string): Promise<{ wishlisted: false; count: number }> {
-    const removed = await this.items.deleteOne({ userId: new Types.ObjectId(user.id), productId: new Types.ObjectId(productId) });
-    if (removed.deletedCount) await this.products.adjustWishlistCount(productId, -1);
+    const removed = await this.db.delete(wishlistItems, { userId: user.id, productId });
+    if (removed) await this.products.adjustWishlistCount(productId, -1);
     return { wishlisted: false, count: await this.count(user.id) };
   }
 
   async clear(user: AuthUser): Promise<{ cleared: number }> {
-    const rows = await this.items.find({ userId: new Types.ObjectId(user.id) }).select('productId').lean();
-    await this.items.deleteMany({ userId: new Types.ObjectId(user.id) });
-    await Promise.all(rows.map((row) => this.products.adjustWishlistCount(row.productId, -1)));
-    return { cleared: rows.length };
+    const removed = await this.db.find(wishlistItems, { userId: user.id });
+    await this.db.deleteMany(wishlistItems, { id: { $in: removed.map((row) => row.id) } });
+    await Promise.all(removed.map((row) => this.products.adjustWishlistCount(row.productId, -1)));
+    return { cleared: removed.length };
   }
 
   /** "Restock alerts on/off" for an item. Turning one on also saves the item. */
   async setRestockAlert(user: AuthUser, productId: string, on: boolean): Promise<{ restockAlert: boolean }> {
     const product = await this.products.findById(productId);
     if (!product) throw Errors.notFound('This item is no longer listed.', 'PRODUCT_NOT_FOUND');
-    const result = await this.items.updateOne(
-      { userId: new Types.ObjectId(user.id), productId: product._id },
-      { $set: { restockAlert: on } },
-      { upsert: on },
-    );
-    if (result.upsertedCount) await this.products.adjustWishlistCount(productId, 1);
+    if (on) {
+      const existing = await this.db.update(wishlistItems, { userId: user.id, productId: product.id }, { restockAlert: true });
+      if (!existing) {
+        try {
+          await this.db.insert(wishlistItems, { userId: user.id, productId: product.id, restockAlert: true });
+          await this.products.adjustWishlistCount(product.id, 1);
+        } catch (error) {
+          if (!isUniqueViolation(error)) throw error;
+          await this.db.update(wishlistItems, { userId: user.id, productId: product.id }, { restockAlert: true });
+        }
+      }
+    } else {
+      await this.db.update(wishlistItems, { userId: user.id, productId: product.id }, { restockAlert: false });
+    }
     return { restockAlert: on };
   }
 
   /** Tells everyone waiting on an item that it is back, once. */
   private async notifyRestock(event: ProductRestocked): Promise<void> {
-    const waiting = await this.items.find({ productId: new Types.ObjectId(event.productId), restockAlert: true }).select('userId').lean();
+    const waiting = await this.db.find(wishlistItems, { productId: event.productId, restockAlert: true });
+    await this.db.updateMany(wishlistItems, { id: { $in: waiting.map((row) => row.id) }, restockAlert: true }, { restockAlert: false });
     if (!waiting.length) return;
-    await this.items.updateMany({ productId: new Types.ObjectId(event.productId), restockAlert: true }, { $set: { restockAlert: false } });
     this.events.publish<RestockAlert>(WISHLIST_EVENTS.restockAlert, {
-      userIds: waiting.map((row) => String(row.userId)),
+      userIds: waiting.map((row) => row.userId),
       productId: event.productId,
       title: event.title,
     });

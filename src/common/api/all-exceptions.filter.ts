@@ -1,3 +1,4 @@
+import { explain } from '../util/explain-error';
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import type { Response } from 'express';
 import { AppError } from './app-error';
@@ -27,6 +28,18 @@ const FRIENDLY: Record<number, string> = {
 };
 
 type Failure = { status: number; body: ApiFailure };
+
+/** "users_email_key" on "users" → "email": unique constraints are named `<table>_<columns>_key`. */
+/** The duplicate-key index behind a MongoDB error ("users_email_key" → table "users", field "email"). */
+function duplicateKey(exception: unknown): { field?: string } | null {
+  const error = exception as { code?: unknown; errmsg?: unknown; message?: unknown; collection?: unknown } | null;
+  if (!error || (error.code !== 11000 && error.code !== 11001)) return null;
+  const message = String(error.errmsg ?? error.message ?? '');
+  const collection = /collection: [^.]+\.(\S+)/.exec(message)?.[1];
+  const index = /index: (\S+)/.exec(message)?.[1];
+  if (!collection || !index || !index.startsWith(`${collection}_`) || !index.endsWith('_key')) return {};
+  return { field: index.slice(collection.length + 1, -'_key'.length).replace(/_/g, ' ') || undefined };
+}
 
 function messageOf(response: unknown, fallback: string): string {
   if (typeof response === 'string') return response;
@@ -61,10 +74,9 @@ export function toFailure(exception: unknown): Failure {
     return { status, body: { ok: false, error: message, code: STATUS_CODE[status] ?? 'ERROR' } };
   }
 
-  const error = exception as { name?: string; code?: number | string; keyValue?: Record<string, unknown>; path?: string; errors?: Record<string, { message: string }> };
-
-  if (error?.code === 11000) {
-    const field = Object.keys(error.keyValue ?? {})[0];
+  const duplicate = duplicateKey(exception);
+  if (duplicate) {
+    const field = duplicate.field;
     return {
       status: HttpStatus.CONFLICT,
       body: {
@@ -76,20 +88,7 @@ export function toFailure(exception: unknown): Failure {
     };
   }
 
-  if (error?.name === 'CastError') {
-    return {
-      status: HttpStatus.BAD_REQUEST,
-      body: { ok: false, error: `Invalid ${error.path ?? 'value'}.`, code: 'INVALID_ID' },
-    };
-  }
-
-  if (error?.name === 'ValidationError' && error.errors) {
-    const details = Object.entries(error.errors).map(([field, value]) => ({ field, messages: [value.message] }));
-    return {
-      status: HttpStatus.BAD_REQUEST,
-      body: { ok: false, error: details[0]?.messages[0] ?? 'Validation failed.', code: 'VALIDATION_FAILED', details },
-    };
-  }
+  const error = exception as { name?: string; code?: number | string };
 
   if (error?.name === 'MulterError') {
     const tooLarge = error.code === 'LIMIT_FILE_SIZE';
@@ -116,9 +115,11 @@ export class AllExceptionsFilter implements ExceptionFilter {
   catch(exception: unknown, host: ArgumentsHost): void {
     if (host.getType() !== 'http') return;
     const response = host.switchToHttp().getResponse<Response>();
+    const request = host.switchToHttp().getRequest<{ method?: string; originalUrl?: string }>();
     const { status, body } = toFailure(exception);
     if (status >= 500) {
-      this.logger.error(exception instanceof Error ? exception.stack ?? exception.message : String(exception));
+      const stack = exception instanceof Error ? exception.stack ?? '' : '';
+      this.logger.error(`${explain(`A request to ${request.method} ${request.originalUrl} crashed and the user got an error`, exception)}${stack ? `\n${stack}` : ''}`);
     }
     if (response.headersSent) return;
     response.status(status).json(body);

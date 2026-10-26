@@ -1,17 +1,23 @@
 import { Injectable } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
 import { Errors } from '../../common/api/app-error';
 import type { AuthUser } from '../../common/auth/principal';
-import type { Lean } from '../../common/util/mongo';
+import { isUuid } from '../../common/util/uuid';
+import { InjectDb, type Database } from '../../database/database';
+import { cartItems, carts, type DeliveryInfo } from '../../database/schema';
 import { CouponsService } from '../coupons/coupons.service';
 import { priceCart, type PricingSettings } from '../orders/pricing';
-import { ProductsService } from '../products/products.service';
 import type { ProductCard } from '../products/product.presenter';
-import { Product } from '../products/schemas/product.schema';
+import { ProductsService } from '../products/products.service';
 import { SettingsService } from '../settings/settings.service';
-import { Cart, type DeliveryInfo } from './cart.schema';
 import type { DeliveryInfoDto } from './dto/cart.dto';
+
+/** A buyer's cart: its lines in the order they were added, the coupon and the delivery details. */
+export type Cart = {
+  userId: string;
+  lines: { productId: string; quantity: number; addedAt: Date }[];
+  couponCode: string | null;
+  delivery: DeliveryInfo | null;
+};
 
 const MAX_LINES = 50;
 
@@ -52,18 +58,20 @@ export async function pricingSettings(settings: SettingsService): Promise<Pricin
 @Injectable()
 export class CartService {
   constructor(
-    @InjectModel(Cart.name) private readonly carts: Model<Cart>,
-    @InjectModel(Product.name) private readonly productModel: Model<Product>,
+    @InjectDb() private readonly db: Database,
     private readonly products: ProductsService,
     private readonly coupons: CouponsService,
     private readonly settings: SettingsService,
   ) {}
 
-  private async load(userId: string): Promise<Lean<Cart>> {
-    const cart = await this.carts
-      .findOneAndUpdate({ userId: new Types.ObjectId(userId) }, { $setOnInsert: { lines: [] } }, { upsert: true, returnDocument: 'after' })
-      .lean<Lean<Cart>>();
-    return cart!;
+  /** The user's cart, created on first use. */
+  private async load(userId: string): Promise<Cart> {
+    const [cart, rows] = await Promise.all([
+      this.db.upsert(carts, { userId }, {}),
+      this.db.find(cartItems, { userId }, { sort: { addedAt: 1 } }),
+    ]);
+    const lines = rows.map((row) => ({ productId: row.productId, quantity: row.quantity, addedAt: row.addedAt }));
+    return { userId, lines, couponCode: cart.couponCode, delivery: cart.delivery };
   }
 
   /** The cart, priced the way checkout will price it. */
@@ -72,29 +80,26 @@ export class CartService {
     return this.price(user, cart);
   }
 
-  private async price(user: AuthUser, cart: Lean<Cart>): Promise<CartView> {
+  private async price(user: AuthUser, cart: Cart): Promise<CartView> {
     const ids = cart.lines.map((line) => line.productId);
-    const [rows, cards] = await Promise.all([
-      this.productModel.find({ _id: { $in: ids } }).lean<Lean<Product>[]>(),
-      this.products.cardsByIds(ids, user, true),
-    ]);
-    const byId = new Map(rows.map((row) => [String(row._id), row]));
+    const [rows, cards] = await Promise.all([this.products.byIds(ids), this.products.cardsByIds(ids, user, true)]);
+    const byId = new Map(rows.map((row) => [row.id, row]));
     const cardById = new Map(cards.map((card) => [card.id, card]));
 
     const entries: CartEntry[] = [];
     const pricedLines: { productId: string; sellerId: string; unitPrice: number; quantity: number }[] = [];
     for (const line of cart.lines) {
-      const product = byId.get(String(line.productId));
-      const card = cardById.get(String(line.productId));
+      const product = byId.get(line.productId);
+      const card = cardById.get(line.productId);
       if (!product || !card || product.deletedAt) continue;
       let issue: string | null = null;
-      if (String(product.sellerId) === user.id) issue = 'This is your own listing.';
+      if (product.sellerId === user.id) issue = 'This is your own listing.';
       else if (product.status !== 'active') issue = 'This item is no longer available.';
       else if (product.stock <= 0) issue = 'Sold out.';
       else if (product.stock < line.quantity) issue = `Only ${product.stock} left — we will check out ${product.stock}.`;
-      const available = issue === null || (product.stock > 0 && product.status === 'active' && String(product.sellerId) !== user.id);
+      const available = issue === null || (product.stock > 0 && product.status === 'active' && product.sellerId !== user.id);
       const quantity = available ? Math.min(line.quantity, product.stock) : line.quantity;
-      if (available) pricedLines.push({ productId: String(product._id), sellerId: String(product.sellerId), unitPrice: product.price, quantity });
+      if (available) pricedLines.push({ productId: product.id, sellerId: product.sellerId, unitPrice: product.price, quantity });
       entries.push({ product: card, quantity, lineTotal: Math.round(product.price * quantity * 100) / 100, available, issue });
     }
 
@@ -110,13 +115,13 @@ export class CartService {
       tax: pricing.tax,
       total: pricing.total,
       coupon: coupon ? coupon.code : null,
-      deliveryInfo: cart.delivery ?? null,
+      deliveryInfo: cart.delivery,
     };
   }
 
-  private async assertBuyable(user: AuthUser, productId: string, quantity: number): Promise<Lean<Product>> {
+  private async assertBuyable(user: AuthUser, productId: string, quantity: number) {
     const product = await this.products.findPublic(productId);
-    if (String(product.sellerId) === user.id) throw Errors.forbidden('You cannot buy your own listing.', 'OWN_LISTING');
+    if (product.sellerId === user.id) throw Errors.forbidden('You cannot buy your own listing.', 'OWN_LISTING');
     if (product.stock <= 0) throw Errors.conflict('This item is sold out.', 'OUT_OF_STOCK');
     if (quantity > product.stock) throw Errors.conflict(`Only ${product.stock} left in stock.`, 'INSUFFICIENT_STOCK', { available: product.stock });
     return product;
@@ -124,35 +129,36 @@ export class CartService {
 
   async add(user: AuthUser, productId: string, quantity = 1): Promise<CartView> {
     const cart = await this.load(user.id);
-    const existing = cart.lines.find((line) => String(line.productId) === productId);
+    const existing = cart.lines.find((line) => line.productId === productId);
     const next = (existing?.quantity ?? 0) + quantity;
     await this.assertBuyable(user, productId, next);
     if (!existing && cart.lines.length >= MAX_LINES) throw Errors.conflict('Your cart is full. Check out or remove something first.', 'CART_FULL');
-    if (existing) {
-      await this.carts.updateOne({ _id: cart._id, 'lines.productId': existing.productId }, { $set: { 'lines.$.quantity': next } });
-    } else {
-      await this.carts.updateOne({ _id: cart._id }, { $push: { lines: { productId: new Types.ObjectId(productId), quantity, addedAt: new Date() } } });
-    }
+    await this.db.upsert(cartItems, { userId: user.id, productId }, { quantity: next });
+    // A new line (not a quantity bump) counts towards the product's Popular ranking.
+    if (!existing) void this.products.recordCartAdd(productId).catch(() => undefined);
     return this.view(user);
   }
 
   async setQuantity(user: AuthUser, productId: string, quantity: number): Promise<CartView> {
     const cart = await this.load(user.id);
-    if (!cart.lines.some((line) => String(line.productId) === productId)) {
+    if (!cart.lines.some((line) => line.productId === productId)) {
       throw Errors.notFound('That item is not in your cart.', 'CART_ITEM_NOT_FOUND');
     }
     await this.assertBuyable(user, productId, quantity);
-    await this.carts.updateOne({ _id: cart._id, 'lines.productId': new Types.ObjectId(productId) }, { $set: { 'lines.$.quantity': quantity } });
+    await this.db.update(cartItems, { userId: user.id, productId }, { quantity });
     return this.view(user);
   }
 
   async remove(user: AuthUser, productId: string): Promise<CartView> {
-    await this.carts.updateOne({ userId: new Types.ObjectId(user.id) }, { $pull: { lines: { productId: new Types.ObjectId(productId) } } });
+    if (isUuid(productId)) await this.db.delete(cartItems, { userId: user.id, productId });
     return this.view(user);
   }
 
   async clear(user: AuthUser): Promise<CartView> {
-    await this.carts.updateOne({ userId: new Types.ObjectId(user.id) }, { $set: { lines: [] }, $unset: { couponCode: 1 } });
+    await this.db.transaction(async (tx) => {
+      await tx.deleteMany(cartItems, { userId: user.id });
+      await tx.update(carts, { userId: user.id }, { couponCode: null });
+    });
     return this.view(user);
   }
 
@@ -167,21 +173,17 @@ export class CartService {
         'COUPON_NOT_APPLICABLE',
       );
     }
-    await this.carts.updateOne({ _id: cart._id }, { $set: { couponCode: coupon.code } });
+    await this.db.update(carts, { userId: cart.userId }, { couponCode: coupon.code });
     return view;
   }
 
   async removeCoupon(user: AuthUser): Promise<CartView> {
-    await this.carts.updateOne({ userId: new Types.ObjectId(user.id) }, { $unset: { couponCode: 1 } });
+    await this.db.update(carts, { userId: user.id }, { couponCode: null });
     return this.view(user);
   }
 
   async setDelivery(user: AuthUser, input: DeliveryInfoDto): Promise<CartView> {
-    await this.load(user.id);
-    await this.carts.updateOne(
-      { userId: new Types.ObjectId(user.id) },
-      { $set: { delivery: { ...input, state: input.state ?? '', zip: input.zip ?? '' } } },
-    );
+    await this.db.upsert(carts, { userId: user.id }, { delivery: { ...input, state: input.state ?? '', zip: input.zip ?? '' } });
     return this.view(user);
   }
 
@@ -198,14 +200,19 @@ export class CartService {
   }
 
   /** Used by checkout: the raw lines and delivery, without pricing. */
-  async raw(userId: string): Promise<Lean<Cart>> {
+  async raw(userId: string): Promise<Cart> {
     return this.load(userId);
   }
 
-  async emptyAfterCheckout(userId: string, productIds: Types.ObjectId[]): Promise<void> {
-    await this.carts.updateOne(
-      { userId: new Types.ObjectId(userId) },
-      { $pull: { lines: { productId: { $in: productIds } } }, $unset: { couponCode: 1 } },
-    );
+  async emptyAfterCheckout(userId: string, productIds: string[]): Promise<void> {
+    await this.db.transaction(async (tx) => {
+      if (productIds.length) await tx.deleteMany(cartItems, { userId, productId: { $in: productIds } });
+      await tx.update(carts, { userId }, { couponCode: null });
+    });
+  }
+
+  /** How many lines are in the cart (the header badge). */
+  async countLines(userId: string): Promise<number> {
+    return this.db.count(cartItems, { userId });
   }
 }

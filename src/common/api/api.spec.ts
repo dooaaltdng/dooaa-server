@@ -19,19 +19,15 @@ describe('failure envelope', () => {
     expect(toFailure(new BadRequestException('Bad thing')).body).toMatchObject({ code: 'BAD_REQUEST', error: 'Bad thing' });
   });
 
-  it('turns duplicate keys into a 409 naming the field', () => {
-    expect(toFailure({ code: 11000, keyValue: { email: 'a@b.co' } })).toEqual({
+  it('turns unique violations into a 409 naming the field', () => {
+    const duplicate = Object.assign(new Error('E11000 duplicate key error collection: dooaa.users index: users_email_key dup key: { email: "a@b.c" }'), { code: 11000 });
+    expect(toFailure(duplicate)).toEqual({
       status: 409,
       body: { ok: false, error: 'That email is already in use.', code: 'DUPLICATE', details: { field: 'email' } },
     });
   });
 
-  it('turns cast and validation errors into 400s', () => {
-    expect(toFailure({ name: 'CastError', path: '_id' }).body).toEqual({ ok: false, error: 'Invalid _id.', code: 'INVALID_ID' });
-    expect(toFailure({ name: 'ValidationError', errors: { price: { message: 'Price must be positive.' } } }).body).toMatchObject({
-      error: 'Price must be positive.',
-      code: 'VALIDATION_FAILED',
-    });
+  it('turns upload errors into 4xx answers', () => {
     expect(toFailure({ name: 'MulterError', code: 'LIMIT_FILE_SIZE' })).toMatchObject({ status: 413, body: { code: 'PAYLOAD_TOO_LARGE' } });
   });
 

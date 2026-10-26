@@ -1,11 +1,13 @@
-import { MongoMemoryServer } from 'mongodb-memory-server';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
 
 /**
- * One MongoDB for the whole run. Workers inherit the URI through the
- * environment and each test file opens its own database on it.
+ * One in-memory MongoDB replica set for the whole run (a replica set, so
+ * transactions work). Each test app uses its own database on it, so files
+ * run in parallel safely. Set TEST_MONGODB_URI to use an existing server.
  */
 export default async function globalSetup(): Promise<void> {
-  const server = await MongoMemoryServer.create();
-  (globalThis as { __MONGO__?: MongoMemoryServer }).__MONGO__ = server;
-  process.env.MONGO_TEST_URI = server.getUri();
+  if (process.env.TEST_MONGODB_URI) return;
+  const server = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger' } });
+  (globalThis as { __MONGO__?: MongoMemoryReplSet }).__MONGO__ = server;
+  process.env.TEST_MONGODB_URI = server.getUri();
 }

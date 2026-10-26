@@ -1,7 +1,7 @@
 import { Body, Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { CurrentStaff, RequirePermissions, StaffOnly } from '../../common/auth/decorators';
 import type { AuthStaff } from '../../common/auth/principal';
 import { ESCROW_STATUSES, SETTLEMENTS, type EscrowStatus, type Settlement } from '../../common/domain';
@@ -39,14 +39,14 @@ export class AdminEscrowController {
   }
 
   @Get('escrows/:id')
-  get(@Param('id', ObjectIdPipe) id: string) {
+  get(@Param('id', UuidPipe) id: string) {
     return this.escrow.get(id);
   }
 
   /** Release, refund, force-release or reverse. Permission depends on the verb. */
   @HttpCode(200)
   @Post('escrows/:id/settle')
-  settle(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string, @Body() body: SettleDto) {
+  settle(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string, @Body() body: SettleDto) {
     return this.escrow.settle(staff, id, body.settlement, body.note);
   }
 
@@ -58,7 +58,7 @@ export class AdminEscrowController {
   @RequirePermissions('escrow.release')
   @HttpCode(200)
   @Post('payouts/:id/retry')
-  retry(@CurrentStaff() staff: AuthStaff, @Param('id', ObjectIdPipe) id: string) {
+  retry(@CurrentStaff() staff: AuthStaff, @Param('id', UuidPipe) id: string) {
     return this.wallet.retryPayout(staff, id);
   }
 }

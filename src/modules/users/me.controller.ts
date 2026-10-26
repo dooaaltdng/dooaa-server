@@ -56,6 +56,14 @@ export class MeController {
   @AllowRestricted()
   @AuthThrottle()
   @HttpCode(200)
+  @Post('close/code')
+  closeCode(@CurrentUser() user: AuthUser) {
+    return this.me.sendCloseCode(user);
+  }
+
+  @AllowRestricted()
+  @AuthThrottle()
+  @HttpCode(200)
   @Post('close')
   close(@CurrentUser() user: AuthUser, @Body() body: CloseAccountDto) {
     return this.me.close(user, body);

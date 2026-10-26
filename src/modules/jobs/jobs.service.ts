@@ -1,16 +1,28 @@
 import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import { SchedulerRegistry } from '@nestjs/schedule';
+import { DAY } from '../../common/util/dates';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
+import { InjectDb, type Database } from '../../database/database';
+import { notifications, oauthGrants, otps, providerEvents, sessions, visitorDays } from '../../database/schema';
 import { OrdersService } from '../orders/orders.service';
 import { PaymentsService } from '../payments/payments.service';
 import { SettingsService } from '../settings/settings.service';
+import { explain } from '../../common/util/explain-error';
 
-type JobName = 'payments' | 'escrow';
+type JobName = 'payments' | 'escrow' | 'housekeeping';
+
+/** How long rows that only matter for a while are kept. */
+const RETENTION = {
+  notifications: 120 * DAY,
+  visitorDays: 3 * DAY,
+  providerEvents: 30 * DAY,
+};
 
 /**
  * Background work. Every step is a conditional, idempotent transition, so
- * running on several instances at once (or twice in a row) is safe.
+ * running on several instances at once (or twice in a row) is safe. The
+ * housekeeping job deletes what has expired.
  */
 @Injectable()
 export class JobsService implements OnApplicationBootstrap, OnModuleDestroy {
@@ -18,6 +30,7 @@ export class JobsService implements OnApplicationBootstrap, OnModuleDestroy {
   private readonly running = new Set<JobName>();
 
   constructor(
+    @InjectDb() private readonly db: Database,
     private readonly registry: SchedulerRegistry,
     private readonly payments: PaymentsService,
     private readonly orders: OrdersService,
@@ -29,7 +42,8 @@ export class JobsService implements OnApplicationBootstrap, OnModuleDestroy {
     if (!this.config.scheduler.enabled) return;
     this.every('payments', 5 * 60_000);
     this.every('escrow', 10 * 60_000);
-    this.logger.log('Background jobs scheduled (payments every 5 min, escrow every 10 min)');
+    this.every('housekeeping', 60 * 60_000);
+    this.logger.log('Background jobs scheduled (payments every 5 min, escrow every 10 min, housekeeping hourly)');
   }
 
   private every(name: JobName, ms: number): void {
@@ -53,15 +67,28 @@ export class JobsService implements OnApplicationBootstrap, OnModuleDestroy {
     return { released, cancelled };
   }
 
+  /** Deletes what has expired: sessions, codes and grants past their expiry, and old activity rows. */
+  async housekeepingJob(now = new Date()): Promise<Record<string, number>> {
+    const before = (ms: number) => new Date(now.getTime() - ms);
+    return {
+      sessions: await this.db.deleteMany(sessions, { expiresAt: { $lt: now } }),
+      otps: await this.db.deleteMany(otps, { expiresAt: { $lt: now } }),
+      oauthGrants: await this.db.deleteMany(oauthGrants, { expiresAt: { $lt: now } }),
+      notifications: await this.db.deleteMany(notifications, { createdAt: { $lt: before(RETENTION.notifications) } }),
+      visitorDays: await this.db.deleteMany(visitorDays, { at: { $lt: before(RETENTION.visitorDays) } }),
+      providerEvents: await this.db.deleteMany(providerEvents, { receivedAt: { $lt: before(RETENTION.providerEvents) } }),
+    };
+  }
+
   async run(name: JobName): Promise<unknown> {
     if (this.running.has(name)) return { skipped: true };
     this.running.add(name);
     try {
-      const result = name === 'payments' ? await this.paymentsJob() : await this.escrowJob();
+      const result = name === 'payments' ? await this.paymentsJob() : name === 'escrow' ? await this.escrowJob() : await this.housekeepingJob();
       this.logger.debug(`Job ${name}: ${JSON.stringify(result)}`);
       return result;
     } catch (error) {
-      this.logger.error(`Job ${name} failed: ${(error as Error).message}`);
+      this.logger.error(explain(`The background task "${name}" failed; it will run again on its next schedule`, error));
       return { error: (error as Error).message };
     } finally {
       this.running.delete(name);
@@ -69,7 +96,7 @@ export class JobsService implements OnApplicationBootstrap, OnModuleDestroy {
   }
 
   async runAll() {
-    return { payments: await this.run('payments'), escrow: await this.run('escrow') };
+    return { payments: await this.run('payments'), escrow: await this.run('escrow'), housekeeping: await this.run('housekeeping') };
   }
 
   onModuleDestroy(): void {

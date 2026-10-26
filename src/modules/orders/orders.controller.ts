@@ -27,7 +27,6 @@ export class CheckoutController {
   cart(@CurrentUser() user: AuthUser, @Body() body: CheckoutDto) {
     return this.checkout.checkoutCart(user, {
       method: body.method,
-      savedCardId: body.savedCardId,
       delivery: body.delivery ? { ...body.delivery, state: body.delivery.state ?? '', zip: body.delivery.zip ?? '' } : undefined,
     });
   }
@@ -46,7 +45,6 @@ export class CheckoutController {
       productId: body.productId,
       quantity: body.quantity,
       method: body.method,
-      savedCardId: body.savedCardId,
       offerId: body.offerId,
       delivery: { ...body.delivery, state: body.delivery.state ?? '', zip: body.delivery.zip ?? '' },
     });

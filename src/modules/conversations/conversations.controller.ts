@@ -1,6 +1,6 @@
 import { Body, Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { CurrentUser, RequireVerifiedEmail } from '../../common/auth/decorators';
 import type { AuthUser } from '../../common/auth/principal';
 import { ConversationsService } from './conversations.service';
@@ -31,73 +31,73 @@ export class ConversationsController {
   }
 
   @Get('conversations/:id')
-  detail(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string) {
+  detail(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string) {
     return this.conversations.detail(user, id);
   }
 
   @Get('conversations/:id/messages')
-  messages(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string, @Query() query: MessagesQueryDto) {
+  messages(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Query() query: MessagesQueryDto) {
     return this.conversations.messagesPage(user, id, query);
   }
 
   @RequireVerifiedEmail()
   @Post('conversations/:id/messages')
-  send(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string, @Body() body: SendMessageDto) {
+  send(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Body() body: SendMessageDto) {
     return this.conversations.send(user, id, body);
   }
 
   @HttpCode(200)
   @Post('conversations/:id/read')
-  read(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string) {
+  read(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string) {
     return this.conversations.markRead(user, id);
   }
 
   /** "Make an Offer". */
   @RequireVerifiedEmail()
   @Post('conversations/:id/offers')
-  offer(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string, @Body() body: OfferDto) {
+  offer(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Body() body: OfferDto) {
     return this.conversations.makeOffer(user, id, body);
   }
 
   @HttpCode(200)
   @Post('offers/:id/accept')
-  accept(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string) {
+  accept(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string) {
     return this.conversations.acceptOffer(user, id);
   }
 
   @HttpCode(200)
   @Post('offers/:id/decline')
-  decline(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string) {
+  decline(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string) {
     return this.conversations.declineOffer(user, id);
   }
 
   @HttpCode(200)
   @Post('offers/:id/counter')
-  counter(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string, @Body() body: OfferDto) {
+  counter(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Body() body: OfferDto) {
     return this.conversations.counterOffer(user, id, body);
   }
 
   @HttpCode(200)
   @Post('offers/:id/withdraw')
-  withdraw(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string) {
+  withdraw(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string) {
     return this.conversations.withdrawOffer(user, id);
   }
 
   /** "Propose a Meetup". */
   @Post('conversations/:id/meetups')
-  propose(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string, @Body() body: MeetupDto) {
+  propose(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Body() body: MeetupDto) {
     return this.conversations.proposeMeetup(user, id, body);
   }
 
   @HttpCode(200)
   @Post('conversations/:id/meetups/:messageId/accept')
-  acceptMeetup(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string, @Param('messageId', ObjectIdPipe) messageId: string) {
+  acceptMeetup(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Param('messageId', UuidPipe) messageId: string) {
     return this.conversations.respondToMeetup(user, id, messageId, 'accepted');
   }
 
   @HttpCode(200)
   @Post('conversations/:id/meetups/:messageId/decline')
-  declineMeetup(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string, @Param('messageId', ObjectIdPipe) messageId: string) {
+  declineMeetup(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Param('messageId', UuidPipe) messageId: string) {
     return this.conversations.respondToMeetup(user, id, messageId, 'declined');
   }
 }

@@ -4,7 +4,6 @@ import { Http, data, failure } from './utils/http';
 import { eventually } from './utils/eventually';
 import { createProduct, model, registerSeller, registerUser, staffToken, uploadImage, type TestUser } from './utils/factories';
 import { DELIVERY, payAndVerify, settle } from './utils/commerce';
-import { Product } from '../src/modules/products/schemas/product.schema';
 
 describe('Messaging, offers, meetups and realtime (e2e)', () => {
   let t: TestApp;
@@ -21,13 +20,17 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
       socket.on('connect_error', (error) => reject(error));
     });
 
-  const next = <T = any>(socket: Socket, event: string, timeoutMs = 3000) =>
+  /** The next `event` on the socket (optionally the next one `matching`), ignoring stragglers from earlier tests. */
+  const next = <T = any>(socket: Socket, event: string, timeoutMs = 3000, matching: (payload: T) => boolean = () => true) =>
     new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`Timed out waiting for ${event}`)), timeoutMs);
-      socket.once(event, (payload: T) => {
+      const listener = (payload: T) => {
+        if (!matching(payload)) return;
         clearTimeout(timer);
+        socket.off(event, listener);
         resolve(payload);
-      });
+      };
+      socket.on(event, listener);
     });
 
   const ack = <T = any>(socket: Socket, event: string, payload: unknown) =>
@@ -47,13 +50,13 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
   describe('threads', () => {
     it('starts a thread about a listing, with the enquiry quoting it', async () => {
       const product = await createProduct(t, seller.id, { title: 'Samsung Galaxy S23 Ultra', price: 4_200_000, pricing: 'negotiable' });
-      const thread = data(await http.post('/conversations', { productId: String(product._id), body: 'Hello, is this item still available?' }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id, body: 'Hello, is this item still available?' }, buyer.token));
       expect(thread).toMatchObject({
         viewerRole: 'buyer',
         name: 'Sola Seller',
         store: 'Nelson Stores',
         verified: true,
-        productId: String(product._id),
+        productId: product.id,
         subject: { title: 'Samsung Galaxy S23 Ultra', price: 4_200_000 },
         unread: 0,
         escrow: null,
@@ -64,24 +67,24 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
       const inbox = data(await http.get('/conversations', seller.token));
       expect(inbox.rows[0]).toMatchObject({ id: thread.id, viewerRole: 'seller', name: 'Ada Obi', store: 'Buyer', unread: 1, preview: 'Hello, is this item still available?' });
       expect(data(await http.get('/conversations/unread-count', seller.token))).toEqual({ threads: 1, messages: 1 });
-      expect((await model<Product>(t, Product.name).findById(product._id).lean())!.stats.inquiries).toBe(1);
+      expect((await model(t, 'Product').findById(product.id).lean())!.statsInquiries).toBe(1);
 
       // Asking again reuses the same thread.
-      const again = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const again = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       expect(again.id).toBe(thread.id);
     });
 
     it('refuses to message yourself or without a verified email', async () => {
       const product = await createProduct(t, seller.id);
-      failure(await http.post('/conversations', { productId: String(product._id) }, seller.token), 403, 'OWN_LISTING');
+      failure(await http.post('/conversations', { productId: product.id }, seller.token), 403, 'OWN_LISTING');
       const unverified = await registerUser(t, { verifyEmail: false });
-      failure(await http.post('/conversations', { productId: String(product._id) }, unverified.token), 403, 'EMAIL_NOT_VERIFIED');
+      failure(await http.post('/conversations', { productId: product.id }, unverified.token), 403, 'EMAIL_NOT_VERIFIED');
       failure(await http.post('/conversations', {}, buyer.token), 400, 'VALIDATION_FAILED');
     });
 
     it('sends text and uploaded attachments, and tracks unread on the other side', async () => {
       const product = await createProduct(t, seller.id);
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       failure(await http.post(`/conversations/${thread.id}/messages`, { body: '   ' }, buyer.token), 400, 'VALIDATION_FAILED');
       data(await http.post(`/conversations/${thread.id}/messages`, { body: 'Can you share a video?' }, buyer.token));
 
@@ -100,7 +103,7 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
 
     it('keeps strangers out', async () => {
       const product = await createProduct(t, seller.id);
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       const stranger = await registerUser(t);
       failure(await http.get(`/conversations/${thread.id}`, stranger.token), 404, 'CONVERSATION_NOT_FOUND');
       failure(await http.post(`/conversations/${thread.id}/messages`, { body: 'hi' }, stranger.token), 404, 'CONVERSATION_NOT_FOUND');
@@ -108,7 +111,7 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
 
     it('pages back through history', async () => {
       const product = await createProduct(t, seller.id);
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       for (let index = 0; index < 7; index += 1) data(await http.post(`/conversations/${thread.id}/messages`, { body: `message ${index}` }, buyer.token));
       const latest = data(await http.get(`/conversations/${thread.id}/messages?limit=3`, buyer.token));
       expect(latest.messages.map((message: any) => message.body)).toEqual(['message 4', 'message 5', 'message 6']);
@@ -120,7 +123,7 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
     it('filters the inbox to unread and searches it', async () => {
       const other = await registerSeller(t, { storeName: 'Gadget Hub' });
       const product = await createProduct(t, other.id, { title: 'Nexus Twin Tub Washing Machine' });
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       data(await http.post(`/conversations/${thread.id}/messages`, { body: 'Sent you the receipt' }, other.token));
       const unread = data(await http.get('/conversations?filter=unread', buyer.token));
       expect(unread.rows.map((row: any) => row.id)).toContain(thread.id);
@@ -132,13 +135,13 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
   describe('offers', () => {
     it('refuses offers on fixed-price listings', async () => {
       const product = await createProduct(t, seller.id, { pricing: 'fixed' });
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       failure(await http.post(`/conversations/${thread.id}/offers`, { amount: 300_000 }, buyer.token), 409, 'FIXED_PRICE');
     });
 
     it('runs offer → counter → accept, and escrow checkout charges the agreed price', async () => {
       const product = await createProduct(t, seller.id, { title: 'Samsung Galaxy S23', price: 4_200_000, pricing: 'negotiable' });
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       const afterOffer = data(await http.post(`/conversations/${thread.id}/offers`, { amount: 3_800_000, note: 'Would you consider this?' }, buyer.token));
       expect(afterOffer.offer).toMatchObject({ amount: 3_800_000, listed: 4_200_000, status: 'pending', note: 'Would you consider this?', from: { role: 'Buyer' } });
       expect(afterOffer.messages.at(-1)).toMatchObject({ kind: 'product', product: { price: 3_800_000 } });
@@ -154,13 +157,13 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
       const accepted = data(await http.post(`/offers/${offerId}/accept`, {}, buyer.token));
       expect(accepted.offer).toMatchObject({ status: 'accepted', agreedAmount: 4_000_000 });
 
-      const quote = data(await http.get(`/checkout/escrow/${product._id}/quote?offerId=${offerId}`, buyer.token));
+      const quote = data(await http.get(`/checkout/escrow/${product.id}/quote?offerId=${offerId}`, buyer.token));
       expect(quote.quote).toMatchObject({ itemPrice: 4_000_000, escrowFee: 20_000, total: 4_025_000 });
     });
 
     it('lets the seller decline and the buyer withdraw', async () => {
       const product = await createProduct(t, seller.id, { pricing: 'negotiable' });
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       const first = data(await http.post(`/conversations/${thread.id}/offers`, { amount: 100_000 }, buyer.token)).offer;
       expect(data(await http.post(`/offers/${first.id}/decline`, {}, seller.token)).messages.at(-1)).toMatchObject({ systemLead: 'Offer declined.' });
       const second = data(await http.post(`/conversations/${thread.id}/offers`, { amount: 150_000 }, buyer.token)).offer;
@@ -170,7 +173,7 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
 
     it('notifies the seller of a new offer', async () => {
       const product = await createProduct(t, seller.id, { pricing: 'negotiable', title: 'Notify Me Phone' });
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       data(await http.post(`/conversations/${thread.id}/offers`, { amount: 120_000 }, buyer.token));
       await eventually(async () => {
         const bell = data(await http.get('/notifications', seller.token));
@@ -184,7 +187,7 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
 
     it('proposes a meetup the other side can accept once', async () => {
       const product = await createProduct(t, seller.id);
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       failure(await http.post(`/conversations/${thread.id}/meetups`, { place: 'Central Park Cafe', date: tomorrow(), from: '16:00', to: '14:00' }, seller.token), 400, 'VALIDATION_FAILED');
       failure(await http.post(`/conversations/${thread.id}/meetups`, { place: 'Central Park Cafe', date: '2020-01-01', from: '14:00', to: '16:00' }, seller.token), 400, 'VALIDATION_FAILED');
       const meetup = data(await http.post(`/conversations/${thread.id}/meetups`, { place: 'Central Park Cafe, 123 Park Avenue, Lagos', date: tomorrow(), from: '14:00', to: '16:00' }, seller.token));
@@ -202,8 +205,8 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
   describe('orders in the thread', () => {
     it('links the paid order to the enquiry thread and narrates it', async () => {
       const product = await createProduct(t, seller.id, { title: 'Twin Tub Washing Machine', price: 549_000 });
-      const thread = data(await http.post('/conversations', { productId: String(product._id), body: 'Is the warranty still valid?' }, buyer.token));
-      const checkout = data(await http.post('/checkout/escrow', { productId: String(product._id), method: 'card', delivery: DELIVERY }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id, body: 'Is the warranty still valid?' }, buyer.token));
+      const checkout = data(await http.post('/checkout/escrow', { productId: product.id, method: 'card', delivery: DELIVERY }, buyer.token));
       await payAndVerify(t, buyer, checkout.payment.reference);
 
       let detail = data(await http.get(`/conversations/${thread.id}`, buyer.token));
@@ -214,12 +217,16 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
         productPrice: 549_000,
         fee: 2_745,
         shipping: 5_000,
-        buyer: { mask: '**** 4081' },
+        buyer: { mask: '****' },
         seller: { name: 'Nelson Stores' },
       });
       expect(detail.escrow.trackingSteps).toHaveLength(5);
       expect(detail.escrow.shipWithinSeconds).toBeGreaterThan(0);
-      expect(detail.messages.at(-1)).toMatchObject({ kind: 'system', systemLead: 'Escrow funded.' });
+      // The thread is narrated by an order event, a moment after the payment lands.
+      await eventually(async () => {
+        const narrated = data(await http.get(`/conversations/${thread.id}`, buyer.token));
+        expect(narrated.messages.at(-1)).toMatchObject({ kind: 'system', systemLead: 'Escrow funded.' });
+      });
 
       data(await http.post(`/seller/orders/${checkout.orders[0].id}/ship`, { carrier: 'Red Star Express', trackingNumber: 'RS-2211' }, seller.token));
       await settle(t);
@@ -239,10 +246,10 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
 
     it('delivers new messages live to the other participant', async () => {
       const product = await createProduct(t, seller.id);
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       const sellerSocket = await connect(seller.token);
-      const incoming = next(sellerSocket, 'message:new');
-      const updated = next(sellerSocket, 'conversation:updated');
+      const incoming = next(sellerSocket, 'message:new', 3000, (payload: any) => payload.conversationId === thread.id);
+      const updated = next(sellerSocket, 'conversation:updated', 3000, (payload: any) => payload.id === thread.id);
       data(await http.post(`/conversations/${thread.id}/messages`, { body: 'Live hello' }, buyer.token));
       expect(await incoming).toMatchObject({ conversationId: thread.id, message: { body: 'Live hello', mine: false } });
       expect(await updated).toMatchObject({ id: thread.id, unread: 1, preview: 'Live hello' });
@@ -250,7 +257,7 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
 
     it('sends over the socket with an acknowledgement, and relays typing', async () => {
       const product = await createProduct(t, seller.id);
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       const buyerSocket = await connect(buyer.token);
       const sellerSocket = await connect(seller.token);
       expect(await ack(buyerSocket, 'conversation:join', { conversationId: thread.id })).toEqual({ ok: true, data: { joined: thread.id } });
@@ -268,7 +275,7 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
 
     it('does not let strangers join or post into a thread', async () => {
       const product = await createProduct(t, seller.id);
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       const stranger = await registerUser(t);
       const socket = await connect(stranger.token);
       expect(await ack(socket, 'conversation:join', { conversationId: thread.id })).toMatchObject({ ok: false, code: 'CONVERSATION_NOT_FOUND' });
@@ -276,10 +283,12 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
       expect(await ack(socket, 'typing', { conversationId: thread.id, typing: true })).toMatchObject({ ok: false, code: 'NOT_JOINED' });
     });
 
-    it('pushes notifications live and reports presence', async () => {
+    it('pushes notifications live (once switched on) and reports presence', async () => {
+      // Web notifications start off for every account; the buyer opts in.
+      data(await http.patch('/me/notification-preferences', { web: true }, buyer.token));
       const buyerSocket = await connect(buyer.token);
       const product = await createProduct(t, seller.id, { pricing: 'negotiable', title: 'Live Offer Phone' });
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, buyer.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
       const offer = data(await http.post(`/conversations/${thread.id}/offers`, { amount: 90_000 }, buyer.token)).offer;
       const pushed = next<any>(buyerSocket, 'notification:new');
       data(await http.post(`/offers/${offer.id}/decline`, {}, seller.token));
@@ -304,7 +313,7 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
     it('lists, counts and clears the bell', async () => {
       const reader = await registerUser(t);
       const product = await createProduct(t, seller.id);
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, reader.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, reader.token));
       data(await http.post(`/conversations/${thread.id}/messages`, { body: 'One' }, seller.token));
       data(await http.post(`/conversations/${thread.id}/messages`, { body: 'Two' }, seller.token));
       const bell = await eventually(async () => {
@@ -321,9 +330,9 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
 
     it('turns message alerts off when the user asks', async () => {
       const quiet = await registerUser(t);
-      data(await http.patch('/me/notification-preferences', { web: false, email: false }, quiet.token));
+      data(await http.patch('/me/notification-preferences', { web: false, messages: false }, quiet.token));
       const product = await createProduct(t, seller.id);
-      const thread = data(await http.post('/conversations', { productId: String(product._id) }, quiet.token));
+      const thread = data(await http.post('/conversations', { productId: product.id }, quiet.token));
       const before = t.mail.outbox.length;
       data(await http.post(`/conversations/${thread.id}/messages`, { body: 'Hello quiet' }, seller.token));
       await settle(t);

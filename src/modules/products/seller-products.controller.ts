@@ -1,6 +1,6 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { CurrentUser, SellerOnly } from '../../common/auth/decorators';
 import type { AuthUser } from '../../common/auth/principal';
 import { CreateProductDto, SellerProductStatusDto, SellerProductsQueryDto, UpdateProductDto } from './dto/product.dto';
@@ -25,22 +25,22 @@ export class SellerProductsController {
   }
 
   @Get(':id')
-  get(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string) {
+  get(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string) {
     return this.products.sellerGet(user, id);
   }
 
   @Patch(':id')
-  update(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string, @Body() body: UpdateProductDto) {
+  update(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Body() body: UpdateProductDto) {
     return this.products.update(user, id, body);
   }
 
   @Patch(':id/status')
-  status(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string, @Body() body: SellerProductStatusDto) {
+  status(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Body() body: SellerProductStatusDto) {
     return this.products.setSellerStatus(user, id, body.status);
   }
 
   @Delete(':id')
-  remove(@CurrentUser() user: AuthUser, @Param('id', ObjectIdPipe) id: string) {
+  remove(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string) {
     return this.products.remove(user, id);
   }
 }

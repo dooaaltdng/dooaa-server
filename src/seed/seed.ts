@@ -1,20 +1,20 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
-import { getModelToken } from '@nestjs/mongoose';
-import type { Model } from 'mongoose';
 import { AppModule } from '../app.module';
-import { APP_CONFIG, type AppConfig } from '../config/configuration';
 import { regionFor } from '../common/domain';
 import { excerpt, normalizePhone } from '../common/util/text';
-import { Product } from '../modules/products/schemas/product.schema';
+import { APP_CONFIG, type AppConfig } from '../config/configuration';
+import { loadEnvFiles } from '../config/env-files';
+import { DATABASE, type Database } from '../database/database';
+import { products, users } from '../database/schema';
 import { ProductsService } from '../modules/products/products.service';
 import { StaffService } from '../modules/staff/staff.service';
 import { PasswordService } from '../modules/users/password.service';
-import { User } from '../modules/users/schemas/user.schema';
 import { DEMO_BUYER, DEMO_LISTINGS, DEMO_PASSWORD, DEMO_SELLER } from './demo-data';
 
 /**
- * Seeds a database. Safe to run repeatedly: nothing that exists is changed.
+ * Seeds the MongoDB database (indexes are created when the app starts).
+ * Safe to run repeatedly: nothing that exists is changed.
  *
  *   npm run seed                      # superadmin + reference data
  *   SEED_DEMO=true npm run seed       # …plus demo buyer, seller and listings
@@ -23,6 +23,7 @@ import { DEMO_BUYER, DEMO_LISTINGS, DEMO_PASSWORD, DEMO_SELLER } from './demo-da
  * the app itself on boot; the superadmin comes from SEED_SUPERADMIN_*.
  */
 async function main(): Promise<void> {
+  loadEnvFiles();
   const app = await NestFactory.createApplicationContext(AppModule, { logger: ['error', 'warn', 'log'] });
   try {
     const config = app.get<AppConfig>(APP_CONFIG);
@@ -45,48 +46,49 @@ async function main(): Promise<void> {
       if (config.env === 'production' && process.env.SEED_DEMO_IN_PRODUCTION !== 'true') {
         throw new Error('Refusing to seed demo data in production (set SEED_DEMO_IN_PRODUCTION=true to override).');
       }
-      const users = app.get<Model<User>>(getModelToken(User.name));
-      const products = app.get<Model<Product>>(getModelToken(Product.name));
+      const db = app.get<Database>(DATABASE);
       const hash = await app.get(PasswordService).hash(DEMO_PASSWORD);
 
-      const upsertUser = async (person: typeof DEMO_BUYER & { storeName?: string }, role: 'buyer' | 'seller') => {
-        await users.updateOne(
-          { email: person.email },
+      const ensureUser = async (person: typeof DEMO_BUYER & { storeName?: string }, role: 'buyer' | 'seller') => {
+        const now = new Date();
+        await db.insertIgnoringDuplicates(users, [
           {
-            $setOnInsert: {
-              firstName: person.firstName,
-              lastName: person.lastName,
-              email: person.email,
-              phone: normalizePhone(person.phone),
-              passwordHash: hash,
-              role,
-              emailVerified: true,
-              identity: 'verified',
-              verificationLevel: role === 'seller' ? 'high-value' : 'normal',
-              location: person.location,
-              region: regionFor(person.location),
-              termsAcceptedAt: new Date(),
-              privacyAcceptedAt: new Date(),
-              ...(person.storeName ? { seller: { storeName: person.storeName, dispatchDays: 3, responseLabel: 'Typically responds within an hour', deliveryLabel: 'Nationwide Delivery (1-3 business days within Lagos)' } } : {}),
-            },
+            firstName: person.firstName,
+            lastName: person.lastName,
+            email: person.email,
+            phone: normalizePhone(person.phone),
+            passwordHash: hash,
+            role,
+            emailVerified: true,
+            identity: 'verified',
+            verificationLevel: role === 'seller' ? 'high-value' : 'normal',
+            location: person.location,
+            region: regionFor(person.location) ?? null,
+            termsAcceptedAt: now,
+            privacyAcceptedAt: now,
+            ...(person.storeName
+              ? {
+                  sellerStoreName: person.storeName,
+                  sellerDispatchDays: 3,
+                  sellerResponseLabel: 'Typically responds within an hour',
+                  sellerDeliveryLabel: 'Nationwide Delivery (1-3 business days within Lagos)',
+                }
+              : {}),
           },
-          { upsert: true },
-        );
-        return (await users.findOne({ email: person.email }).lean())!;
+        ]);
+        return (await db.findOne(users, { email: person.email }))!;
       };
 
-      const buyer = await upsertUser(DEMO_BUYER, 'buyer');
-      const seller = await upsertUser(DEMO_SELLER, 'seller');
+      const buyer = await ensureUser(DEMO_BUYER, 'buyer');
+      const seller = await ensureUser(DEMO_SELLER, 'seller');
       log(`Demo buyer: ${buyer.email} / ${DEMO_PASSWORD}`);
       log(`Demo seller: ${seller.email} / ${DEMO_PASSWORD}`);
 
-      const imageBase = `${config.clientUrl}`;
       let created = 0;
       for (const [index, listing] of DEMO_LISTINGS.entries()) {
-        const exists = await products.exists({ sellerId: seller._id, title: listing.title });
-        if (exists) continue;
-        await products.create({
-          sellerId: seller._id,
+        if (await db.exists(products, { sellerId: seller.id, title: listing.title })) continue;
+        await db.insert(products, {
+          sellerId: seller.id,
           title: listing.title,
           description: listing.description,
           summary: excerpt(listing.description, 120),
@@ -100,7 +102,7 @@ async function main(): Promise<void> {
           delivery: listing.delivery,
           stock: listing.stock,
           location: listing.location,
-          images: [`${imageBase}${listing.image}`],
+          images: [`${config.clientUrl}${listing.image}`],
           status: 'active',
           featured: Boolean(listing.featured),
           sellerVerified: true,
@@ -109,7 +111,7 @@ async function main(): Promise<void> {
         });
         created += 1;
       }
-      await app.get(ProductsService).recountActiveListings(seller._id);
+      await app.get(ProductsService).recountActiveListings(seller.id);
       log(`Demo listings: ${created} created (${DEMO_LISTINGS.length - created} already present).`);
     }
     log('Done.');

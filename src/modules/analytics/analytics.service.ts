@@ -1,14 +1,11 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
+import type { StatScope } from '../../common/domain';
 import { EventBus } from '../../common/events/event-bus';
-import { dayKey, startOfLagosDay } from '../../common/util/dates';
+import { dayKey, startOfLagosDay, TIME_ZONE } from '../../common/util/dates';
 import { formatNairaCompact } from '../../common/util/money';
-import { Order } from '../orders/schemas/order.schema';
+import { InjectDb, isUniqueViolation, type Database, type Table, type Where } from '../../database/database';
+import { dailyStats, orders, products, users, visitorDays, type OrderRow } from '../../database/schema';
 import { PRODUCT_EVENTS, type ProductViewed } from '../products/products.service';
-import { Product } from '../products/schemas/product.schema';
-import { User } from '../users/schemas/user.schema';
-import { DailyStat, VisitorDay } from './analytics.schema';
 import { buildBuckets, compactCount, fold, percentChange, type RangeId } from './buckets';
 
 const OFFICIAL_STORE_EMAIL = 'store@dooaa.ng';
@@ -20,11 +17,7 @@ export type TrendId = 'transactions' | 'activity';
 @Injectable()
 export class AnalyticsService implements OnModuleInit {
   constructor(
-    @InjectModel(DailyStat.name) private readonly stats: Model<DailyStat>,
-    @InjectModel(VisitorDay.name) private readonly visitors: Model<VisitorDay>,
-    @InjectModel(Order.name) private readonly orders: Model<Order>,
-    @InjectModel(Product.name) private readonly products: Model<Product>,
-    @InjectModel(User.name) private readonly users: Model<User>,
+    @InjectDb() private readonly db: Database,
     private readonly events: EventBus,
   ) {}
 
@@ -32,62 +25,75 @@ export class AnalyticsService implements OnModuleInit {
     this.events.on<ProductViewed>(PRODUCT_EVENTS.viewed, (event) => this.recordProductView(event.sellerId));
   }
 
+  /** Adds to a day's counters, creating the row on the day's first count. */
+  private async bumpDay(scope: StatScope, sellerId: string | null, day: string, field: 'visits' | 'productViews'): Promise<void> {
+    const bump = () => this.db.upsert(dailyStats, { scope, sellerId, day }, { $inc: { [field]: 1 } });
+    // Two first counts of a day can race to create the row; the loser just increments it.
+    await bump().catch((error) => (isUniqueViolation(error) ? bump() : Promise.reject(error)));
+  }
+
   /** One visit per visitor per Lagos day. */
   async recordVisit(visitorId: string): Promise<{ counted: boolean }> {
     const day = dayKey();
-    const result = await this.visitors.updateOne({ visitorId, day }, { $setOnInsert: { at: new Date() } }, { upsert: true });
-    if (!result.upsertedCount) return { counted: false };
-    await this.stats.updateOne({ scope: 'site', sellerId: null, day }, { $inc: { visits: 1 } }, { upsert: true });
+    const inserted = await this.db.insertIgnoringDuplicates(visitorDays, [{ visitorId, day }]);
+    if (!inserted) return { counted: false };
+    await this.bumpDay('site', null, day, 'visits');
     return { counted: true };
   }
 
   async recordProductView(sellerId: string): Promise<void> {
     const day = dayKey();
-    await Promise.all([
-      this.stats.updateOne({ scope: 'seller', sellerId: new Types.ObjectId(sellerId), day }, { $inc: { productViews: 1 } }, { upsert: true }),
-      this.stats.updateOne({ scope: 'site', sellerId: null, day }, { $inc: { productViews: 1 } }, { upsert: true }),
-    ]);
+    await Promise.all([this.bumpDay('seller', sellerId, day, 'productViews'), this.bumpDay('site', null, day, 'productViews')]);
   }
 
   /** Paid amounts grouped by Lagos day (or month). */
-  private async moneyByKey(match: Record<string, unknown>, from: Date, to: Date, field: '$total' | '$sellerEarning', monthly: boolean): Promise<Map<string, number>> {
-    const rows = await this.orders.aggregate<{ _id: string; amount: number }>([
-      { $match: { ...match, 'payment.status': 'paid', 'payment.paidAt': { $gte: from, $lte: to } } },
-      { $group: { _id: { $dateToString: { format: monthly ? '%Y-%m' : '%Y-%m-%d', date: '$payment.paidAt', timezone: 'Africa/Lagos' } }, amount: { $sum: field } } },
+  private async moneyByKey(match: Where<OrderRow>, from: Date, to: Date, field: 'total' | 'sellerEarning', monthly: boolean): Promise<Map<string, number>> {
+    const rows = await this.db.aggregate<{ _id: string; amount: number }>(orders, [
+      { $match: { ...match, paymentStatus: 'paid', paymentPaidAt: { $gte: from, $lte: to } } },
+      {
+        $group: {
+          _id: { $dateToString: { date: '$paymentPaidAt', format: monthly ? '%Y-%m' : '%Y-%m-%d', timezone: TIME_ZONE } },
+          amount: { $sum: `$${field}` },
+        },
+      },
     ]);
-    return new Map(rows.map((row) => [row._id, row.amount]));
+    return new Map(rows.map((row) => [row._id, row.amount ?? 0]));
   }
 
-  private async countsByKey(field: 'visits' | 'productViews', scope: 'site' | 'seller', sellerId: Types.ObjectId | null, fromDay: string, monthly: boolean): Promise<Map<string, number>> {
-    const rows = await this.stats.find({ scope, sellerId, day: { $gte: fromDay } }).select(`day ${field}`).lean();
+  private async countsByKey(field: 'visits' | 'productViews', scope: StatScope, sellerId: string | null, fromDay: string, monthly: boolean): Promise<Map<string, number>> {
+    const rows = await this.db.find(dailyStats, { scope, sellerId, day: { $gte: fromDay } });
     const out = new Map<string, number>();
     for (const row of rows) {
       const key = monthly ? row.day.slice(0, 7) : row.day;
-      out.set(key, (out.get(key) ?? 0) + (row[field] ?? 0));
+      out.set(key, (out.get(key) ?? 0) + row[field]);
     }
     return out;
   }
 
+  private countOf(table: Table, where: Where<any>): Promise<number> {
+    return this.db.count(table, where);
+  }
+
   /** Seller Analytics: revenue against the previous period, orders by status and store views. */
   async sellerAnalytics(sellerId: string, range: '7d' | '30d' | '12m') {
-    const owner = new Types.ObjectId(sellerId);
     const monthly = range === '12m';
     const { current, previous, from, previousFrom, to } = buildBuckets(range, new Date());
     const [money, views, statuses] = await Promise.all([
-      this.moneyByKey({ sellerId: owner }, previousFrom, to, '$sellerEarning', monthly),
-      this.countsByKey('productViews', 'seller', owner, dayKey(previousFrom), monthly),
-      this.orders.aggregate<{ _id: string; count: number }>([
-        { $match: { sellerId: owner, 'payment.status': 'paid', 'payment.paidAt': { $gte: from } } },
+      this.moneyByKey({ sellerId }, previousFrom, to, 'sellerEarning', monthly),
+      this.countsByKey('productViews', 'seller', sellerId, dayKey(previousFrom), monthly),
+      this.db.aggregate<{ status: string; count: number }>(orders, [
+        { $match: { sellerId, paymentStatus: 'paid', paymentPaidAt: { $gte: from } } },
         { $group: { _id: '$status', count: { $sum: 1 } } },
+        { $project: { _id: 0, status: '$_id', count: 1 } },
       ]),
     ]);
     const currentRevenue = fold(current, money);
     const previousRevenue = fold(previous, money);
-    const byStatus = new Map(statuses.map((row) => [row._id, row.count]));
+    const byStatus = new Map<string, number>(statuses.map((row) => [row.status, row.count]));
     const totalRevenue = currentRevenue.reduce((sum, value) => sum + value, 0);
     const lastRevenue = previousRevenue.reduce((sum, value) => sum + value, 0);
     const totalViews = fold(current, views).reduce((sum, value) => sum + value, 0);
-    const orders = [...byStatus.values()].reduce((sum, value) => sum + value, 0);
+    const orderCount = [...byStatus.values()].reduce((sum, value) => sum + value, 0);
     return {
       range,
       rangeLabel: RANGE_LABEL[range],
@@ -102,8 +108,8 @@ export class AnalyticsService implements OnModuleInit {
         revenue: Math.round(totalRevenue * 100) / 100,
         previousRevenue: Math.round(lastRevenue * 100) / 100,
         change: percentChange(totalRevenue, lastRevenue),
-        orders,
-        conversionRate: totalViews > 0 ? Math.round((orders / totalViews) * 1000) / 10 : 0,
+        orders: orderCount,
+        conversionRate: totalViews > 0 ? Math.round((orderCount / totalViews) * 1000) / 10 : 0,
       },
     };
   }
@@ -113,17 +119,21 @@ export class AnalyticsService implements OnModuleInit {
     const monthStart = new Date(`${dayKey().slice(0, 7)}-01T00:00:00+01:00`);
     const lastMonthStart = new Date(monthStart.getTime());
     lastMonthStart.setUTCMonth(lastMonthStart.getUTCMonth() - 1);
-    const people = { email: { $ne: OFFICIAL_STORE_EMAIL }, status: { $ne: 'closed' as const } };
+    const people = { email: { $ne: OFFICIAL_STORE_EMAIL }, status: { $ne: 'closed' } };
+    // Accounts without a role yet count as buyers, as on the storefront.
+    const buyer = { ...people, role: { $ne: 'seller' } };
+    const seller = { ...people, role: 'seller' };
+    const live = { status: 'active', deletedAt: null };
     const [buyers, buyersNew, sellers, sellersNew, items, itemsNew, active, fundedThis, fundedLast] = await Promise.all([
-      this.users.countDocuments({ ...people, role: { $ne: 'seller' } }),
-      this.users.countDocuments({ ...people, role: { $ne: 'seller' }, createdAt: { $gte: monthStart } }),
-      this.users.countDocuments({ ...people, role: 'seller' }),
-      this.users.countDocuments({ ...people, role: 'seller', createdAt: { $gte: monthStart } }),
-      this.products.countDocuments({ status: 'active', deletedAt: null }),
-      this.products.countDocuments({ status: 'active', deletedAt: null, publishedAt: { $gte: monthStart } }),
-      this.orders.countDocuments({ 'escrow.status': { $in: ['pending', 'dispute'] } }),
-      this.orders.countDocuments({ 'escrow.fundedAt': { $gte: monthStart } }),
-      this.orders.countDocuments({ 'escrow.fundedAt': { $gte: lastMonthStart, $lt: monthStart } }),
+      this.countOf(users, buyer),
+      this.countOf(users, { ...buyer, createdAt: { $gte: monthStart } }),
+      this.countOf(users, seller),
+      this.countOf(users, { ...seller, createdAt: { $gte: monthStart } }),
+      this.countOf(products, live),
+      this.countOf(products, { ...live, publishedAt: { $gte: monthStart } }),
+      this.countOf(orders, { escrowStatus: { $in: ['pending', 'dispute'] } }),
+      this.countOf(orders, { escrowFundedAt: { $gte: monthStart } }),
+      this.countOf(orders, { escrowFundedAt: { $gte: lastMonthStart, $lt: monthStart } }),
     ]);
     const growth = (total: number, added: number) => percentChange(total, total - added);
     return [
@@ -139,7 +149,7 @@ export class AnalyticsService implements OnModuleInit {
     const { current, previous, previousFrom, to } = buildBuckets(range, new Date());
     const values =
       id === 'transactions'
-        ? await this.moneyByKey({}, previousFrom, to, '$total', false)
+        ? await this.moneyByKey({}, previousFrom, to, 'total', false)
         : await this.countsByKey('visits', 'site', null, dayKey(previousFrom), false);
     const currentPoints = fold(current, values);
     const previousPoints = fold(previous, values);
@@ -162,7 +172,7 @@ export class AnalyticsService implements OnModuleInit {
 
   /** Housekeeping for tests and reports: today's site counters. */
   async today() {
-    const row = await this.stats.findOne({ scope: 'site', sellerId: null, day: dayKey(startOfLagosDay()) }).lean();
+    const row = await this.db.findOne(dailyStats, { scope: 'site', sellerId: null, day: dayKey(startOfLagosDay()) });
     return { visits: row?.visits ?? 0, productViews: row?.productViews ?? 0 };
   }
 }

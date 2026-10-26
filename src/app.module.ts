@@ -1,9 +1,9 @@
 import { Module } from '@nestjs/common';
 import { APP_GUARD, Reflector } from '@nestjs/core';
-import { MongooseModule } from '@nestjs/mongoose';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { LoggerModule } from 'nestjs-pino';
+import { CacheModule } from './cache/cache.module';
 import { AUTH_THROTTLE } from './common/auth/throttle';
 import { EventsModule } from './common/events/events.module';
 import { AppConfigModule } from './config/config.module';
@@ -72,15 +72,6 @@ const reflector = new Reflector();
         },
       }),
     }),
-    MongooseModule.forRootAsync({
-      inject: [APP_CONFIG],
-      useFactory: (config: AppConfig) => ({
-        uri: config.mongo.uri,
-        dbName: config.mongo.dbName,
-        autoIndex: true,
-        serverSelectionTimeoutMS: 10_000,
-      }),
-    }),
     ThrottlerModule.forRootAsync({
       inject: [APP_CONFIG],
       useFactory: (config: AppConfig) => ({
@@ -97,6 +88,7 @@ const reflector = new Reflector();
     }),
     ScheduleModule.forRoot(),
     DatabaseModule,
+    CacheModule,
     EventsModule,
     AuditModule,
     SettingsModule,

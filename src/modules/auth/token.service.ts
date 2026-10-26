@@ -1,13 +1,14 @@
 import { Injectable } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import { InjectModel } from '@nestjs/mongoose';
 import { createHash, randomBytes } from 'node:crypto';
-import { Model, Types } from 'mongoose';
 import { Errors } from '../../common/api/app-error';
 import type { AccessTokenPayload } from '../../common/auth/principal';
+import type { SubjectType } from '../../common/domain';
+import { isUuid } from '../../common/util/uuid';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
-import { Session, type SubjectType } from './schemas/session.schema';
+import { InjectDb, type Database } from '../../database/database';
+import { sessions } from '../../database/schema';
 
 export type TokenPair = {
   accessToken: string;
@@ -28,7 +29,7 @@ export class TokenService {
   constructor(
     private readonly jwt: JwtService,
     @InjectConfig() private readonly config: AppConfig,
-    @InjectModel(Session.name) private readonly sessions: Model<Session>,
+    @InjectDb() private readonly db: Database,
   ) {}
 
   private secretFor(type: SubjectType): string {
@@ -57,7 +58,7 @@ export class TokenService {
         issuer: 'dooaa',
         audience: type === 'staff' ? 'dooaa-admin' : 'dooaa-client',
       });
-      if (payload.typ !== type || !Types.ObjectId.isValid(payload.sub)) throw new Error('wrong token type');
+      if (payload.typ !== type || !isUuid(payload.sub)) throw new Error('wrong token type');
       return payload;
     } catch (error) {
       const expired = (error as { name?: string }).name === 'TokenExpiredError';
@@ -71,14 +72,14 @@ export class TokenService {
     const refreshToken = `${type === 'staff' ? 's' : 'u'}.${randomBytes(48).toString('base64url')}`;
     const days = type === 'staff' ? this.config.jwt.staffRefreshTtlDays : this.config.jwt.refreshTtlDays;
     const expiresAt = new Date(Date.now() + days * 86_400_000);
-    await this.sessions.create({
-      subjectId: new Types.ObjectId(subjectId),
+    await this.db.insert(sessions, {
+      subjectId,
       subjectType: type,
       tokenHash: hashToken(refreshToken),
       family: family ?? randomBytes(12).toString('hex'),
       expiresAt,
-      ip: meta.ip,
-      userAgent: meta.userAgent,
+      ip: meta.ip ?? null,
+      userAgent: meta.userAgent ?? null,
     });
     return {
       accessToken: await this.signAccess(type, subjectId, version),
@@ -94,44 +95,31 @@ export class TokenService {
    */
   async rotate(type: SubjectType, refreshToken: string, meta: SessionMeta = {}): Promise<{ subjectId: string; family: string }> {
     const tokenHash = hashToken(refreshToken);
-    const session = await this.sessions.findOne({ tokenHash, subjectType: type }).lean();
+    const session = await this.db.findOne(sessions, { tokenHash, subjectType: type });
     if (!session) throw Errors.unauthorized('Sign in again to continue.', 'INVALID_REFRESH_TOKEN');
     if (session.revokedAt) {
-      await this.sessions.updateMany({ family: session.family, revokedAt: null }, { $set: { revokedAt: new Date() } });
+      await this.db.updateMany(sessions, { family: session.family, revokedAt: null }, { revokedAt: new Date() });
       throw Errors.unauthorized('Sign in again to continue.', 'REFRESH_TOKEN_REUSED');
     }
     if (session.expiresAt.getTime() < Date.now()) {
       throw Errors.unauthorized('Your session has expired. Sign in again.', 'REFRESH_TOKEN_EXPIRED');
     }
     // Conditional update: two concurrent refreshes with one token cannot both win.
-    const claimed = await this.sessions.findOneAndUpdate(
-      { _id: session._id, revokedAt: null },
-      { $set: { revokedAt: new Date(), replacedAt: new Date(), ip: meta.ip ?? session.ip } },
-    );
+    const now = new Date();
+    const claimed = await this.db.update(sessions, { id: session.id, revokedAt: null }, { revokedAt: now, replacedAt: now, ip: meta.ip ?? session.ip });
     if (!claimed) throw Errors.unauthorized('Sign in again to continue.', 'REFRESH_TOKEN_REUSED');
-    return { subjectId: String(session.subjectId), family: session.family };
+    return { subjectId: session.subjectId, family: session.family };
   }
 
   async revoke(type: SubjectType, refreshToken: string): Promise<void> {
-    await this.sessions.updateOne(
-      { tokenHash: hashToken(refreshToken), subjectType: type, revokedAt: null },
-      { $set: { revokedAt: new Date() } },
-    );
+    await this.db.updateMany(sessions, { tokenHash: hashToken(refreshToken), subjectType: type, revokedAt: null }, { revokedAt: new Date() });
   }
 
   async revokeAll(type: SubjectType, subjectId: string): Promise<void> {
-    await this.sessions.updateMany(
-      { subjectId: new Types.ObjectId(subjectId), subjectType: type, revokedAt: null },
-      { $set: { revokedAt: new Date() } },
-    );
+    await this.db.updateMany(sessions, { subjectId, subjectType: type, revokedAt: null }, { revokedAt: new Date() });
   }
 
   async activeSessionCount(type: SubjectType, subjectId: string): Promise<number> {
-    return this.sessions.countDocuments({
-      subjectId: new Types.ObjectId(subjectId),
-      subjectType: type,
-      revokedAt: null,
-      expiresAt: { $gt: new Date() },
-    });
+    return this.db.count(sessions, { subjectId, subjectType: type, revokedAt: null, expiresAt: { $gt: new Date() } });
   }
 }

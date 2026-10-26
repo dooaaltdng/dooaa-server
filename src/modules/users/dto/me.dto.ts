@@ -1,15 +1,16 @@
 import { Type } from 'class-transformer';
 import { IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUrl, Matches, Max, MaxLength, Min, MinLength } from 'class-validator';
-import { CLOSE_REASONS, GENDERS, type Gender } from '../../../common/domain';
+import { CLOSE_REASONS, type Gender, GENDERS, OTP_CHANNELS, type OtpChannel } from '../../../common/domain';
 import { Trim } from '../../../common/util/transforms';
 import { IsPersonName, IsPhoneNumber, IsStrongPassword } from '../../../common/util/validators';
-import { OTP_CHANNELS, type OtpChannel } from '../../otp/otp.schema';
 
 export class UpdateProfileDto {
+  /** Full name, as one field; stored as first name + the rest. */
+  @IsOptional() @Trim() @IsString() @MinLength(2, { message: 'Enter your full name.' }) @MaxLength(100) @Matches(/^[\p{L}][\p{L}\p{M}'’. -]*$/u, { message: 'Use letters only in your name.' }) name?: string;
   @IsOptional() @Trim() @IsPersonName('First name') firstName?: string;
   @IsOptional() @Trim() @IsPersonName('Last name') lastName?: string;
   @IsOptional() @Trim() @IsPhoneNumber() phone?: string;
-  @IsOptional() @Trim() @IsString() @MaxLength(60) location?: string;
+  @IsOptional() @Trim() @IsString() @MaxLength(120) location?: string;
   @IsOptional() @IsIn(GENDERS) gender?: Gender;
   /** Seller profile, shown on listings and in chat. */
   @IsOptional() @Trim() @IsString() @MaxLength(80) storeName?: string;
@@ -44,5 +45,6 @@ export class ChangePasswordDto {
 export class CloseAccountDto {
   @IsIn(CLOSE_REASONS, { message: 'Choose a reason so we know how to improve.' }) reason: string;
   @IsOptional() @Trim() @IsString() @MaxLength(1000) notes?: string;
-  @IsString() @MinLength(1, { message: 'Enter your password to confirm.' }) @MaxLength(128) password: string;
+  /** The 6-digit code from POST /me/close/code — sign-in is passwordless, so the email confirms it. */
+  @IsString() @Matches(/^\d{6}$/, { message: 'Enter the 6-digit code from your email.' }) code: string;
 }

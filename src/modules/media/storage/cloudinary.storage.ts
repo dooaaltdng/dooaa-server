@@ -1,6 +1,6 @@
 import { v2 as cloudinary, type UploadApiResponse } from 'cloudinary';
-import type { MediaKind, MediaVisibility } from '../media.schema';
 import type { DirectUploadTicket, InspectedObject, PutResult, StorageDriver, StoredObject } from './storage.driver';
+import { type MediaKind, type MediaVisibility } from '../../../common/domain';
 
 export type CloudinaryOptions = { cloudName: string; apiKey: string; apiSecret: string; folder: string };
 type ResourceType = 'image' | 'video' | 'raw';

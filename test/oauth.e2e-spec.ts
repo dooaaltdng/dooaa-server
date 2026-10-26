@@ -1,13 +1,9 @@
-import { getModelToken } from '@nestjs/mongoose';
-import type { Model } from 'mongoose';
 import request from 'supertest';
 import { createTestApp, type TestApp } from './utils/app';
 import { API, Http, data, failure } from './utils/http';
-import { PASSWORD, registerUser, uniqueEmail } from './utils/factories';
-import { OAuthGrant } from '../src/modules/auth/oauth/oauth-grant.schema';
+import { PASSWORD, model, registerUser, uniqueEmail } from './utils/factories';
 import type { OAuthProfile } from '../src/modules/auth/oauth/oauth-provider';
 import { sandboxOAuthCode } from '../src/modules/auth/oauth/sandbox.provider';
-import { User } from '../src/modules/users/schemas/user.schema';
 
 const CLIENT = 'http://localhost:3000';
 const CALLBACK = 'http://localhost:4000/api/v1/auth/oauth/google/callback';
@@ -15,12 +11,12 @@ const CALLBACK = 'http://localhost:4000/api/v1/auth/oauth/google/callback';
 describe('Social sign-in (e2e)', () => {
   let t: TestApp;
   let http: Http;
-  let users: Model<User>;
+  let users: ReturnType<typeof model>;
 
   beforeAll(async () => {
     t = await createTestApp();
     http = new Http(t);
-    users = t.get<Model<User>>(getModelToken(User.name));
+    users = model(t, 'User');
   });
   afterAll(async () => t.close());
 
@@ -116,7 +112,7 @@ describe('Social sign-in (e2e)', () => {
       expect(me.id).toBe(body.user.id);
 
       const stored = await users.findById(body.user.id).select('+passwordHash').lean();
-      expect(stored?.oauth).toEqual([expect.objectContaining({ provider: 'google', subject: who.subject, email: who.email })]);
+      expect(await model(t, 'UserOauthIdentity').find({ userId: body.user.id })).toEqual([expect.objectContaining({ provider: 'google', subject: who.subject, email: who.email })]);
       expect(stored?.passwordHash).toMatch(/^\$2[aby]\$/);
       await t.mail.idle();
       expect(t.mail.lastTo(who.email!)?.subject).toBe('Welcome to DOOAA');
@@ -146,7 +142,7 @@ describe('Social sign-in (e2e)', () => {
       const { body } = await signIn(who, 'facebook');
       expect(body.isNewUser).toBe(true);
       const stored = await users.findById(body.user.id).lean();
-      expect(stored?.oauth?.[0]).toMatchObject({ provider: 'facebook', subject: who.subject });
+      expect((await model(t, 'UserOauthIdentity').find({ userId: body.user.id }))[0]).toMatchObject({ provider: 'facebook', subject: who.subject });
     });
   });
 
@@ -185,8 +181,8 @@ describe('Social sign-in (e2e)', () => {
       const viaGoogle = await signIn(profile({ email }), 'google');
       const viaFacebook = await signIn(profile({ email }), 'facebook');
       expect(viaFacebook.body.user.id).toBe(viaGoogle.body.user.id);
-      const stored = await users.findById(viaGoogle.body.user.id).lean();
-      expect(stored?.oauth?.map((identity) => identity.provider).sort()).toEqual(['facebook', 'google']);
+      const identities = await model(t, 'UserOauthIdentity').find({ userId: viaGoogle.body.user.id });
+      expect(identities.map((identity: { provider: string }) => identity.provider).sort()).toEqual(['facebook', 'google']);
     });
   });
 
@@ -252,13 +248,13 @@ describe('Social sign-in (e2e)', () => {
     it('stores only a hash of the code', async () => {
       const landing = await roundTrip(profile());
       const code = landing.searchParams.get('code')!;
-      const grants = t.get<Model<OAuthGrant>>(getModelToken(OAuthGrant.name));
+      const grants = model(t, 'OAuthGrant');
       expect(await grants.countDocuments({ codeHash: code })).toBe(0);
     });
 
     it('expires', async () => {
       const landing = await roundTrip(profile());
-      const grants = t.get<Model<OAuthGrant>>(getModelToken(OAuthGrant.name));
+      const grants = model(t, 'OAuthGrant');
       await grants.updateMany({}, { $set: { expiresAt: new Date(Date.now() - 1000) } });
       failure(await http.post('/auth/oauth/exchange', { code: landing.searchParams.get('code') }), 400, 'OAUTH_CODE_INVALID');
     });

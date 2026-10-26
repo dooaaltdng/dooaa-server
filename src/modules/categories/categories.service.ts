@@ -1,13 +1,13 @@
 import { Injectable } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { CacheService } from '../../cache/cache.service';
 import { Errors } from '../../common/api/app-error';
-import { TtlCache } from '../../common/util/cache';
-import type { Lean } from '../../common/util/mongo';
-import { Product } from '../products/schemas/product.schema';
+import { slugify } from '../../common/util/text';
+import { InjectDb, type Database } from '../../database/database';
+import { categories, products } from '../../database/schema';
 import { PUBLIC_PRODUCT_FILTER } from '../products/product.filters';
-import { Category } from './category.schema';
 import { DEFAULT_CATEGORIES } from './category.seed';
+
+export type Category = typeof categories.$inferSelect;
 
 export type CategoryView = {
   id: string;
@@ -21,31 +21,37 @@ export type CategoryView = {
 
 export type HomeTileView = { id: string; name: string; image: string };
 
+const ALL_KEY = 'categories:all';
+const COUNTS_KEY = 'categories:counts';
+const ALL_TTL_MS = 10 * 60_000;
+const COUNTS_TTL_MS = 30_000;
+
 @Injectable()
 export class CategoriesService {
-  private readonly cache = new TtlCache<Lean<Category>[]>(60_000, 1);
-  private readonly counts = new TtlCache<Map<string, number>>(30_000, 1);
-
   constructor(
-    @InjectModel(Category.name) private readonly categories: Model<Category>,
-    @InjectModel(Product.name) private readonly products: Model<Product>,
+    @InjectDb() private readonly db: Database,
+    private readonly cache: CacheService,
   ) {}
 
-  private all(): Promise<Lean<Category>[]> {
-    return this.cache.wrap('all', () => this.categories.find().sort({ order: 1, name: 1 }).lean<Lean<Category>[]>());
+  private all(): Promise<Category[]> {
+    return this.cache.wrap(ALL_KEY, ALL_TTL_MS, async () =>
+      (await this.db.find(categories, {})).sort((a, b) => a.name.localeCompare(b.name, 'en', { sensitivity: 'base' })),
+    );
   }
 
-  private productCounts(): Promise<Map<string, number>> {
-    return this.counts.wrap('counts', async () => {
-      const rows = await this.products.aggregate<{ _id: string; count: number }>([
+  /** Live listings per category slug. */
+  private async productCounts(): Promise<Map<string, number>> {
+    const rows = await this.cache.wrap(COUNTS_KEY, COUNTS_TTL_MS, () =>
+      this.db.aggregate<{ slug: string; count: number }>(products, [
         { $match: PUBLIC_PRODUCT_FILTER },
         { $group: { _id: '$categoryId', count: { $sum: 1 } } },
-      ]);
-      return new Map(rows.map((row) => [row._id, row.count]));
-    });
+        { $project: { _id: 0, slug: '$_id', count: 1 } },
+      ]),
+    );
+    return new Map(rows.map((row) => [row.slug, row.count]));
   }
 
-  private view(category: Lean<Category>, counts: Map<string, number>): CategoryView {
+  private view(category: Category, counts: Map<string, number>): CategoryView {
     return {
       id: category.slug,
       slug: category.slug,
@@ -58,24 +64,26 @@ export class CategoriesService {
   }
 
   async list(includeInactive = false): Promise<CategoryView[]> {
-    const [categories, counts] = await Promise.all([this.all(), this.productCounts()]);
-    return categories.filter((category) => includeInactive || category.active).map((category) => this.view(category, counts));
+    const [all, counts] = await Promise.all([this.all(), this.productCounts()]);
+    return all.filter((category) => includeInactive || category.active).map((category) => this.view(category, counts));
   }
 
   async get(slug: string): Promise<CategoryView> {
-    const [categories, counts] = await Promise.all([this.all(), this.productCounts()]);
-    const category = categories.find((entry) => entry.slug === slug && entry.active);
+    const [all, counts] = await Promise.all([this.all(), this.productCounts()]);
+    const category = all.find((entry) => entry.slug === slug && entry.active);
     if (!category) throw Errors.notFound('That category does not exist.', 'CATEGORY_NOT_FOUND');
     return this.view(category, counts);
   }
 
-  /** The landing rail's six tiles, in their drawn order and labels. */
+  /**
+   * The landing page's "Browse Categories" rail: exactly the categories the
+   * console manages — every visible one, A–Z, with the name and image set in
+   * Items & Listing Management → Categories.
+   */
   async homeTiles(): Promise<HomeTileView[]> {
-    const categories = (await this.all()).filter((category) => category.active);
-    return categories
-      .flatMap((category) => category.home.map((tile) => ({ order: tile.order, id: category.slug, name: tile.label, image: tile.image || category.image })))
-      .sort((a, b) => a.order - b.order)
-      .map(({ id, name, image }) => ({ id, name, image }));
+    return (await this.all())
+      .filter((category) => category.active)
+      .map((category) => ({ id: category.slug, name: category.name, image: category.image }));
   }
 
   async nameOf(slug: string): Promise<string> {
@@ -96,30 +104,84 @@ export class CategoriesService {
     if (unknown.length) throw Errors.badRequest(`Unknown categories: ${unknown.join(', ')}.`, 'UNKNOWN_CATEGORY');
   }
 
+  /** The console's view: hidden categories too, in shop order, with every listing counted (not only live ones). */
+  async adminList(): Promise<(CategoryView & { order: number; totalListings: number })[]> {
+    const [all, counts, totals] = await Promise.all([
+      this.all(),
+      this.productCounts(),
+      this.db.aggregate<{ slug: string; count: number }>(products, [
+        { $match: { deletedAt: null } },
+        { $group: { _id: '$categoryId', count: { $sum: 1 } } },
+        { $project: { _id: 0, slug: '$_id', count: 1 } },
+      ]),
+    ]);
+    const total = new Map(totals.map((row) => [row.slug, row.count]));
+    return all.map((category) => ({ ...this.view(category, counts), order: category.order, totalListings: total.get(category.slug) ?? 0 }));
+  }
+
+  /** A new category; categories are listed alphabetically. Its slug (the URL part) comes from the name and never changes. */
+  async create(input: { name: string; description?: string; image?: string; active?: boolean }): Promise<CategoryView> {
+    const base = slugify(input.name);
+    if (!base) throw Errors.badRequest('Give the category a name with letters or numbers.', 'CATEGORY_NAME_INVALID');
+    const all = await this.db.find(categories, {}, { sort: { order: -1 } });
+    if (all.some((category) => category.name.trim().toLowerCase() === input.name.trim().toLowerCase())) {
+      throw Errors.conflict(`A category called "${input.name.trim()}" already exists.`, 'CATEGORY_EXISTS');
+    }
+    let slug = base;
+    for (let n = 2; all.some((category) => category.slug === slug); n += 1) slug = `${base}-${n}`;
+    const created = await this.db.insert(categories, {
+      slug,
+      name: input.name.trim(),
+      description: input.description?.trim() ?? '',
+      image: input.image ?? '',
+      active: input.active ?? true,
+      order: (all[0]?.order ?? 0) + 1,
+      home: [],
+    });
+    await this.invalidate();
+    return this.view(created, await this.productCounts());
+  }
+
+  /** Deletes a category nothing uses. One with listings must be hidden instead, so no listing is left without a category. */
+  async remove(slug: string): Promise<{ slug: string; name: string }> {
+    const category = await this.db.findOne(categories, { slug });
+    if (!category) throw Errors.notFound('That category does not exist.', 'CATEGORY_NOT_FOUND');
+    const used = await this.db.count(products, { categoryId: slug, deletedAt: null });
+    if (used > 0) {
+      throw Errors.conflict(
+        `${category.name} still has ${used} listing${used === 1 ? '' : 's'}. Move them to another category first, or hide the category instead.`,
+        'CATEGORY_IN_USE',
+        { listings: used },
+      );
+    }
+    await this.db.deleteMany(categories, { slug });
+    await this.invalidate();
+    return { slug, name: category.name };
+  }
+
   async update(slug: string, patch: Partial<Pick<Category, 'name' | 'description' | 'image' | 'active' | 'order'>>): Promise<CategoryView> {
-    const updated = await this.categories.findOneAndUpdate({ slug }, { $set: patch }, { returnDocument: 'after' }).lean<Lean<Category>>();
+    const updated = await this.db.update(categories, { slug }, patch);
     if (!updated) throw Errors.notFound('That category does not exist.', 'CATEGORY_NOT_FOUND');
-    this.invalidate();
+    await this.invalidate();
     return this.view(updated, await this.productCounts());
   }
 
-  /** Inserts the default taxonomy where it is missing. Safe to run on every boot. */
+  /** Seeds the default taxonomy into an empty table. Safe to run on every boot; the console's edits are kept. */
   async ensureDefaults(): Promise<void> {
-    if ((await this.categories.estimatedDocumentCount()) > 0) return;
-    await this.categories.bulkWrite(
-      DEFAULT_CATEGORIES.map((category, index) => ({
-        updateOne: { filter: { slug: category.slug }, update: { $setOnInsert: { ...category, order: index + 1, active: true } }, upsert: true },
-      })),
+    if ((await this.db.count(categories)) > 0) return;
+    await this.db.insertIgnoringDuplicates(
+      categories,
+      DEFAULT_CATEGORIES.map((category, index) => ({ ...category, order: index + 1, active: true })),
     );
-    this.invalidate();
+    await this.invalidate();
   }
 
-  invalidate(): void {
-    this.cache.clear();
-    this.counts.clear();
+  async invalidate(): Promise<void> {
+    // 'catalog:home' (ProductsService) carries the landing rail, so a category edit refreshes it too.
+    await this.cache.delete(ALL_KEY, COUNTS_KEY, 'catalog:home');
   }
 
-  invalidateCounts(): void {
-    this.counts.clear();
+  async invalidateCounts(): Promise<void> {
+    await this.cache.delete(COUNTS_KEY);
   }
 }

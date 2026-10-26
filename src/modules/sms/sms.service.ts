@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { normalizePhone } from '../../common/util/text';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
+import { explain } from '../../common/util/explain-error';
 
 export type SmsChannel = 'sms' | 'whatsapp';
 export type SentSms = { to: string; body: string; channel: SmsChannel; at: Date };
@@ -42,12 +43,12 @@ export class SmsService {
         signal: AbortSignal.timeout(10_000),
       });
       if (!response.ok) {
-        this.logger.warn(`Termii refused a ${channel} to ${to}: HTTP ${response.status}`);
+        this.logger.warn(`Termii (the SMS provider) refused to send a ${channel} message to ${to}. Details: HTTP ${response.status}`);
         return false;
       }
       return true;
     } catch (error) {
-      this.logger.error(`Termii ${channel} to ${to} failed: ${(error as Error).message}`);
+      this.logger.error(explain(`Could not send a ${channel} message to ${to} through Termii (the SMS provider)`, error));
       return false;
     }
   }

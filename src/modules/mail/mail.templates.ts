@@ -73,6 +73,16 @@ ${paragraphs}${code}${cta}${footnote}
 export type OtpPurposeCopy = { subject: string; heading: string; lead: string };
 
 export const OTP_COPY: Record<string, OtpPurposeCopy> = {
+  'close-account': {
+    subject: 'Confirm deleting your DOOAA account',
+    heading: 'Confirm account deletion',
+    lead: 'Enter this code to permanently delete your DOOAA account. If you did not ask for this, ignore this email and your account stays as it is.',
+  },
+  'sign-in': {
+    subject: 'Your DOOAA sign-in code',
+    heading: 'Sign in to DOOAA',
+    lead: 'Enter this code to sign in. If you did not try to sign in, you can ignore this email.',
+  },
   'verify-email': {
     subject: 'Your DOOAA verification code',
     heading: 'Confirm your email address',

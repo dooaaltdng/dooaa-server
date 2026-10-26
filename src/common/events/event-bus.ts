@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { explain } from '../util/explain-error';
 
 /**
  * In-process domain events, so a payment webhook can complete an order, an
@@ -27,7 +28,7 @@ export class EventBus {
       try {
         await handler(payload);
       } catch (error) {
-        this.logger.error(`Handler for ${event} failed: ${(error as Error).message}`);
+        this.logger.error(explain(`Something that runs after "${event}" failed (the main action still succeeded)`, error));
         throw error;
       }
     }

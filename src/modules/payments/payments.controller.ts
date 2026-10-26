@@ -20,8 +20,9 @@ export class PaymentsController {
   ) {}
 
   /**
-   * Provider webhooks. The signature over the raw body is checked before
-   * anything is read; a bad signature gets a 401 and changes nothing.
+   * Provider webhooks (Bachs posts to /payments/webhooks/bachs). The
+   * signature over the raw body is checked before anything is read; a bad
+   * signature gets a 401 and changes nothing.
    */
   @Public()
   @SkipThrottle()
@@ -57,7 +58,7 @@ export class PaymentsController {
   @Get(':reference')
   async get(@CurrentUser() user: AuthUser, @Param('reference') reference: string) {
     const payment = await this.payments.findByReference(reference);
-    if (!payment || String(payment.buyerId) !== user.id) throw Errors.notFound('We could not find that payment.', 'PAYMENT_NOT_FOUND');
+    if (!payment || payment.buyerId !== user.id) throw Errors.notFound('We could not find that payment.', 'PAYMENT_NOT_FOUND');
     return this.payments.view(payment);
   }
 

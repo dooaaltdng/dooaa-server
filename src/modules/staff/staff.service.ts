@@ -1,24 +1,32 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
 import { createHash, randomBytes } from 'node:crypto';
-import { Model } from 'mongoose';
 import { Errors } from '../../common/api/app-error';
 import type { AuthStaff } from '../../common/auth/principal';
 import { STAFF_ROLE_LABEL, type StaffRole } from '../../common/domain';
-import type { Lean } from '../../common/util/mongo';
 import { normalizeEmail } from '../../common/util/text';
+import { isUuid } from '../../common/util/uuid';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
+import { InjectDb, isUniqueViolation, type Database } from '../../database/database';
+import { staff } from '../../database/schema';
 import { AuditService } from '../audit/audit.service';
 import { PrincipalService } from '../auth/principal.service';
 import { TokenService, type SessionMeta, type TokenPair } from '../auth/token.service';
 import { MailService } from '../mail/mail.service';
+import { MediaService } from '../media/media.service';
+import { OtpService, type IssuedOtp } from '../otp/otp.service';
 import { PasswordService } from '../users/password.service';
 import { PRESENCE, PresenceRegistry } from './presence';
-import { Staff } from './schemas/staff.schema';
+import { staffOmit, toStaff, type StaffMember } from './staff.model';
 import { toStaffSession, type StaffSession } from './staff.presenter';
 
 const INVITE_TTL_DAYS = 7;
+/** How long the reset token handed out after a correct code stays usable. */
+const RESET_TOKEN_MINUTES = 15;
+/** OTP context that keeps console reset codes apart from marketplace ones. */
+const STAFF_OTP_CONTEXT = 'staff';
+/** The one message every failed forgot-password step shows, so it never says why. */
+const RESET_FAILED = "We couldn't complete that request.";
 
 function hashInvite(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -27,50 +35,58 @@ function hashInvite(token: string): string {
 @Injectable()
 export class StaffService {
   constructor(
-    @InjectModel(Staff.name) private readonly staff: Model<Staff>,
+    @InjectDb() private readonly db: Database,
     private readonly passwords: PasswordService,
     private readonly tokens: TokenService,
     private readonly principals: PrincipalService,
     private readonly audit: AuditService,
     private readonly mail: MailService,
+    private readonly otp: OtpService,
+    private readonly media: MediaService,
     @Inject(PRESENCE) private readonly presence: PresenceRegistry,
     @InjectConfig() private readonly config: AppConfig,
   ) {}
 
-  private session(member: Lean<Staff>): StaffSession {
-    return toStaffSession(member, this.presence.isOnline(String(member._id)));
+  private session(member: StaffMember): StaffSession {
+    return toStaffSession(member, this.presence.isOnline(member.id));
+  }
+
+  /** A live invitation or reset link, by its token. */
+  private async byLinkToken(token: string): Promise<StaffMember | null> {
+    return this.db.findOne(
+      staff,
+      { inviteTokenHash: hashInvite(token), status: { $in: ['invited', 'active'] }, inviteExpiresAt: { $gt: new Date() } },
+      { omit: staffOmit },
+    );
   }
 
   async signIn(email: string, password: string, meta: SessionMeta): Promise<{ session: StaffSession; tokens: TokenPair }> {
-    const member = await this.staff.findOne({ email: normalizeEmail(email) }).select('+passwordHash').lean<Lean<Staff>>();
+    const member = await this.db.findOne(staff, { email: normalizeEmail(email) });
     if (member?.lockedUntil && member.lockedUntil.getTime() > Date.now()) {
       throw Errors.tooMany('Too many failed attempts. Try again later.', 'ACCOUNT_LOCKED');
     }
     const valid = await this.passwords.verify(password, member?.passwordHash);
     if (!member || !valid || member.status !== 'active') {
       if (member && !valid) {
-        const updated = await this.staff.findByIdAndUpdate(member._id, { $inc: { failedSignIns: 1 } }, { returnDocument: 'after' }).lean();
+        const updated = await this.db.update(staff, { id: member.id }, { $inc: { failedSignIns: 1 } });
         if (updated && updated.failedSignIns >= this.config.auth.maxFailedSignIns) {
-          await this.staff.updateOne(
-            { _id: member._id },
-            { $set: { lockedUntil: new Date(Date.now() + this.config.auth.lockMinutes * 60_000), failedSignIns: 0 } },
-          );
+          await this.db.update(staff, { id: member.id }, { lockedUntil: new Date(Date.now() + this.config.auth.lockMinutes * 60_000), failedSignIns: 0 });
         }
       }
       throw Errors.unauthorized('Those credentials do not match a console account.', 'INVALID_CREDENTIALS');
     }
     const now = new Date();
-    await this.staff.updateOne({ _id: member._id }, { $set: { lastLoginAt: now, lastSeenAt: now, failedSignIns: 0 }, $unset: { lockedUntil: 1 } });
-    const tokens = await this.tokens.issue('staff', String(member._id), member.tokenVersion ?? 0, meta);
-    return { session: this.session({ ...member, lastLoginAt: now, lastSeenAt: now }), tokens };
+    const signedIn = (await this.db.update(staff, { id: member.id }, { lastLoginAt: now, lastSeenAt: now, failedSignIns: 0, lockedUntil: null }))!;
+    const tokens = await this.tokens.issue('staff', member.id, member.tokenVersion, meta);
+    return { session: this.session(toStaff(signedIn)), tokens };
   }
 
   async refresh(refreshToken: string | undefined, meta: SessionMeta): Promise<{ session: StaffSession; tokens: TokenPair }> {
     if (!refreshToken) throw Errors.unauthorized('Sign in again to continue.', 'INVALID_REFRESH_TOKEN');
     const { subjectId, family } = await this.tokens.rotate('staff', refreshToken, meta);
-    const member = await this.staff.findById(subjectId).lean<Lean<Staff>>();
+    const member = await this.findById(subjectId);
     if (!member || member.status !== 'active') throw Errors.unauthorized('Sign in again to continue.', 'INVALID_REFRESH_TOKEN');
-    const tokens = await this.tokens.issue('staff', subjectId, member.tokenVersion ?? 0, meta, family);
+    const tokens = await this.tokens.issue('staff', subjectId, member.tokenVersion, meta, family);
     return { session: this.session(member), tokens };
   }
 
@@ -79,32 +95,48 @@ export class StaffService {
   }
 
   async me(actor: AuthStaff): Promise<StaffSession> {
-    const member = await this.staff.findById(actor.id).lean<Lean<Staff>>();
+    const member = await this.findById(actor.id);
     if (!member) throw Errors.unauthorized();
     return this.session(member);
   }
 
-  /** The whole team: active and invited members by seniority, then anyone removed (so they can be restored). */
-  async list(): Promise<StaffSession[]> {
-    const members = await this.staff.find().sort({ role: 1, createdAt: 1 }).lean<Lean<Staff>[]>();
-    const rank: Record<StaffRole, number> = { superadmin: 0, admin: 1, moderator: 2 };
-    const removed = (member: Lean<Staff>) => (member.status === 'disabled' ? 1 : 0);
-    return members
-      .sort((a, b) => removed(a) - removed(b) || rank[a.role] - rank[b.role])
-      .map((member) => this.session(member));
+  /** Your own name. Role, email and title stay with a superadmin. */
+  async updateOwnProfile(actor: AuthStaff, input: { firstName: string; lastName: string }): Promise<StaffSession> {
+    const updated = await this.db.update(staff, { id: actor.id }, { firstName: input.firstName, lastName: input.lastName });
+    if (!updated) throw Errors.unauthorized();
+    await this.principals.invalidateStaff(actor.id);
+    return this.session(toStaff(updated));
   }
 
-  async findById(id: string): Promise<Lean<Staff> | null> {
-    return this.staff.findById(id).lean<Lean<Staff>>();
+  /** Your own photo: a URL you uploaded with purpose "avatar", or null to remove it. */
+  async setOwnAvatar(actor: AuthStaff, url: string | null): Promise<StaffSession> {
+    if (url) await this.media.assertOwnedUrls([url], { id: actor.id, type: 'staff' }, ['avatar']);
+    const updated = await this.db.update(staff, { id: actor.id }, { avatarUrl: url });
+    if (!updated) throw Errors.unauthorized();
+    await this.principals.invalidateStaff(actor.id);
+    return this.session(toStaff(updated));
+  }
+
+  /** The whole team: active and invited members by seniority, then anyone removed (so they can be restored). */
+  async list(): Promise<StaffSession[]> {
+    const members = await this.db.find(staff, {}, { sort: { createdAt: 1 }, omit: staffOmit });
+    const rank: Record<StaffRole, number> = { superadmin: 0, admin: 1, moderator: 2 };
+    const removed = (member: StaffMember) => (member.status === 'disabled' ? 1 : 0);
+    return members.sort((a, b) => removed(a) - removed(b) || rank[a.role] - rank[b.role]).map((member) => this.session(member));
+  }
+
+  async findById(id: string): Promise<StaffMember | null> {
+    if (!isUuid(id)) return null;
+    return this.db.findOne(staff, { id }, { omit: staffOmit });
   }
 
   async activeSuperadmins(): Promise<number> {
-    return this.staff.countDocuments({ role: 'superadmin', status: 'active' });
+    return this.db.count(staff, { role: 'superadmin', status: 'active' });
   }
 
   /** All active staff, for fan-out notifications. */
-  async activeMembers(): Promise<Lean<Staff>[]> {
-    return this.staff.find({ status: 'active' }).lean<Lean<Staff>[]>();
+  async activeMembers(): Promise<StaffMember[]> {
+    return this.db.find(staff, { status: 'active' }, { omit: staffOmit });
   }
 
   async invite(actor: AuthStaff, input: { email: string; firstName: string; lastName: string; role: StaffRole; title?: string }): Promise<StaffSession & { inviteExpiresAt: string }> {
@@ -112,31 +144,34 @@ export class StaffService {
       throw Errors.forbidden('Only a superadmin can invite another superadmin.', 'SUPERADMIN_REQUIRED');
     }
     const email = normalizeEmail(input.email);
-    const existing = await this.staff.findOne({ email }).lean();
+    const existing = await this.db.findOne(staff, { email });
     if (existing && existing.status !== 'invited') {
       throw Errors.conflict('That email already has a console account.', 'STAFF_EXISTS');
     }
     const token = randomBytes(32).toString('base64url');
     const inviteExpiresAt = new Date(Date.now() + INVITE_TTL_DAYS * 86_400_000);
-    const member = await this.staff
-      .findOneAndUpdate(
-        { email },
-        {
-          $set: {
-            firstName: input.firstName,
-            lastName: input.lastName,
-            role: input.role,
-            title: input.title || STAFF_ROLE_LABEL[input.role],
-            status: 'invited',
-            inviteTokenHash: hashInvite(token),
-            inviteExpiresAt,
-            invitedBy: actor.id,
-          },
-        },
-        { upsert: true, returnDocument: 'after' },
-      )
-      .lean<Lean<Staff>>();
-
+    const invitation = {
+      firstName: input.firstName,
+      lastName: input.lastName,
+      role: input.role,
+      title: input.title || STAFF_ROLE_LABEL[input.role],
+      status: 'invited' as const,
+      inviteTokenHash: hashInvite(token),
+      inviteExpiresAt,
+      invitedBy: actor.id,
+    };
+    // Inviting the same address again replaces the earlier (unaccepted) invitation.
+    let member: StaffMember | null;
+    try {
+      member = existing
+        ? await this.db.update(staff, { email, status: 'invited' }, invitation)
+        : await this.db.insert(staff, { email, ...invitation });
+    } catch (error) {
+      if (!isUniqueViolation(error, 'staff_email_key')) throw error;
+      member = await this.db.update(staff, { email, status: 'invited' }, invitation);
+    }
+    member = member && toStaff(member);
+    if (!member) throw Errors.conflict('That email already has a console account.', 'STAFF_EXISTS');
     const link = `${this.config.adminUrl}/accept-invite?token=${encodeURIComponent(token)}`;
     void this.mail.send(email, {
       subject: 'You have been invited to the DOOAA console',
@@ -151,10 +186,10 @@ export class StaffService {
       action: `Invited a ${STAFF_ROLE_LABEL[input.role].toLowerCase()}`,
       target: `${input.firstName} ${input.lastName} (${email})`,
       targetType: 'staff',
-      targetId: String(member!._id),
+      targetId: member.id,
       elevated: input.role === 'superadmin',
     });
-    return { ...this.session(member!), inviteExpiresAt: inviteExpiresAt.toISOString() };
+    return { ...this.session(member), inviteExpiresAt: inviteExpiresAt.toISOString() };
   }
 
   /**
@@ -162,9 +197,7 @@ export class StaffService {
    * invited) or a password reset the platform team sent an active member.
    */
   async inviteInfo(token: string): Promise<{ email: string; firstName: string; lastName: string; role: StaffRole; purpose: 'invite' | 'reset' }> {
-    const member = await this.staff
-      .findOne({ inviteTokenHash: hashInvite(token), status: { $in: ['invited', 'active'] }, inviteExpiresAt: { $gt: new Date() } })
-      .lean<Lean<Staff>>();
+    const member = await this.byLinkToken(token);
     if (!member) throw Errors.notFound('This link is no longer valid. Ask a superadmin for a new one.', 'INVITE_INVALID');
     return {
       email: member.email,
@@ -181,33 +214,89 @@ export class StaffService {
    * the reason for it.
    */
   async acceptInvite(token: string, password: string, meta: SessionMeta): Promise<{ session: StaffSession; tokens: TokenPair }> {
-    const current = await this.staff
-      .findOne({ inviteTokenHash: hashInvite(token), status: { $in: ['invited', 'active'] }, inviteExpiresAt: { $gt: new Date() } })
-      .lean<Lean<Staff>>();
+    const current = await this.byLinkToken(token);
     if (!current) throw Errors.notFound('This link is no longer valid. Ask a superadmin for a new one.', 'INVITE_INVALID');
     const reset = current.status === 'active';
-    const member = await this.staff
-      .findOneAndUpdate(
-        { _id: current._id, inviteTokenHash: hashInvite(token) },
-        {
-          $set: { status: 'active', passwordHash: await this.passwords.hash(password), lastLoginAt: new Date(), failedSignIns: 0 },
-          $unset: { inviteTokenHash: 1, inviteExpiresAt: 1, lockedUntil: 1 },
-          ...(reset ? { $inc: { tokenVersion: 1 } } : {}),
+    const updatedMember = await this.db.update(
+      staff,
+      { id: current.id, inviteTokenHash: hashInvite(token) },
+      {
+        $set: {
+        status: 'active',
+        passwordHash: await this.passwords.hash(password),
+        lastLoginAt: new Date(),
+        failedSignIns: 0,
+        inviteTokenHash: null,
+        inviteExpiresAt: null,
+        lockedUntil: null,
         },
-        { returnDocument: 'after' },
-      )
-      .lean<Lean<Staff>>();
+        ...(reset ? { $inc: { tokenVersion: 1 } } : {}),
+      },
+    );
+    const member = updatedMember && toStaff(updatedMember);
     if (!member) throw Errors.notFound('This link is no longer valid. Ask a superadmin for a new one.', 'INVITE_INVALID');
     if (reset) {
-      this.principals.invalidateStaff(String(member._id));
-      await this.tokens.revokeAll('staff', String(member._id));
+      await this.principals.invalidateStaff(member.id);
+      await this.tokens.revokeAll('staff', member.id);
       await this.audit.record(
         { kind: 'system', name: `${member.firstName} ${member.lastName}` },
-        { action: 'Set a new console password from a reset link', target: member.email, targetType: 'staff', targetId: String(member._id) },
+        { action: 'Set a new console password from a reset link', target: member.email, targetType: 'staff', targetId: member.id },
       );
     }
-    const tokens = await this.tokens.issue('staff', String(member._id), member.tokenVersion ?? 0, meta);
+    const tokens = await this.tokens.issue('staff', member.id, member.tokenVersion, meta);
     return { session: this.session(member), tokens };
+  }
+
+  /**
+   * Forgot password, step 1: emails a 6-digit code to a console account.
+   * Invited members may use it too (it doubles as accepting the invitation);
+   * unknown and disabled addresses get the same bare failure.
+   */
+  async requestPasswordReset(rawEmail: string): Promise<IssuedOtp> {
+    const email = normalizeEmail(rawEmail);
+    const member = await this.db.findOne(staff, { email, status: { $in: ['active', 'invited'] } });
+    if (!member) throw Errors.badRequest(RESET_FAILED, 'RESET_FAILED');
+    return this.otp.issue({ key: email, purpose: 'reset-password', channel: 'email', to: email, context: STAFF_OTP_CONTEXT });
+  }
+
+  /**
+   * Step 2: a correct code is swapped for a short-lived reset token, stored
+   * like a reset link so step 3 can reuse the same one-time check.
+   */
+  async verifyResetCode(rawEmail: string, code: string): Promise<{ resetToken: string; expiresAt: string }> {
+    const email = normalizeEmail(rawEmail);
+    const member = await this.db.findOne(staff, { email, status: { $in: ['active', 'invited'] } });
+    if (!member) throw Errors.badRequest(RESET_FAILED, 'RESET_FAILED');
+    await this.otp.verify({ key: email, purpose: 'reset-password', code, context: STAFF_OTP_CONTEXT });
+    const token = randomBytes(32).toString('base64url');
+    const expiresAt = new Date(Date.now() + RESET_TOKEN_MINUTES * 60_000);
+    await this.db.update(staff, { id: member.id }, { inviteTokenHash: hashInvite(token), inviteExpiresAt: expiresAt });
+    return { resetToken: token, expiresAt: expiresAt.toISOString() };
+  }
+
+  /**
+   * Step 3: sets the new password and ends every session. It does not sign in;
+   * the console sends the member back to the sign-in page.
+   */
+  async resetPassword(token: string, password: string): Promise<{ reset: true }> {
+    const current = await this.byLinkToken(token);
+    if (!current) throw Errors.badRequest('This reset has expired. Start again.', 'RESET_EXPIRED');
+    const updated = await this.db.update(
+      staff,
+      { id: current.id, inviteTokenHash: hashInvite(token) },
+      {
+        $set: { status: 'active', passwordHash: await this.passwords.hash(password), failedSignIns: 0, lockedUntil: null, inviteTokenHash: null, inviteExpiresAt: null },
+        $inc: { tokenVersion: 1 },
+      },
+    );
+    if (!updated) throw Errors.badRequest('This reset has expired. Start again.', 'RESET_EXPIRED');
+    await this.principals.invalidateStaff(current.id);
+    await this.tokens.revokeAll('staff', current.id);
+    await this.audit.record(
+      { kind: 'system', name: `${current.firstName} ${current.lastName}` },
+      { action: 'Reset their console password with an emailed code', target: current.email, targetType: 'staff', targetId: current.id },
+    );
+    return { reset: true };
   }
 
   /**
@@ -215,15 +304,15 @@ export class StaffService {
    * platform team sends a one-time link (valid for a day) to set a new one.
    */
   async sendPasswordReset(actor: AuthStaff, id: string): Promise<{ id: string; resetExpiresAt: string }> {
-    const member = await this.staff.findById(id).lean<Lean<Staff>>();
+    const member = await this.findById(id);
     if (!member || member.status === 'disabled') throw Errors.notFound('That team member is not on the console.', 'STAFF_NOT_FOUND');
     if (member.status === 'invited') throw Errors.conflict('This member has not accepted their invitation yet. Send the invitation again instead.', 'STAFF_INVITED');
     if (member.role === 'superadmin' && actor.role !== 'superadmin') {
-      throw Errors.forbidden('Only a superadmin can reset a superadmin\'s password.', 'SUPERADMIN_REQUIRED');
+      throw Errors.forbidden("Only a superadmin can reset a superadmin's password.", 'SUPERADMIN_REQUIRED');
     }
     const token = randomBytes(32).toString('base64url');
     const resetExpiresAt = new Date(Date.now() + 86_400_000);
-    await this.staff.updateOne({ _id: member._id }, { $set: { inviteTokenHash: hashInvite(token), inviteExpiresAt: resetExpiresAt } });
+    await this.db.update(staff, { id: member.id }, { inviteTokenHash: hashInvite(token), inviteExpiresAt: resetExpiresAt });
     const link = `${this.config.adminUrl}/accept-invite?token=${encodeURIComponent(token)}`;
     void this.mail.send(member.email, {
       subject: 'Reset your DOOAA console password',
@@ -246,7 +335,7 @@ export class StaffService {
 
   /** Changing your own password from the account menu. Other sessions end; this one carries on with fresh tokens. */
   async changePassword(actor: AuthStaff, currentPassword: string, newPassword: string, meta: SessionMeta): Promise<{ session: StaffSession; tokens: TokenPair }> {
-    const member = await this.staff.findById(actor.id).select('+passwordHash').lean<Lean<Staff>>();
+    const member = await this.db.findOne(staff, { id: actor.id });
     if (!member) throw Errors.unauthorized();
     if (!(await this.passwords.verify(currentPassword, member.passwordHash))) {
       throw Errors.badRequest('Your current password is not correct.', 'WRONG_PASSWORD');
@@ -254,14 +343,12 @@ export class StaffService {
     if (await this.passwords.verify(newPassword, member.passwordHash)) {
       throw Errors.badRequest('Choose a password you have not used here before.', 'PASSWORD_REUSED');
     }
-    const updated = await this.staff
-      .findByIdAndUpdate(actor.id, { $set: { passwordHash: await this.passwords.hash(newPassword) }, $inc: { tokenVersion: 1 } }, { returnDocument: 'after' })
-      .lean<Lean<Staff>>();
-    this.principals.invalidateStaff(actor.id);
+    const updated = toStaff((await this.db.update(staff, { id: actor.id }, { $set: { passwordHash: await this.passwords.hash(newPassword) }, $inc: { tokenVersion: 1 } }))!);
+    await this.principals.invalidateStaff(actor.id);
     await this.tokens.revokeAll('staff', actor.id);
     await this.audit.record(actor, { action: 'Changed their console password', target: member.email, targetType: 'staff', targetId: actor.id });
-    const tokens = await this.tokens.issue('staff', actor.id, updated!.tokenVersion ?? 0, meta);
-    return { session: this.session(updated!), tokens };
+    const tokens = await this.tokens.issue('staff', actor.id, updated.tokenVersion, meta);
+    return { session: this.session(updated), tokens };
   }
 
   /**
@@ -270,7 +357,7 @@ export class StaffService {
    */
   async updateRole(actor: AuthStaff, id: string, role: StaffRole): Promise<StaffSession> {
     if (actor.id === id) throw Errors.forbidden('You cannot change your own role.', 'SELF_ROLE_CHANGE');
-    const member = await this.staff.findById(id).lean<Lean<Staff>>();
+    const member = await this.findById(id);
     if (!member || member.status === 'disabled') throw Errors.notFound('That team member is not on the console.', 'STAFF_NOT_FOUND');
     const touchesSuperadmin = role === 'superadmin' || member.role === 'superadmin';
     if (touchesSuperadmin && actor.role !== 'superadmin') {
@@ -280,10 +367,8 @@ export class StaffService {
       throw Errors.conflict('The console needs at least one superadmin.', 'LAST_SUPERADMIN');
     }
     if (member.role === role) return this.session(member);
-    const updated = await this.staff
-      .findByIdAndUpdate(id, { $set: { role, title: STAFF_ROLE_LABEL[role] }, $inc: { tokenVersion: 1 } }, { returnDocument: 'after' })
-      .lean<Lean<Staff>>();
-    this.principals.invalidateStaff(id);
+    const updated = toStaff((await this.db.update(staff, { id }, { $set: { role, title: STAFF_ROLE_LABEL[role] }, $inc: { tokenVersion: 1 } }))!);
+    await this.principals.invalidateStaff(id);
     await this.tokens.revokeAll('staff', id);
     await this.audit.record(actor, {
       action: `Changed a team member's role to ${STAFF_ROLE_LABEL[role]}`,
@@ -293,12 +378,12 @@ export class StaffService {
       elevated: role === 'superadmin' || member.role === 'superadmin',
       meta: { from: member.role, to: role },
     });
-    return this.session(updated!);
+    return this.session(updated);
   }
 
   async setDisabled(actor: AuthStaff, id: string, disabled: boolean): Promise<StaffSession> {
     if (actor.id === id) throw Errors.forbidden('You cannot remove yourself from the console.', 'SELF_DISABLE');
-    const member = await this.staff.findById(id).lean<Lean<Staff>>();
+    const member = await this.findById(id);
     if (!member) throw Errors.notFound('That team member is not on the console.', 'STAFF_NOT_FOUND');
     if (member.role === 'superadmin') {
       if (actor.role !== 'superadmin') throw Errors.forbidden('Only a superadmin can remove a superadmin.', 'SUPERADMIN_REQUIRED');
@@ -308,10 +393,8 @@ export class StaffService {
     }
     // A restored member who never finished their invitation goes back to waiting on it.
     const status = disabled ? 'disabled' : member.lastLoginAt ? 'active' : 'invited';
-    const updated = await this.staff
-      .findByIdAndUpdate(id, { $set: { status }, $inc: { tokenVersion: 1 } }, { returnDocument: 'after' })
-      .lean<Lean<Staff>>();
-    this.principals.invalidateStaff(id);
+    const updated = toStaff((await this.db.update(staff, { id }, { $set: { status }, $inc: { tokenVersion: 1 } }))!);
+    await this.principals.invalidateStaff(id);
     await this.tokens.revokeAll('staff', id);
     await this.audit.record(actor, {
       action: disabled ? 'Removed a team member from the console' : 'Restored a team member',
@@ -319,27 +402,28 @@ export class StaffService {
       targetType: 'staff',
       targetId: id,
     });
-    return this.session(updated!);
+    return this.session(updated);
   }
 
   async touch(id: string): Promise<void> {
-    await this.staff.updateOne({ _id: id }, { $set: { lastSeenAt: new Date() } });
+    if (!isUuid(id)) return;
+    await this.db.update(staff, { id }, { lastSeenAt: new Date() });
   }
 
-  /** Creates or refreshes the first superadmin from configuration (seeding). */
-  async ensureSuperadmin(input: { email: string; firstName: string; lastName: string; password: string }): Promise<Lean<Staff>> {
+  /** Creates the first superadmin from configuration (seeding). An existing account is left as it is. */
+  async ensureSuperadmin(input: { email: string; firstName: string; lastName: string; password: string }): Promise<StaffMember> {
     const email = normalizeEmail(input.email);
-    const existing = await this.staff.findOne({ email }).lean<Lean<Staff>>();
+    const existing = await this.db.findOne(staff, { email }, { omit: staffOmit });
     if (existing) return existing;
-    const created = await this.staff.create({
-      email,
-      firstName: input.firstName,
-      lastName: input.lastName,
-      role: 'superadmin',
-      title: 'Superadmin',
-      status: 'active',
-      passwordHash: await this.passwords.hash(input.password),
-    });
-    return created.toObject() as Lean<Staff>;
+    const created = await this.db.insert(staff, {
+        email,
+        firstName: input.firstName,
+        lastName: input.lastName,
+        role: 'superadmin',
+        title: 'Superadmin',
+        status: 'active',
+        passwordHash: await this.passwords.hash(input.password),
+      });
+    return toStaff(created);
   }
 }

@@ -1,18 +1,19 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { Model, Types } from 'mongoose';
 import { Errors } from '../../common/api/app-error';
-import { PRIVATE_MEDIA_PURPOSES, type MediaPurpose } from '../../common/domain';
-import type { Lean } from '../../common/util/mongo';
+import { PRIVATE_MEDIA_PURPOSES, type MediaKind, type MediaPurpose, type MediaVisibility } from '../../common/domain';
+import { isUuid, uuidv7 } from '../../common/util/uuid';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
-import { Media, type MediaKind, type MediaVisibility } from './media.schema';
+import { InjectDb, type Database } from '../../database/database';
+import { media } from '../../database/schema';
 import { sniff } from './sniff';
 import { CLOUDINARY_ALLOWED_FORMATS, CLOUDINARY_DIRECT_UPLOAD_TTL_SECONDS } from './storage/cloudinary.storage';
 import { STORAGE_DRIVER, type DirectUploadTicket, type StorageDriver, type StoredObject } from './storage/storage.driver';
+import { explain } from '../../common/util/explain-error';
 
 export type UploadedFile = { buffer: Buffer; originalname: string; size: number; mimetype?: string };
+export type MediaRecord = typeof media.$inferSelect;
 export type MediaOwner = { id: string; type: 'user' | 'staff' };
 
 export type MediaView = {
@@ -86,7 +87,7 @@ export class MediaService {
   private readonly logger = new Logger(MediaService.name);
 
   constructor(
-    @InjectModel(Media.name) private readonly media: Model<Media>,
+    @InjectDb() private readonly db: Database,
     @Inject(STORAGE_DRIVER) private readonly storage: StorageDriver,
     @InjectConfig() private readonly config: AppConfig,
   ) {}
@@ -133,7 +134,7 @@ export class MediaService {
     try {
       stored = await this.storage.put(storageKey, file.buffer, detected.mime, visibility);
     } catch (error) {
-      this.logger.error(`Storage upload failed: ${(error as Error).message}`);
+      this.logger.error(explain('Could not upload the file to Cloudinary (file storage)', error));
       throw Errors.badGateway('We could not store that file. Please try again.', 'STORAGE_ERROR');
     }
     return this.record({
@@ -162,24 +163,24 @@ export class MediaService {
     url?: string;
     posterUrl?: string;
   }): Promise<MediaView> {
-    const id = new Types.ObjectId();
-    const created = await this.media.create({
-      _id: id,
-      ownerId: new Types.ObjectId(input.owner.id),
-      ownerType: input.owner.type,
-      purpose: input.purpose,
-      kind: input.kind,
-      name: safeName(input.name),
-      mimeType: input.mimeType,
-      size: input.size,
-      visibility: input.visibility,
-      storageKey: input.storageKey,
-      provider: this.storage.name,
-      // Drivers without a CDN serve public objects through the content route.
-      url: input.visibility === 'public' ? (input.url ?? this.contentUrl(String(id))) : undefined,
-      posterUrl: input.posterUrl,
-    });
-    return this.view(created.toObject() as Lean<Media>);
+    const id = uuidv7();
+    const created = await this.db.insert(media, {
+        id,
+        ownerId: input.owner.id,
+        ownerType: input.owner.type,
+        purpose: input.purpose,
+        kind: input.kind,
+        name: safeName(input.name),
+        mimeType: input.mimeType,
+        size: input.size,
+        visibility: input.visibility,
+        storageKey: input.storageKey,
+        provider: this.storage.name,
+        // Drivers without a CDN serve public objects through the content route.
+        url: input.visibility === 'public' ? (input.url ?? this.contentUrl(id)) : null,
+        posterUrl: input.posterUrl ?? null,
+      });
+    return this.view(created);
   }
 
   /**
@@ -220,7 +221,7 @@ export class MediaService {
     if (payload.ownerId !== owner.id || payload.ownerType !== owner.type) {
       throw Errors.forbidden('That upload belongs to someone else.', 'UPLOAD_TICKET_INVALID');
     }
-    const existing = await this.media.findOne({ storageKey: payload.key }).lean<Lean<Media>>();
+    const existing = await this.db.findOne(media, { storageKey: payload.key });
     if (existing) return this.view(existing);
     if (!this.storage.inspect) throw Errors.badRequest('Direct uploads need Cloudinary.', 'DIRECT_UPLOAD_UNAVAILABLE');
 
@@ -293,45 +294,45 @@ export class MediaService {
     return expected.length === actual.length && timingSafeEqual(expected, actual);
   }
 
-  view(row: Lean<Media>): MediaView {
+  view(row: MediaRecord): MediaView {
     return {
-      id: String(row._id),
-      url: row.visibility === 'private' ? this.signedUrl(String(row._id)) : row.url!,
-      posterUrl: row.posterUrl ?? null,
+      id: row.id,
+      url: row.visibility === 'private' ? this.signedUrl(row.id) : row.url!,
+      posterUrl: row.posterUrl,
       kind: row.kind,
       name: row.name,
       size: row.size,
       mimeType: row.mimeType,
       purpose: row.purpose,
       visibility: row.visibility,
-      createdAt: new Date(row.createdAt).toISOString(),
+      createdAt: row.createdAt.toISOString(),
     };
   }
 
-  async findById(id: string): Promise<Lean<Media> | null> {
-    if (!Types.ObjectId.isValid(id)) return null;
-    return this.media.findById(id).lean<Lean<Media>>();
+  async findById(id: string): Promise<MediaRecord | null> {
+    if (!isUuid(id)) return null;
+    return this.db.findOne(media, { id });
   }
 
   /** Streams (or redirects to) a file for the content route. */
-  async read(id: string, access: { expires?: number; sig?: string }): Promise<{ media: Lean<Media>; object: StoredObject }> {
-    const media = await this.findById(id);
-    if (!media) throw Errors.notFound();
-    if (media.visibility === 'private' && !this.verifySignature(id, Number(access.expires), access.sig ?? '')) {
+  async read(id: string, access: { expires?: number; sig?: string }): Promise<{ media: MediaRecord; object: StoredObject }> {
+    const record = await this.findById(id);
+    if (!record) throw Errors.notFound();
+    if (record.visibility === 'private' && !this.verifySignature(id, Number(access.expires), access.sig ?? '')) {
       throw Errors.forbidden('This link has expired.', 'LINK_EXPIRED');
     }
-    const object = await this.storage.get(media.storageKey, media.visibility, media.mimeType);
+    const object = await this.storage.get(record.storageKey, record.visibility, record.mimeType);
     if (!object) throw Errors.notFound();
-    return { media, object };
+    return { media: record, object };
   }
 
   async remove(id: string, owner: MediaOwner): Promise<{ deleted: true }> {
-    const media = await this.media.findOne({ _id: id, ownerId: owner.id }).lean<Lean<Media>>();
-    if (!media) throw Errors.notFound();
-    await this.storage.delete(media.storageKey, media.visibility, media.mimeType).catch((error) => {
-      this.logger.warn(`Could not delete ${media.storageKey}: ${(error as Error).message}`);
+    const record = isUuid(id) ? await this.db.findOne(media, { id, ownerId: owner.id, ownerType: owner.type }) : null;
+    if (!record) throw Errors.notFound();
+    await this.storage.delete(record.storageKey, record.visibility, record.mimeType).catch((error) => {
+      this.logger.warn(explain(`Could not delete the file ${record.storageKey} from Cloudinary (file storage)`, error));
     });
-    await this.media.deleteOne({ _id: id });
+    await this.db.delete(media, { id });
     return { deleted: true };
   }
 
@@ -342,10 +343,7 @@ export class MediaService {
   async assertOwnedUrls(urls: string[], owner: MediaOwner, purposes: MediaPurpose[], keep: string[] = []): Promise<void> {
     const fresh = [...new Set(urls.filter((url) => !keep.includes(url)))];
     if (!fresh.length) return;
-    const found = await this.media
-      .find({ url: { $in: fresh }, ownerId: new Types.ObjectId(owner.id), purpose: { $in: purposes } })
-      .select('url')
-      .lean();
+    const found = await this.db.find(media, { url: { $in: fresh }, ownerId: owner.id, ownerType: owner.type, purpose: { $in: purposes } });
     const known = new Set(found.map((row) => row.url));
     const missing = fresh.filter((url) => !known.has(url));
     if (missing.length) {
@@ -354,17 +352,17 @@ export class MediaService {
   }
 
   /** Looks up public media by URL (for message attachments: name, size, poster). */
-  async byUrl(url: string): Promise<Lean<Media> | null> {
-    return this.media.findOne({ url }).lean<Lean<Media>>();
+  async byUrl(url: string): Promise<MediaRecord | null> {
+    return this.db.findOne(media, { url });
   }
 
   /** Resolves private media ids (KYC documents) owned by the user. */
-  async ownedByIds(ids: string[], owner: MediaOwner, purpose: MediaPurpose): Promise<Lean<Media>[]> {
-    const valid = ids.filter((id) => Types.ObjectId.isValid(id));
+  async ownedByIds(ids: string[], owner: MediaOwner, purpose: MediaPurpose): Promise<MediaRecord[]> {
+    const valid = ids.filter(isUuid);
     if (valid.length !== ids.length) throw Errors.badRequest('Upload each document first.', 'MEDIA_NOT_FOUND');
-    const rows = await this.media
-      .find({ _id: { $in: valid }, ownerId: new Types.ObjectId(owner.id), purpose })
-      .lean<Lean<Media>[]>();
+    const rows = valid.length
+      ? await this.db.find(media, { id: { $in: valid }, ownerId: owner.id, ownerType: owner.type, purpose })
+      : [];
     if (rows.length !== new Set(valid).size) throw Errors.badRequest('Upload each document first.', 'MEDIA_NOT_FOUND');
     return rows;
   }

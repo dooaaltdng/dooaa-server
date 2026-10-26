@@ -1,19 +1,20 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { CacheService } from '../../cache/cache.service';
 import { EventBus } from '../../common/events/event-bus';
 import { longDate } from '../../common/util/dates';
 import { formatNaira } from '../../common/util/money';
-import type { Lean } from '../../common/util/mongo';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
 import { CONVERSATION_EVENTS, type ConversationMessageEvent, type ConversationOfferEvent } from '../conversations/conversations.service';
 import { ORDER_EVENTS, type OrderUpdated } from '../orders/orders.service';
-import type { Order } from '../orders/schemas/order.schema';
+import type { Order } from '../orders/order.model';
 import { PRODUCT_EVENTS, type ProductFlagged, type ProductStatusChanged } from '../products/products.service';
 import { RealtimeService } from '../realtime/realtime.service';
 import { SettingsService } from '../settings/settings.service';
 import { WALLET_EVENTS, type PayoutUpdated } from '../wallet/wallet.service';
 import { WISHLIST_EVENTS, type RestockAlert } from '../wishlist/wishlist.service';
 import { NotificationsService } from './notifications.service';
+import { explain } from '../../common/util/explain-error';
 
 const MESSAGE_EMAIL_COOLDOWN_MS = 30 * 60_000;
 
@@ -24,11 +25,10 @@ const MESSAGE_EMAIL_COOLDOWN_MS = 30 * 60_000;
 @Injectable()
 export class NotificationsListener implements OnModuleInit {
   private readonly logger = new Logger(NotificationsListener.name);
-  /** Last message email per conversation+recipient, so a busy chat does not flood an inbox. */
-  private readonly lastMessageEmail = new Map<string, number>();
 
   constructor(
     private readonly notifications: NotificationsService,
+    private readonly cache: CacheService,
     private readonly settings: SettingsService,
     private readonly realtime: RealtimeService,
     private readonly events: EventBus,
@@ -49,7 +49,7 @@ export class NotificationsListener implements OnModuleInit {
     try {
       await work();
     } catch (error) {
-      this.logger.warn(`Notification side effect failed: ${(error as Error).message}`);
+      this.logger.warn(explain('Could not send a notification (the action it was about still succeeded)', error));
     }
   }
 
@@ -57,14 +57,14 @@ export class NotificationsListener implements OnModuleInit {
     return `${this.config.clientUrl}${path}`;
   }
 
-  private itemsLabel(order: Lean<Order>): string {
+  private itemsLabel(order: Order): string {
     const first = order.items[0]?.title ?? 'your item';
     return order.items.length > 1 ? `${first} and ${order.items.length - 1} more` : first;
   }
 
   private async onOrder({ order, event, note }: OrderUpdated): Promise<void> {
-    const buyer = String(order.buyerId);
-    const seller = String(order.sellerId);
+    const buyer = order.buyerId;
+    const seller = order.sellerId;
     const number = `#${order.reference}`;
     const buyerLink = `/orders/${order.reference}`;
     const sellerLink = `/seller/orders/${order.reference}`;
@@ -264,36 +264,32 @@ export class NotificationsListener implements OnModuleInit {
   private async onMessage({ conversation, message, recipientIds, senderName }: ConversationMessageEvent): Promise<void> {
     if (message.kind === 'system') return;
     for (const recipient of recipientIds) {
-      const role = String(conversation.buyerId) === recipient ? 'buyer' : 'seller';
-      const online = this.realtime.isOnline(recipient);
-      const key = `${String(conversation._id)}:${recipient}`;
-      const last = this.lastMessageEmail.get(key) ?? 0;
-      const emailNow = !online && Date.now() - last > MESSAGE_EMAIL_COOLDOWN_MS;
-      if (emailNow) this.lastMessageEmail.set(key, Date.now());
+      const role = conversation.buyerId === recipient ? 'buyer' : 'seller';
+      // One email per thread and recipient per cooldown, so a busy chat does not flood an inbox.
+      const emailNow = !this.realtime.isOnline(recipient) && (await this.cache.claim(`mail-cooldown:message:${conversation.id}:${recipient}`, MESSAGE_EMAIL_COOLDOWN_MS));
       const name = message.senderRole === 'staff' ? 'DOOAA Support' : senderName;
       await this.notifications.notifyUser(recipient, {
         type: 'message.new',
         title: `New message from ${name}`,
-        body: message.body ? message.body.slice(0, 140) : conversation.lastMessage?.preview || 'Sent an attachment',
+        body: message.body ? message.body.slice(0, 140) : conversation.lastMessage.preview || 'Sent an attachment',
         category: 'messages',
-        link: `/messages?c=${String(conversation._id)}`,
-        data: { conversationId: String(conversation._id), role },
+        link: `/messages?c=${conversation.id}`,
+        data: { conversationId: conversation.id, role },
         email: emailNow
           ? {
               subject: `New message from ${name} on DOOAA`,
               heading: `${name} sent you a message`,
               paragraphs: [message.body ? `“${message.body.slice(0, 300)}”` : 'They sent you an attachment.', 'Reply on DOOAA so the conversation stays protected.'],
-              cta: { label: 'Reply', url: this.clientLink(`/messages?c=${String(conversation._id)}`) },
+              cta: { label: 'Reply', url: this.clientLink(`/messages?c=${conversation.id}`) },
             }
           : undefined,
       });
     }
-    if (this.lastMessageEmail.size > 10_000) this.lastMessageEmail.clear();
   }
 
   private async onOffer({ conversation, offer, action, recipientId }: ConversationOfferEvent): Promise<void> {
     const title = conversation.subject?.title ?? 'your listing';
-    const link = `/messages?c=${String(conversation._id)}`;
+    const link = `/messages?c=${conversation.id}`;
     const copy: Record<ConversationOfferEvent['action'], { title: string; body: string; tone: 'blue' | 'green' | 'red' }> = {
       made: { title: `New offer: ${formatNaira(offer.amount)}`, body: `On ${title} (listed at ${formatNaira(offer.listed)}).`, tone: 'blue' },
       accepted: { title: 'Offer accepted', body: `${formatNaira(offer.agreedAmount ?? offer.amount)} was agreed for ${title}. Pay through escrow to secure it.`, tone: 'green' },
@@ -301,7 +297,7 @@ export class NotificationsListener implements OnModuleInit {
       declined: { title: 'Offer declined', body: `Your offer on ${title} was declined.`, tone: 'red' },
       withdrawn: { title: 'Offer withdrawn', body: `The buyer withdrew their offer on ${title}.`, tone: 'red' },
     };
-    await this.notifications.notifyUser(recipientId, { type: `offer.${action}`, ...copy[action], category: 'messages', link, data: { offerId: String(offer._id) } });
+    await this.notifications.notifyUser(recipientId, { type: `offer.${action}`, ...copy[action], category: 'messages', link, data: { offerId: offer.id } });
   }
 
   private async onFlagged(event: ProductFlagged): Promise<void> {

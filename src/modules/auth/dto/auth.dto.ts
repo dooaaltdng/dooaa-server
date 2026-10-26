@@ -1,8 +1,7 @@
 import { Equals, IsBoolean, IsEmail, IsIn, IsOptional, IsString, Length, Matches, MaxLength, MinLength } from 'class-validator';
-import { USER_ROLES, type UserRole } from '../../../common/domain';
+import { OTP_CHANNELS, type OtpChannel, USER_ROLES, type UserRole } from '../../../common/domain';
 import { ToLowerTrim, Trim } from '../../../common/util/transforms';
 import { IsPersonName, IsPhoneNumber, IsStrongPassword } from '../../../common/util/validators';
-import { OTP_CHANNELS, type OtpChannel } from '../../otp/otp.schema';
 
 export class SignUpDto {
   @Trim() @IsPersonName('First name') firstName: string;
@@ -57,4 +56,23 @@ export class VerifyPasswordDto {
 
 export class SetRoleDto {
   @IsIn(USER_ROLES, { message: 'Choose buyer or seller.' }) role: UserRole;
+}
+
+/** Passwordless sign-up: one name field, email and phone. The code goes to the email. */
+export class StartSignUpDto {
+  @Trim() @IsString() @MinLength(2, { message: 'Enter your name.' }) @MaxLength(100) @Matches(/^[\p{L}][\p{L}\p{M}'’. -]*$/u, { message: 'Use letters only in your name.' }) name: string;
+  @ToLowerTrim() @IsEmail({}, { message: 'Enter a valid email address.' }) @MaxLength(254) email: string;
+  @Trim() @IsPhoneNumber() phone: string;
+  @IsBoolean() @Equals(true, { message: 'Accept the Terms & conditions to continue.' }) acceptedTerms: boolean;
+}
+
+export class StartSignInDto {
+  @ToLowerTrim() @IsEmail({}, { message: 'Enter a valid email address.' }) @MaxLength(254) email: string;
+}
+
+export class VerifyCodeDto {
+  /** Which code this is: the one from sign-up (confirms the email) or from sign-in. */
+  @IsIn(['sign-up', 'sign-in']) intent: 'sign-up' | 'sign-in';
+  @ToLowerTrim() @IsEmail({}, { message: 'Enter a valid email address.' }) @MaxLength(254) email: string;
+  @Trim() @Matches(/^\d{6}$/, { message: 'Enter all 6 digits.' }) code: string;
 }

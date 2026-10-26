@@ -1,102 +1,103 @@
 /**
  * The money boundary. DOOAA never holds or moves money itself: every debit
  * (charging a buyer) and every credit (paying a seller, refunding a buyer)
- * is executed by the provider behind this interface. Our database only
- * records what the provider confirmed. Amounts here are in Naira; providers
- * convert to their own units.
+ * is executed by the provider behind this interface — Bachs. Our database
+ * only records what the provider confirmed. Amounts here are in Naira.
  */
 
-export type ChargeChannel = 'card' | 'bank_transfer' | 'ussd' | 'bank';
+/** The rails a buyer may use on the hosted checkout. */
+export type PaymentRail = 'card' | 'bank_transfer';
 
-export type InitializeChargeInput = {
+export type CheckoutInput = {
+  /** Our payment reference; unique, and the idempotency key for the request. */
   reference: string;
   amount: number;
-  email: string;
-  callbackUrl: string;
-  channels?: ChargeChannel[];
-  metadata?: Record<string, unknown>;
+  customer: { email: string; name?: string; phone?: string };
+  /** Where the buyer lands after paying, and after giving up. */
+  successUrl: string;
+  cancelUrl: string;
+  rails: PaymentRail[];
+  expiresInMinutes: number;
+  metadata?: Record<string, string>;
 };
 
-export type InitializedCharge = {
-  reference: string;
-  /** Hosted checkout page to send the buyer to. */
-  authorizationUrl: string;
-  /** For the provider's inline/popup checkout. */
-  accessCode: string;
+export type CheckoutSession = {
+  checkoutId: string;
+  /** The hosted page to send the buyer to. */
+  checkoutUrl: string;
+  expiresAt?: Date;
 };
 
-export type CardAuthorization = {
-  authorizationCode: string;
-  signature?: string;
-  last4?: string;
-  brand?: string;
-  bank?: string;
-  expMonth?: string;
-  expYear?: string;
-  reusable: boolean;
-  channel?: string;
-};
-
+/** Where a charge stands, as the provider reports it. */
 export type ChargeStatus = {
-  reference: string;
   status: 'success' | 'failed' | 'abandoned' | 'pending';
+  /** What the charge was paid for (on success), in `currency`. */
   amount: number;
   currency: string;
+  /** The provider's id for the charge; refunds are made against it. */
+  chargeId?: string;
   paidAt?: Date;
+  /** How the buyer paid ("card", "bank_transfer"). */
   channel?: string;
+  /** The provider's own word for the outcome, kept for support. */
   gatewayResponse?: string;
-  providerTransactionId?: string;
-  customerEmail?: string;
-  authorization?: CardAuthorization;
+  card?: { brand?: string; last4?: string };
 };
 
 export type RefundInput = {
-  /** The charge being refunded. */
-  chargeReference: string;
-  amount: number;
-  /** Our reference for this refund, echoed back on webhooks where the provider supports it. */
-  refundReference: string;
+  /** The provider's charge id. */
+  chargeId: string;
+  /** Our reference for this refund; the provider echoes it on webhooks. */
+  reference: string;
+  /** Omitted for "everything left on the charge". */
+  amount?: number;
   reason?: string;
 };
 
-export type RefundResult = { providerRefundId: string; status: 'pending' | 'processed' | 'failed' };
+export type RefundResult = { providerRefundId: string; status: 'pending' | 'processed' | 'failed'; failureReason?: string };
 
 export type Bank = { name: string; code: string; slug: string };
 
 export type ResolvedAccount = { accountName: string; accountNumber: string; bankCode: string };
 
-export type TransferInput = {
+export type PayoutDestinationInput = { accountName: string; accountNumber: string; bankCode: string; label: string };
+
+/** A bank account registered with the provider for payouts. New ones are reviewed before they can be used. */
+export type PayoutDestination = { destinationId: string; usable: boolean; status: string };
+
+export type PayoutInput = {
+  destinationId: string;
+  /** What the seller receives; the provider's fee is charged to DOOAA on top. */
   amount: number;
-  recipientCode: string;
+  /** Our payout reference; the provider echoes it on webhooks and uses it for idempotency. */
   reference: string;
-  reason: string;
 };
 
-export type TransferResult = { transferCode: string; status: 'pending' | 'success' | 'failed' | 'otp' };
+export type PayoutResult = { payoutId: string; status: 'pending' | 'success' | 'failed'; failureReason?: string };
 
+/** A webhook, reduced to what DOOAA acts on. `id` is the provider's event id (deliveries repeat). */
 export type ProviderEvent =
-  | { type: 'charge.success' | 'charge.failed'; reference: string; charge: ChargeStatus }
-  | { type: 'transfer.success' | 'transfer.failed' | 'transfer.reversed'; reference: string; transferCode?: string; reason?: string }
-  | { type: 'refund.processed' | 'refund.failed' | 'refund.pending'; chargeReference: string; providerRefundId?: string; refundReference?: string; amount?: number }
-  | { type: 'ignored'; name: string };
+  /** Something happened to a charge or its checkout: confirm with the provider, then apply. */
+  | { id: string; type: 'charge.updated'; reference?: string; checkoutId?: string; chargeId?: string }
+  | { id: string; type: 'refund.processed' | 'refund.failed' | 'refund.pending'; providerRefundId?: string; refundReference?: string; reason?: string }
+  | { id: string; type: 'payout.success' | 'payout.failed'; reference: string; payoutId?: string; reason?: string }
+  | { id: string; type: 'ignored'; name: string };
 
 export interface PaymentProvider {
-  readonly name: 'paystack' | 'sandbox';
-  initializeCharge(input: InitializeChargeInput): Promise<InitializedCharge>;
-  verifyCharge(reference: string): Promise<ChargeStatus>;
-  /** Charges a saved card authorization (returning customers). */
-  chargeAuthorization(input: { authorizationCode: string; email: string; amount: number; reference: string; metadata?: Record<string, unknown> }): Promise<ChargeStatus>;
+  readonly name: string;
+  /** Opens a hosted checkout for one charge. */
+  createCheckout(input: CheckoutInput): Promise<CheckoutSession>;
+  /** Where the charge behind a checkout stands. Never throws for a checkout that simply is not paid yet. */
+  getCharge(checkoutId: string): Promise<ChargeStatus>;
   refund(input: RefundInput): Promise<RefundResult>;
   listBanks(): Promise<Bank[]>;
   resolveAccount(accountNumber: string, bankCode: string): Promise<ResolvedAccount>;
-  createTransferRecipient(input: { name: string; accountNumber: string; bankCode: string }): Promise<{ recipientCode: string }>;
-  initiateTransfer(input: TransferInput): Promise<TransferResult>;
+  createPayoutDestination(input: PayoutDestinationInput): Promise<PayoutDestination>;
+  getPayoutDestination(destinationId: string): Promise<PayoutDestination>;
+  createPayout(input: PayoutInput): Promise<PayoutResult>;
   /** Checks the provider's signature over the raw webhook body. */
-  verifyWebhookSignature(rawBody: Buffer, headers: Record<string, string | string[] | undefined>): boolean;
+  verifyWebhook(rawBody: Buffer, headers: Record<string, string | string[] | undefined>): boolean;
   parseWebhook(body: unknown): ProviderEvent;
 }
 
 export const PAYMENT_PROVIDER = Symbol('PAYMENT_PROVIDER');
-
-/** Events the provider raises are re-published on the bus under these names. */
-export const PROVIDER_EVENT = 'provider.event';

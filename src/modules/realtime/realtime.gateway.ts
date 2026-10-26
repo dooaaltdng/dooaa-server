@@ -1,3 +1,4 @@
+import { explain } from '../../common/util/explain-error';
 import { Logger } from '@nestjs/common';
 import {
   ConnectedSocket,
@@ -114,7 +115,7 @@ export class RealtimeGateway implements OnGatewayInit, OnGatewayConnection, OnGa
       return { ok: true, data: await work() };
     } catch (error) {
       const failure = toFailure(error);
-      if (failure.status >= 500) this.logger.error((error as Error).stack ?? String(error));
+      if (failure.status >= 500) this.logger.error(`${explain('A live (websocket) action crashed and the user got an error', error)}${(error as Error).stack ? `\n${(error as Error).stack}` : ''}`);
       return { ok: false, error: failure.body.error, code: failure.body.code };
     }
   }

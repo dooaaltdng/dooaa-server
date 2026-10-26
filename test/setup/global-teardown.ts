@@ -1,6 +1,5 @@
-import type { MongoMemoryServer } from 'mongodb-memory-server';
+import type { MongoMemoryReplSet } from 'mongodb-memory-server';
 
 export default async function globalTeardown(): Promise<void> {
-  const server = (globalThis as { __MONGO__?: MongoMemoryServer }).__MONGO__;
-  await server?.stop();
+  await (globalThis as { __MONGO__?: MongoMemoryReplSet }).__MONGO__?.stop();
 }

@@ -3,7 +3,6 @@ import { Reflector } from '@nestjs/core';
 import compression from 'compression';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
-import { join } from 'node:path';
 import { AllExceptionsFilter } from './common/api/all-exceptions.filter';
 import { EnvelopeInterceptor } from './common/api/envelope.interceptor';
 import { createValidationPipe } from './common/api/validation';
@@ -23,7 +22,7 @@ export function configureApp(app: NestExpressApplication): AppConfig {
   app.setGlobalPrefix(API_PREFIX);
   app.use(
     helmet({
-      // Media and the sandbox checkout are loaded cross-origin by the two apps.
+      // Media is loaded cross-origin by the two apps.
       crossOriginResourcePolicy: { policy: 'cross-origin' },
       contentSecurityPolicy: false,
     }),
@@ -43,15 +42,6 @@ export function configureApp(app: NestExpressApplication): AppConfig {
   app.useGlobalPipes(createValidationPipe());
   app.useGlobalFilters(new AllExceptionsFilter());
   app.useGlobalInterceptors(new EnvelopeInterceptor(app.get(Reflector)));
-
-  if (config.storage.driver === 'local') {
-    app.useStaticAssets(join(process.cwd(), config.storage.localDir, 'public'), {
-      prefix: '/uploads/',
-      maxAge: '7d',
-      immutable: true,
-      index: false,
-    });
-  }
   app.enableShutdownHooks();
   return config;
 }

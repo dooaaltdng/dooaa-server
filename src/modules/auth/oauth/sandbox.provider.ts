@@ -1,5 +1,5 @@
-import type { OAuthProviderId } from '../../users/schemas/user.schema';
 import { OAuthProviderError, type OAuthProfile, type OAuthProvider } from './oauth-provider';
+import { type OAuthProviderId } from '../../../common/domain';
 
 /** Encodes the profile a sandbox "sign-in" returns. Tests craft their own; development gets a default. */
 export function sandboxOAuthCode(profile: OAuthProfile): string {

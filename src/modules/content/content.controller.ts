@@ -1,7 +1,7 @@
 import { Body, Controller, Get, HttpCode, Param, Post } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { CurrentStaff, Public, RequirePermissions, StaffOnly } from '../../common/auth/decorators';
 import type { AuthStaff } from '../../common/auth/principal';
 import { Trim } from '../../common/util/transforms';
@@ -63,7 +63,7 @@ export class AdminContentController {
   @RequirePermissions('content.publish')
   @HttpCode(200)
   @Post(':slug/versions/:versionId/restore')
-  restore(@CurrentStaff() staff: AuthStaff, @Param('slug') slug: string, @Param('versionId', ObjectIdPipe) versionId: string) {
+  restore(@CurrentStaff() staff: AuthStaff, @Param('slug') slug: string, @Param('versionId', UuidPipe) versionId: string) {
     return this.content.restore(staff, slug, versionId);
   }
 }

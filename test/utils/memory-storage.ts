@@ -1,7 +1,7 @@
-import type { MediaVisibility } from '../media.schema';
-import type { PutResult, StorageDriver, StoredObject } from './storage.driver';
+import type { PutResult, StorageDriver, StoredObject } from '../../src/modules/media/storage/storage.driver';
+import { type MediaVisibility } from '../../src/common/domain';
 
-/** Keeps uploads in process memory; served through the API's content route. Tests only. */
+/** Keeps uploads in process memory, served through the API's content route: the test suite's Cloudinary. */
 export class MemoryStorage implements StorageDriver {
   readonly name = 'memory' as const;
   private readonly objects = new Map<string, { body: Buffer; contentType: string }>();

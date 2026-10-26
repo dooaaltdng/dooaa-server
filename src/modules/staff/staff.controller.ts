@@ -3,7 +3,7 @@ import { ApiTags } from '@nestjs/swagger';
 import { IsOptional, IsString, MaxLength } from 'class-validator';
 import { CurrentStaff, RequirePermissions, StaffOnly } from '../../common/auth/decorators';
 import type { AuthStaff } from '../../common/auth/principal';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { PageQueryDto } from '../../common/util/pagination';
 import { AuditService } from '../audit/audit.service';
 import { InviteStaffDto, UpdateStaffRoleDto } from './dto/staff.dto';
@@ -36,7 +36,7 @@ export class StaffController {
 
   @RequirePermissions('settings.manage')
   @Patch('staff/:id/role')
-  updateRole(@CurrentStaff() actor: AuthStaff, @Param('id', ObjectIdPipe) id: string, @Body() body: UpdateStaffRoleDto) {
+  updateRole(@CurrentStaff() actor: AuthStaff, @Param('id', UuidPipe) id: string, @Body() body: UpdateStaffRoleDto) {
     return this.staff.updateRole(actor, id, body.role);
   }
 
@@ -44,21 +44,21 @@ export class StaffController {
   @RequirePermissions('settings.manage')
   @HttpCode(200)
   @Post('staff/:id/reset-password')
-  resetPassword(@CurrentStaff() actor: AuthStaff, @Param('id', ObjectIdPipe) id: string) {
+  resetPassword(@CurrentStaff() actor: AuthStaff, @Param('id', UuidPipe) id: string) {
     return this.staff.sendPasswordReset(actor, id);
   }
 
   @RequirePermissions('settings.manage')
   @HttpCode(200)
   @Post('staff/:id/disable')
-  disable(@CurrentStaff() actor: AuthStaff, @Param('id', ObjectIdPipe) id: string) {
+  disable(@CurrentStaff() actor: AuthStaff, @Param('id', UuidPipe) id: string) {
     return this.staff.setDisabled(actor, id, true);
   }
 
   @RequirePermissions('settings.manage')
   @HttpCode(200)
   @Post('staff/:id/restore')
-  restore(@CurrentStaff() actor: AuthStaff, @Param('id', ObjectIdPipe) id: string) {
+  restore(@CurrentStaff() actor: AuthStaff, @Param('id', UuidPipe) id: string) {
     return this.staff.setDisabled(actor, id, false);
   }
 

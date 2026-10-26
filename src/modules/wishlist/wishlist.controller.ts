@@ -1,7 +1,7 @@
 import { Body, Controller, Delete, Get, Param, Put } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { IsBoolean } from 'class-validator';
-import { ObjectIdPipe } from '../../common/api/object-id.pipe';
+import { UuidPipe } from '../../common/api/uuid.pipe';
 import { CurrentUser } from '../../common/auth/decorators';
 import type { AuthUser } from '../../common/auth/principal';
 import { WishlistService } from './wishlist.service';
@@ -28,12 +28,12 @@ export class WishlistController {
   }
 
   @Put('wishlist/:productId')
-  add(@CurrentUser() user: AuthUser, @Param('productId', ObjectIdPipe) productId: string) {
+  add(@CurrentUser() user: AuthUser, @Param('productId', UuidPipe) productId: string) {
     return this.wishlist.add(user, productId);
   }
 
   @Delete('wishlist/:productId')
-  remove(@CurrentUser() user: AuthUser, @Param('productId', ObjectIdPipe) productId: string) {
+  remove(@CurrentUser() user: AuthUser, @Param('productId', UuidPipe) productId: string) {
     return this.wishlist.remove(user, productId);
   }
 
@@ -43,7 +43,7 @@ export class WishlistController {
   }
 
   @Put('products/:productId/restock-alert')
-  restockAlert(@CurrentUser() user: AuthUser, @Param('productId', ObjectIdPipe) productId: string, @Body() body: RestockAlertDto) {
+  restockAlert(@CurrentUser() user: AuthUser, @Param('productId', UuidPipe) productId: string, @Body() body: RestockAlertDto) {
     return this.wishlist.setRestockAlert(user, productId, body.on);
   }
 }

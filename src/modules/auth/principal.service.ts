@@ -1,72 +1,51 @@
 import { Injectable } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { CacheService } from '../../cache/cache.service';
 import type { AuthStaff, AuthUser } from '../../common/auth/principal';
-import { TtlCache } from '../../common/util/cache';
-import { Staff } from '../staff/schemas/staff.schema';
-import { User } from '../users/schemas/user.schema';
+import { isUuid } from '../../common/util/uuid';
+import { InjectDb, pick, type Database } from '../../database/database';
+import { staff, users } from '../../database/schema';
+
+/** Long enough to absorb a burst of requests, short enough that a missed invalidation heals quickly. */
+const PRINCIPAL_TTL_MS = 5_000;
 
 /**
- * Loads the account behind a token. Cached for a few seconds so a burst of
- * requests costs one read; anything that changes status or role calls
- * `invalidate*` so this instance sees it at once.
+ * Loads the account behind a token. Cached in Redis for a few seconds so a
+ * burst of requests costs one read; anything that changes status, role or
+ * token version calls `invalidate*`, which every instance sees at once.
  */
 @Injectable()
 export class PrincipalService {
-  private readonly users = new TtlCache<AuthUser | null>(5_000);
-  private readonly staff = new TtlCache<AuthStaff | null>(5_000);
-
   constructor(
-    @InjectModel(User.name) private readonly userModel: Model<User>,
-    @InjectModel(Staff.name) private readonly staffModel: Model<Staff>,
+    @InjectDb() private readonly db: Database,
+    private readonly cache: CacheService,
   ) {}
 
   user(id: string): Promise<AuthUser | null> {
-    return this.users.wrap(id, async () => {
-      const row = await this.userModel
-        .findById(id)
-        .select('email firstName lastName phone role emailVerified identity verificationLevel status tokenVersion')
-        .lean();
-      if (!row) return null;
-      return {
-        kind: 'user',
-        id: String(row._id),
-        email: row.email,
-        firstName: row.firstName,
-        lastName: row.lastName,
-        phone: row.phone ?? '',
-        role: row.role ?? null,
-        emailVerified: row.emailVerified,
-        identity: row.identity,
-        verificationLevel: row.verificationLevel,
-        status: row.status,
-        tokenVersion: row.tokenVersion ?? 0,
-      };
+    if (!isUuid(id)) return Promise.resolve(null);
+    return this.cache.wrap(`principal:user:${id}`, PRINCIPAL_TTL_MS, async () => {
+      const row = await this.db.findOne(users, { id });
+      return row
+        ? {
+            kind: 'user',
+            ...pick(row, ['id', 'email', 'firstName', 'lastName', 'phone', 'role', 'emailVerified', 'identity', 'verificationLevel', 'status', 'tokenVersion']),
+          }
+        : null;
     });
   }
 
   staffMember(id: string): Promise<AuthStaff | null> {
-    return this.staff.wrap(id, async () => {
-      const row = await this.staffModel.findById(id).select('email firstName lastName role status tokenVersion').lean();
-      if (!row) return null;
-      return {
-        kind: 'staff',
-        id: String(row._id),
-        email: row.email,
-        firstName: row.firstName,
-        lastName: row.lastName,
-        role: row.role,
-        status: row.status,
-        tokenVersion: row.tokenVersion ?? 0,
-      };
+    if (!isUuid(id)) return Promise.resolve(null);
+    return this.cache.wrap(`principal:staff:${id}`, PRINCIPAL_TTL_MS, async () => {
+      const row = await this.db.findOne(staff, { id });
+      return row ? { kind: 'staff', ...pick(row, ['id', 'email', 'firstName', 'lastName', 'role', 'status', 'tokenVersion']) } : null;
     });
   }
 
-  invalidateUser(id: string): void {
-    this.users.delete(id);
+  async invalidateUser(id: string): Promise<void> {
+    await this.cache.delete(`principal:user:${id}`);
   }
 
-  invalidateStaff(id: string): void {
-    this.staff.delete(id);
+  async invalidateStaff(id: string): Promise<void> {
+    await this.cache.delete(`principal:staff:${id}`);
   }
 }

@@ -2,10 +2,10 @@ import type {
   AccountStatus,
   IdentityStatus,
   StaffRole,
+  StaffStatus,
   UserRole,
   VerificationLevel,
 } from '../domain';
-import type { StaffStatus } from '../../modules/staff/schemas/staff.schema';
 
 /** The signed-in marketplace account, as attached to `req.user`. */
 export type AuthUser = {

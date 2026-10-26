@@ -1,33 +1,84 @@
-import { Global, Injectable, Logger, Module, OnApplicationBootstrap } from '@nestjs/common';
-import { InjectConnection, MongooseModule } from '@nestjs/mongoose';
-import { Counter, CounterSchema } from './counter.schema';
-import { CountersService } from './counters.service';
-import { Connection } from 'mongoose';
+import { Global, Inject, Injectable, Logger, Module, type OnApplicationBootstrap, type OnApplicationShutdown } from '@nestjs/common';
+import { MongoClient } from 'mongodb';
+import { APP_CONFIG, type AppConfig } from '../config/configuration';
+import { DATABASE, Database, InjectDb, MONGO_CLIENT } from './database';
+import * as schema from './schema';
+import { counters, type Table } from './schema';
+
+export function createClient(config: AppConfig['database']): MongoClient {
+  return new MongoClient(config.url, {
+    maxPoolSize: config.poolMax,
+    serverSelectionTimeoutMS: 10_000,
+    appName: 'dooaa-server',
+  });
+}
+
+export function createDatabase(client: MongoClient, config: AppConfig['database']): Database {
+  return new Database(client, client.db(config.name));
+}
+
+/** Every collection the schema declares. */
+export const TABLES: Table[] = (Object.values(schema) as unknown[]).filter(
+  (value): value is Table => !!value && typeof value === 'object' && Array.isArray((value as Table).indexes) && typeof (value as Table).key === 'string',
+);
+
+/** Creates every declared index. Idempotent; MongoDB skips indexes that already exist. */
+export async function ensureIndexes(db: Database): Promise<void> {
+  for (const table of TABLES) {
+    if (table.indexes.length) await db.collection(table).createIndexes(table.indexes);
+  }
+}
+
+/** Next value of a named sequence (dispute and support ticket numbers). */
+@Injectable()
+export class SequencesService {
+  constructor(@InjectDb() private readonly db: Database) {}
+
+  async next(sequence: { name: string; startWith: number }): Promise<number> {
+    // The counter counts calls; the first one returns `startWith`.
+    const row = await this.db.upsert(counters, { id: sequence.name }, { $inc: { value: 1 } });
+    return sequence.startWith - 1 + row.value;
+  }
+}
 
 /**
- * Waits for every collection's indexes before the app starts serving. On a
- * fresh database the text index (catalog search) and unique indexes
- * (emails, references) would otherwise be built in the background while the
- * first requests arrive.
+ * Connects before the app serves anything, makes sure the indexes exist and
+ * closes the client on shutdown.
  */
 @Injectable()
-export class IndexBootstrap implements OnApplicationBootstrap {
+export class DatabaseLifecycle implements OnApplicationBootstrap, OnApplicationShutdown {
   private readonly logger = new Logger('Database');
 
-  constructor(@InjectConnection() private readonly connection: Connection) {}
+  constructor(
+    @Inject(MONGO_CLIENT) private readonly client: MongoClient,
+    @InjectDb() private readonly db: Database,
+  ) {}
 
   async onApplicationBootstrap(): Promise<void> {
-    const models = Object.values(this.connection.models);
     const started = Date.now();
-    await Promise.all(models.map((model) => model.init()));
-    this.logger.log(`Indexes ready for ${models.length} collections in ${Date.now() - started}ms`);
+    await this.client.connect();
+    await this.db.db.command({ ping: 1 });
+    await ensureIndexes(this.db);
+    this.logger.log(`Connected to MongoDB (${this.db.db.databaseName}) in ${Date.now() - started}ms`);
+  }
+
+  async onApplicationShutdown(): Promise<void> {
+    await this.client.close();
   }
 }
 
 @Global()
 @Module({
-  imports: [MongooseModule.forFeature([{ name: Counter.name, schema: CounterSchema }])],
-  providers: [IndexBootstrap, CountersService],
-  exports: [CountersService],
+  providers: [
+    { provide: MONGO_CLIENT, inject: [APP_CONFIG], useFactory: (config: AppConfig) => createClient(config.database) },
+    {
+      provide: DATABASE,
+      inject: [MONGO_CLIENT, APP_CONFIG],
+      useFactory: (client: MongoClient, config: AppConfig) => createDatabase(client, config.database),
+    },
+    DatabaseLifecycle,
+    SequencesService,
+  ],
+  exports: [DATABASE, MONGO_CLIENT, SequencesService],
 })
 export class DatabaseModule {}

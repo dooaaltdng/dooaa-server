@@ -1,10 +1,8 @@
+import { uuidv7 } from '../src/common/util/uuid';
 import { createTestApp, type TestApp } from './utils/app';
 import { Http, data, failure } from './utils/http';
 import { eventually } from './utils/eventually';
 import { createProduct, model, registerSeller, registerUser, setSettings, staffToken, uploadImage } from './utils/factories';
-import { WishlistItem } from '../src/modules/wishlist/wishlist.schema';
-import { Product } from '../src/modules/products/schemas/product.schema';
-import { Types } from 'mongoose';
 
 describe('Catalog (e2e)', () => {
   let t: TestApp;
@@ -20,8 +18,8 @@ describe('Catalog (e2e)', () => {
 
     // A small, varied catalogue.
     await createProduct(t, seller.id, { title: 'Apple iPhone 12 Pro 512 GB Blue', price: 400_000, condition: 'used', brand: 'Apple', categoryId: 'gatdgets' });
-    await createProduct(t, seller.id, { title: 'Samsung Galaxy S23 Ultra 5G Phantom Black', price: 1_280_000, condition: 'new', brand: 'Samsung', categoryId: 'gatdgets', stats: { unitsSold: 40, views: 10 } });
-    await createProduct(t, seller.id, { title: 'Tecno Camon 20 Pro', price: 250_000, condition: 'new', brand: 'Tecno', categoryId: 'gatdgets', stats: { views: 500 } });
+    await createProduct(t, seller.id, { title: 'Samsung Galaxy S23 Ultra 5G Phantom Black', price: 1_280_000, condition: 'new', brand: 'Samsung', categoryId: 'gatdgets', statsUnitsSold: 40, statsViews: 10 });
+    await createProduct(t, seller.id, { title: 'Tecno Camon 20 Pro', price: 250_000, condition: 'new', brand: 'Tecno', categoryId: 'gatdgets', statsViews: 500, statsCartAdds: 12, statsPopularity: 12 });
     await createProduct(t, unverifiedSeller.id, { title: 'Itel A70 budget phone', price: 95_000, condition: 'refurbished', brand: 'Itel', sellerVerified: false, location: 'Wuse, Abuja' });
     await createProduct(t, seller.id, { title: 'Toyota Corolla 2016 Neat', price: 9_800_000, condition: 'used', brand: 'Toyota', categoryId: 'automative', featured: true });
     await createProduct(t, seller.id, { title: 'Nike Air Force 1 White 43', price: 95_000, condition: 'new', brand: 'Nike', categoryId: 'fashion', stock: 0 });
@@ -42,6 +40,21 @@ describe('Catalog (e2e)', () => {
     it('gets one category and 404s on unknown slugs', async () => {
       expect(data(await http.get('/categories/fashion'))).toMatchObject({ name: 'Fashion', productCount: 1 });
       failure(await http.get('/categories/spaceships'), 404, 'CATEGORY_NOT_FOUND');
+    });
+  });
+
+  describe('popular', () => {
+    it('counts a product as popular once it is added to a cart (a quantity bump does not count twice)', async () => {
+      const product = await createProduct(t, seller.id, { title: 'Popular Test Blender', price: 30_000, condition: 'new', categoryId: 'home-appliances' });
+      const buyer = await registerUser(t);
+      data(await http.post('/cart/items', { productId: product.id, quantity: 1 }, buyer.token));
+      data(await http.post('/cart/items', { productId: product.id, quantity: 1 }, buyer.token));
+      await eventually(async () => {
+        const row = await model(t, 'Product').findById(product.id);
+        expect(row).toMatchObject({ statsCartAdds: 1, statsPopularity: 1 });
+      });
+      const popular = data(await http.get('/products?collection=popular&limit=60')).rows.map((r: any) => r.id);
+      expect(popular).toContain(product.id);
     });
   });
 
@@ -129,9 +142,12 @@ describe('Catalog (e2e)', () => {
   });
 
   describe('home and detail', () => {
-    it('builds the landing page: six tiles and three rails', async () => {
+    it('builds the landing page: the managed categories (A–Z) and three rails', async () => {
       const home = data(await http.get('/catalog/home'));
-      expect(home.categories.map((tile: any) => tile.name)).toEqual(['Vehicles', 'Electronics', 'Fashion', 'Property', 'Gadget', 'Home Appliances']);
+      const shop = data(await http.get('/categories'));
+      // The rail is exactly the visible categories the console manages, in the same A–Z order.
+      expect(home.categories.map((tile: any) => tile.name)).toEqual(shop.map((category: any) => category.name));
+      expect(home.categories.length).toBeGreaterThan(0);
       expect(home.topSellers[0].brand).toBe('Samsung');
       expect(home.popular[0].brand).toBe('Tecno');
       expect(home.featured[0].brand).toBe('Toyota');
@@ -157,29 +173,29 @@ describe('Catalog (e2e)', () => {
     it('counts views from shoppers but not from the seller', async () => {
       const product = await createProduct(t, seller.id, { title: 'View counter test' });
       const buyer = await registerUser(t);
-      data(await http.get(`/products/${product._id}`, buyer.token));
-      data(await http.get(`/products/${product._id}`));
-      data(await http.get(`/products/${product._id}`, seller.token));
+      data(await http.get(`/products/${product.id}`, buyer.token));
+      data(await http.get(`/products/${product.id}`));
+      data(await http.get(`/products/${product.id}`, seller.token));
       await eventually(async () => {
-        const stored = await model<Product>(t, Product.name).findById(product._id).lean();
-        expect(stored?.stats.views).toBe(2);
+        const stored = await model(t, 'Product').findById(product.id).lean();
+        expect(stored?.statsViews).toBe(2);
       });
       // …and the seller's own visit never lands later.
       await new Promise((resolve) => setTimeout(resolve, 150));
-      expect((await model<Product>(t, Product.name).findById(product._id).lean())?.stats.views).toBe(2);
+      expect((await model(t, 'Product').findById(product.id).lean())?.statsViews).toBe(2);
     });
 
     it('hides listings that are not live', async () => {
-      const draft = await model<Product>(t, Product.name).findOne({ title: 'Hidden draft listing' }).lean();
-      failure(await http.get(`/products/${draft!._id}`), 404, 'PRODUCT_NOT_FOUND');
-      failure(await http.get(`/products/${new Types.ObjectId()}`), 404, 'PRODUCT_NOT_FOUND');
+      const draft = await model(t, 'Product').findOne({ title: 'Hidden draft listing' }).lean();
+      failure(await http.get(`/products/${draft.id}`), 404, 'PRODUCT_NOT_FOUND');
+      failure(await http.get(`/products/${uuidv7()}`), 404, 'PRODUCT_NOT_FOUND');
       failure(await http.get('/products/not-an-id'), 404);
     });
 
     it('marks wishlisted cards for a signed-in shopper', async () => {
       const buyer = await registerUser(t);
       const iphone = data(await http.get('/products?q=iphone')).rows[0];
-      await model<WishlistItem>(t, WishlistItem.name).create({ userId: new Types.ObjectId(buyer.id), productId: new Types.ObjectId(iphone.id) });
+      await model(t, 'WishlistItem').create({ userId: buyer.id, productId: iphone.id });
       const page = data(await http.get('/products?q=iphone', buyer.token));
       expect(page.rows[0].wishlisted).toBe(true);
       expect(data(await http.get(`/products/${iphone.id}`, buyer.token)).wishlisted).toBe(true);
@@ -360,13 +376,13 @@ describe('Catalog (e2e)', () => {
     it('lets moderators approve but not delete, and audits both', async () => {
       const moderator = await staffToken(t, 'moderator', { firstName: 'Amara', lastName: 'Eze' });
       const pending = await createProduct(t, seller.id, { title: 'Awaiting moderation', status: 'pending' });
-      const approved = data(await http.patch(`/admin/listings/${pending._id}/status`, { status: 'active', note: 'Looks genuine' }, moderator.token));
+      const approved = data(await http.patch(`/admin/listings/${pending.id}/status`, { status: 'active', note: 'Looks genuine' }, moderator.token));
       expect(approved.status).toBe('active');
-      failure(await http.delete(`/admin/listings/${pending._id}`, moderator.token), 403, 'PERMISSION_DENIED');
+      failure(await http.delete(`/admin/listings/${pending.id}`, moderator.token), 403, 'PERMISSION_DENIED');
 
       const admin = await staffToken(t, 'admin');
-      data(await http.delete(`/admin/listings/${pending._id}`, admin.token));
-      failure(await http.get(`/admin/listings/${pending._id}`, admin.token), 404);
+      data(await http.delete(`/admin/listings/${pending.id}`, admin.token));
+      failure(await http.get(`/admin/listings/${pending.id}`, admin.token), 404);
       const log = data(await http.get('/admin/audit?search=Awaiting', admin.token));
       expect(log.rows.map((row: any) => row.action)).toEqual(expect.arrayContaining(['Approved a listing', 'Deleted a listing']));
     });

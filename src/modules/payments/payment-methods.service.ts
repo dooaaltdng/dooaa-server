@@ -1,35 +1,35 @@
-import { Inject, Injectable } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { createHash } from 'node:crypto';
-import { Model, Types } from 'mongoose';
+import { CacheService } from '../../cache/cache.service';
 import { Errors } from '../../common/api/app-error';
-import { TtlCache } from '../../common/util/cache';
-import type { Lean } from '../../common/util/mongo';
-import { PAYMENT_PROVIDER, type Bank, type CardAuthorization, type PaymentProvider } from './providers/payment-provider';
-import { PayoutAccount } from './schemas/payout-account.schema';
-import { SavedCard } from './schemas/saved-card.schema';
+import type { PayoutAccountSource } from '../../common/domain';
+import { isUuid } from '../../common/util/uuid';
+import { InjectDb, type Database } from '../../database/database';
+import { payoutAccounts } from '../../database/schema';
+import { PAYMENT_PROVIDER, type Bank, type PaymentProvider } from './providers/payment-provider';
+import { explain } from '../../common/util/explain-error';
 
-/** One row of the settings panel's "Payment accounts" (banks to be paid into, cards to pay with). */
+export type PayoutAccount = typeof payoutAccounts.$inferSelect;
+
+/**
+ * One row of the settings panel's "Payment accounts": the banks a seller is
+ * paid into. Cards are never stored — buyers enter them on Bachs' page.
+ */
 export type PaymentAccountView = {
   id: string;
-  type: 'bank' | 'card';
-  /** Bank name, or the card network for cards. */
+  type: 'bank';
+  /** The bank's name. */
   issuer: string;
   holder: string;
   last4: string;
+  /** Bachs approved the account for payouts (new accounts are reviewed first). */
   verified: boolean;
   primary: boolean;
-  bankCode?: string;
-  expiry?: string;
+  bankCode: string;
 };
 
-const BRAND_LABEL: Record<string, string> = {
-  visa: 'Visa',
-  mastercard: 'Master Card',
-  verve: 'Verve',
-  'american express': 'American Express',
-  amex: 'American Express',
-};
+const BANKS_CACHE_KEY = 'payments:banks';
+const BANKS_TTL_MS = 60 * 60_000;
 
 function fingerprint(bankCode: string, accountNumber: string): string {
   return createHash('sha256').update(`${bankCode}:${accountNumber}`).digest('hex');
@@ -37,18 +37,18 @@ function fingerprint(bankCode: string, accountNumber: string): string {
 
 @Injectable()
 export class PaymentMethodsService {
-  private readonly banksCache = new TtlCache<Bank[]>(60 * 60_000, 1);
+  private readonly logger = new Logger(PaymentMethodsService.name);
 
   constructor(
-    @InjectModel(SavedCard.name) private readonly cards: Model<SavedCard>,
-    @InjectModel(PayoutAccount.name) private readonly accounts: Model<PayoutAccount>,
+    @InjectDb() private readonly db: Database,
     @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
+    private readonly cache: CacheService,
   ) {}
 
   /* --- Banks ---------------------------------------------------------------- */
 
   listBanks(): Promise<Bank[]> {
-    return this.banksCache.wrap('banks', () => this.provider.listBanks());
+    return this.cache.wrap(BANKS_CACHE_KEY, BANKS_TTL_MS, () => this.provider.listBanks());
   }
 
   async bankName(code: string): Promise<string> {
@@ -66,12 +66,12 @@ export class PaymentMethodsService {
 
   /* --- Payout accounts ------------------------------------------------------ */
 
-  private accountView(row: Lean<PayoutAccount>): PaymentAccountView {
+  private accountView(row: PayoutAccount, holder?: string): PaymentAccountView {
     return {
-      id: String(row._id),
+      id: row.id,
       type: 'bank',
       issuer: row.bankName,
-      holder: row.accountName,
+      holder: holder ?? row.accountName,
       last4: row.last4,
       verified: row.verified,
       primary: row.primary,
@@ -79,156 +79,102 @@ export class PaymentMethodsService {
     };
   }
 
+  /**
+   * Resolves the account with the bank, registers it with Bachs as a payout
+   * destination and saves it. Adding the same account again refreshes it.
+   */
   async addPayoutAccount(
     userId: string,
     input: { bankCode: string; accountNumber: string; primary?: boolean },
-    source: 'settings' | 'verification' = 'settings',
+    source: PayoutAccountSource = 'settings',
   ): Promise<PaymentAccountView> {
     const resolved = await this.resolveAccount(input.accountNumber, input.bankCode);
-    const { recipientCode } = await this.provider.createTransferRecipient({
-      name: resolved.accountName,
+    const destination = await this.provider.createPayoutDestination({
+      accountName: resolved.accountName,
       accountNumber: input.accountNumber,
       bankCode: input.bankCode,
+      label: `DOOAA seller ${userId}`,
     });
-    const owner = new Types.ObjectId(userId);
-    const hasAny = (await this.accounts.countDocuments({ userId: owner })) > 0;
-    const primary = input.primary === true || !hasAny;
-    if (primary) await this.accounts.updateMany({ userId: owner }, { $set: { primary: false } });
-    const row = await this.accounts
-      .findOneAndUpdate(
-        { userId: owner, fingerprint: fingerprint(input.bankCode, input.accountNumber) },
-        {
-          $set: {
-            provider: this.provider.name,
-            bankCode: input.bankCode,
-            bankName: resolved.bankName,
-            accountName: resolved.accountName,
-            last4: input.accountNumber.slice(-4),
-            recipientCode,
-            verified: true,
-            source,
-            ...(primary ? { primary: true } : {}),
-          },
-          $setOnInsert: primary ? {} : { primary: false },
-        },
-        { upsert: true, returnDocument: 'after' },
-      )
-      .lean<Lean<PayoutAccount>>();
-    return this.accountView(row!);
+    const total = await this.db.count(payoutAccounts, { userId });
+    const primary = input.primary === true || total === 0;
+    const details = {
+      provider: this.provider.name,
+      bankCode: input.bankCode,
+      bankName: resolved.bankName,
+      accountName: resolved.accountName,
+      last4: input.accountNumber.slice(-4),
+      recipientCode: destination.destinationId,
+      verified: destination.usable,
+      source,
+    };
+    const row = await this.db.transaction(async (tx) => {
+      if (primary) await tx.updateMany(payoutAccounts, { userId }, { primary: false });
+      return tx.upsert(
+        payoutAccounts,
+        { userId, fingerprint: fingerprint(input.bankCode, input.accountNumber) },
+        { ...details, ...(primary ? { primary: true } : {}) },
+        { primary },
+      );
+    });
+    return this.accountView(row);
   }
 
   async payoutAccounts(userId: string): Promise<PaymentAccountView[]> {
-    const rows = await this.accounts.find({ userId: new Types.ObjectId(userId) }).sort({ primary: -1, createdAt: 1 }).lean<Lean<PayoutAccount>[]>();
+    const rows = await this.db.find(payoutAccounts, { userId }, { sort: { primary: -1, createdAt: 1 } });
     return rows.map((row) => this.accountView(row));
   }
 
-  async payoutAccount(userId: string, id?: string): Promise<Lean<PayoutAccount> | null> {
-    const owner = new Types.ObjectId(userId);
-    if (id) {
-      if (!Types.ObjectId.isValid(id)) return null;
-      return this.accounts.findOne({ _id: id, userId: owner }).lean<Lean<PayoutAccount>>();
-    }
-    return this.accounts.findOne({ userId: owner }).sort({ primary: -1, createdAt: 1 }).lean<Lean<PayoutAccount>>();
+  /** The chosen account, or the primary one. */
+  async payoutAccount(userId: string, id?: string): Promise<PayoutAccount | null> {
+    if (id !== undefined && !isUuid(id)) return null;
+    return this.db.findOne(payoutAccounts, { userId, ...(id ? { id } : {}) }, { sort: { primary: -1, createdAt: 1 } });
   }
 
-  /* --- Saved cards ---------------------------------------------------------- */
-
-  private cardView(row: Lean<SavedCard>, holder: string): PaymentAccountView {
-    const brand = (row.brand ?? '').toLowerCase();
-    return {
-      id: String(row._id),
-      type: 'card',
-      issuer: BRAND_LABEL[brand] ?? (row.brand ? row.brand[0].toUpperCase() + row.brand.slice(1) : 'Card'),
-      holder,
-      last4: row.last4 ?? '',
-      verified: true,
-      primary: row.primary,
-      expiry: row.expMonth && row.expYear ? `${row.expMonth.padStart(2, '0')}/${row.expYear.slice(-2)}` : undefined,
-    };
+  /**
+   * Whether Bachs has approved the account for payouts, asking Bachs again
+   * while it is still under review and remembering the answer.
+   */
+  async ensureUsable(account: PayoutAccount): Promise<boolean> {
+    if (account.verified) return true;
+    const destination = await this.provider.getPayoutDestination(account.recipientCode).catch((error: Error) => {
+      this.logger.warn(explain(`Could not confirm the payout bank account ${account.recipientCode} with the payment provider`, error));
+      return null;
+    });
+    if (!destination?.usable) return false;
+    await this.db.update(payoutAccounts, { id: account.id }, { verified: true });
+    return true;
   }
 
-  /** Called when the provider confirms a reusable card payment. */
-  async saveCard(userId: string, provider: string, authorization: CardAuthorization): Promise<void> {
-    const owner = new Types.ObjectId(userId);
-    const hasAny = (await this.cards.countDocuments({ userId: owner })) > 0;
-    const key = authorization.signature ? { userId: owner, signature: authorization.signature } : { userId: owner, authorizationCode: authorization.authorizationCode };
-    await this.cards.updateOne(
-      key,
-      {
-        $set: {
-          provider,
-          authorizationCode: authorization.authorizationCode,
-          last4: authorization.last4,
-          brand: authorization.brand,
-          bank: authorization.bank,
-          expMonth: authorization.expMonth,
-          expYear: authorization.expYear,
-        },
-        $setOnInsert: { primary: !hasAny },
-      },
-      { upsert: true },
-    );
-  }
-
-  async savedCards(userId: string, holder: string): Promise<PaymentAccountView[]> {
-    const rows = await this.cards.find({ userId: new Types.ObjectId(userId) }).sort({ primary: -1, createdAt: 1 }).lean<Lean<SavedCard>[]>();
-    return rows.map((row) => this.cardView(row, holder));
-  }
-
-  async authorizationFor(userId: string, cardId: string): Promise<string> {
-    if (!Types.ObjectId.isValid(cardId)) throw Errors.notFound('That saved card is no longer available.', 'CARD_NOT_FOUND');
-    const card = await this.cards.findOne({ _id: cardId, userId: new Types.ObjectId(userId) }).select('+authorizationCode').lean();
-    if (!card) throw Errors.notFound('That saved card is no longer available.', 'CARD_NOT_FOUND');
-    return card.authorizationCode;
-  }
-
-  /* --- Both, as the settings panel shows them ------------------------------- */
+  /* --- The settings panel ---------------------------------------------------- */
 
   async accountsFor(userId: string, holder: string): Promise<PaymentAccountView[]> {
-    const [banks, cards] = await Promise.all([this.payoutAccounts(userId), this.savedCards(userId, holder)]);
-    return [...banks, ...cards];
+    const rows = await this.db.find(payoutAccounts, { userId }, { sort: { primary: -1, createdAt: 1 } });
+    return rows.map((row) => this.accountView(row, holder));
   }
 
   async remove(userId: string, id: string): Promise<{ removed: true }> {
-    if (!Types.ObjectId.isValid(id)) throw Errors.notFound('That payment account is not on your profile.', 'ACCOUNT_NOT_FOUND');
-    const owner = new Types.ObjectId(userId);
-    const bank = await this.accounts.findOneAndDelete({ _id: id, userId: owner }).lean<Lean<PayoutAccount>>();
-    if (bank) {
-      if (bank.primary) await this.promoteNext('bank', owner);
-      return { removed: true };
-    }
-    const card = await this.cards.findOneAndDelete({ _id: id, userId: owner }).lean<Lean<SavedCard>>();
-    if (card) {
-      if (card.primary) await this.promoteNext('card', owner);
-      return { removed: true };
-    }
-    throw Errors.notFound('That payment account is not on your profile.', 'ACCOUNT_NOT_FOUND');
+    const removed = await this.db.transaction(async (tx) => {
+      const row = isUuid(id) ? await tx.delete(payoutAccounts, { id, userId }) : null;
+      if (row?.primary) {
+        const next = await tx.findOne(payoutAccounts, { userId }, { sort: { createdAt: 1 } });
+        if (next) await tx.update(payoutAccounts, { id: next.id }, { primary: true });
+      }
+      return row;
+    });
+    if (!removed) throw Errors.notFound('That payment account is not on your profile.', 'ACCOUNT_NOT_FOUND');
+    return { removed: true };
   }
 
-  private async promoteNext(kind: 'bank' | 'card', owner: Types.ObjectId): Promise<void> {
-    if (kind === 'bank') {
-      const next = await this.accounts.findOne({ userId: owner }).sort({ createdAt: 1 }).lean();
-      if (next) await this.accounts.updateOne({ _id: next._id }, { $set: { primary: true } });
-      return;
-    }
-    const next = await this.cards.findOne({ userId: owner }).sort({ createdAt: 1 }).lean();
-    if (next) await this.cards.updateOne({ _id: next._id }, { $set: { primary: true } });
-  }
-
-  /** Primary is per kind: one bank payouts default to, one card checkout defaults to. */
+  /** The bank payouts default to. */
   async setPrimary(userId: string, id: string): Promise<{ primary: true }> {
-    if (!Types.ObjectId.isValid(id)) throw Errors.notFound('That payment account is not on your profile.', 'ACCOUNT_NOT_FOUND');
-    const owner = new Types.ObjectId(userId);
-    if (await this.accounts.exists({ _id: id, userId: owner })) {
-      await this.accounts.updateMany({ userId: owner }, { $set: { primary: false } });
-      await this.accounts.updateOne({ _id: id }, { $set: { primary: true } });
-      return { primary: true };
-    }
-    if (await this.cards.exists({ _id: id, userId: owner })) {
-      await this.cards.updateMany({ userId: owner }, { $set: { primary: false } });
-      await this.cards.updateOne({ _id: id }, { $set: { primary: true } });
-      return { primary: true };
-    }
-    throw Errors.notFound('That payment account is not on your profile.', 'ACCOUNT_NOT_FOUND');
+    const updated = await this.db.transaction(async (tx) => {
+      const owned = isUuid(id) ? await tx.findOne(payoutAccounts, { id, userId }) : null;
+      if (!owned) return false;
+      await tx.updateMany(payoutAccounts, { userId }, { primary: false });
+      await tx.update(payoutAccounts, { id }, { primary: true });
+      return true;
+    });
+    if (!updated) throw Errors.notFound('That payment account is not on your profile.', 'ACCOUNT_NOT_FOUND');
+    return { primary: true };
   }
 }
