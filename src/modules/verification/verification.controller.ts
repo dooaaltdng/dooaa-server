@@ -9,12 +9,12 @@ import { BANK_VERIFICATION_METHODS, ID_TYPES, VERIFICATION_LEVELS, type BankVeri
 import { PageQueryDto } from '../../common/util/pagination';
 import { Trim } from '../../common/util/transforms';
 import { VerificationService } from './verification.service';
+import { RequireFeature } from '../../common/auth/feature.guard';
 
 class DocumentsDto {
   /** Media ids from uploads with purpose "kyc". */
   @IsUUID('all', { message: 'Upload the front of your ID.' }) idFront: string;
   @IsOptional() @IsUUID() idBack?: string;
-  @IsUUID('all', { message: 'Take your selfie.' }) selfie: string;
 }
 
 class BankDto {
@@ -26,7 +26,6 @@ class BankDto {
 class SubmitVerificationDto {
   @IsIn(ID_TYPES, { message: 'Choose the type of ID.' }) idType: IdType;
   @ValidateNested() @Type(() => DocumentsDto) documents: DocumentsDto;
-  @IsBoolean() livenessPassed: boolean;
   @IsOptional() @ValidateNested() @Type(() => BankDto) bank?: BankDto;
   @IsArray() @ArrayMaxSize(5) @IsBoolean({ each: true }) consents: boolean[];
 }
@@ -58,6 +57,7 @@ export class VerificationController {
   }
 
   @RequireVerifiedEmail()
+  @RequireFeature('verification')
   @Post()
   submit(@CurrentUser() user: AuthUser, @Body() body: SubmitVerificationDto) {
     return this.verification.submit(user, body);

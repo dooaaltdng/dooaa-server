@@ -6,6 +6,9 @@ import { AppModule } from '../../src/app.module';
 import { configureApp } from '../../src/bootstrap';
 import { CACHE_STORE } from '../../src/cache/cache.store';
 import { DATABASE, type Database } from '../../src/database/database';
+import { settings as settingsTable } from '../../src/database/schema';
+import { defaultSettings } from '../../src/modules/settings/settings.defaults';
+import { SettingsService } from '../../src/modules/settings/settings.service';
 import { MailService } from '../../src/modules/mail/mail.service';
 import { MAIL_TRANSPORT } from '../../src/modules/mail/mail.transport';
 import { STORAGE_DRIVER } from '../../src/modules/media/storage/storage.driver';
@@ -36,7 +39,15 @@ export type TestApp = {
  * Bachs is a fake HTTP server the real provider calls. `env` overrides are
  * applied only while the app reads its configuration.
  */
-export async function createTestApp(options: { env?: Record<string, string>; /** Kept for callers; every test app listens now. */ listen?: boolean } = {}): Promise<TestApp> {
+export async function createTestApp(
+  options: {
+    env?: Record<string, string>;
+    /** Kept for callers; every test app listens now. */
+    listen?: boolean;
+    /** Escrow ships switched off; most suites exercise it, so a test app starts with it on unless asked otherwise. */
+    escrow?: boolean;
+  } = {},
+): Promise<TestApp> {
   const database = `t_${process.env.JEST_WORKER_ID ?? '0'}_${randomBytes(4).toString('hex')}`;
 
   const bachs = new FakeBachs();
@@ -78,6 +89,10 @@ export async function createTestApp(options: { env?: Record<string, string>; /**
     const url = `http://127.0.0.1:${address.port}`;
     bachs.webhookUrl = `${url}/api/v1/payments/webhooks/bachs`;
     mail.attach(app.get(MailService));
+    if (options.escrow !== false) {
+      await app.get<Database>(DATABASE).upsert(settingsTable, { id: 'platform' }, { $set: { 'values.escrow': { ...defaultSettings().escrow, enabled: true } } });
+      await app.get(SettingsService).invalidate();
+    }
     return {
       app,
       server: app.getHttpServer(),

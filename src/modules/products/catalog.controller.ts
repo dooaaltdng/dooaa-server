@@ -8,6 +8,7 @@ import { CategoriesService } from '../categories/categories.service';
 import { ReviewsService } from '../reviews/reviews.service';
 import { CatalogQueryDto, SuggestQueryDto } from './dto/product.dto';
 import { ProductsService } from './products.service';
+import { RequireFeature } from '../../common/auth/feature.guard';
 
 /** Everything a visitor can browse without signing in. A signed-in viewer also gets their wishlist hearts. */
 @ApiTags('Catalog')
@@ -40,6 +41,7 @@ export class CatalogController {
     return this.products.search(query, user);
   }
 
+  @RequireFeature('search')
   @Get('products/suggest')
   suggest(@Query() query: SuggestQueryDto) {
     return this.products.suggest(query.q);

@@ -1,6 +1,6 @@
 import { Body, Controller, Get, HttpCode, Param, Post } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
-import { IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
+import { IsObject, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
 import { UuidPipe } from '../../common/api/uuid.pipe';
 import { CurrentStaff, Public, RequirePermissions, StaffOnly } from '../../common/auth/decorators';
 import type { AuthStaff } from '../../common/auth/principal';
@@ -8,13 +8,15 @@ import { Trim } from '../../common/util/transforms';
 import { ContentService } from './content.service';
 
 class PublishDto {
-  @IsString() @MinLength(1, { message: 'The page cannot be empty.' }) @MaxLength(200_000) body: string;
+  /** Rich-text pages send a body; the home page sends `sections` instead. */
+  @IsOptional() @IsString() @MinLength(1, { message: 'The page cannot be empty.' }) @MaxLength(200_000) body?: string;
+  @IsOptional() @IsObject() sections?: Record<string, unknown>;
   @IsOptional() @Trim() @IsString() @MaxLength(120) title?: string;
   @IsOptional() @Trim() @IsString() @MaxLength(300) summary?: string;
   @IsOptional() @Trim() @IsString() @MaxLength(200) note?: string;
 }
 
-/** Published pages for the storefront (About, Help, Terms, Privacy, Refunds, Safety). */
+/** Published pages for the storefront (Home, About, Help, Terms, Privacy, Refunds, Safety). */
 @ApiTags('Content')
 @Public()
 @Controller('content')

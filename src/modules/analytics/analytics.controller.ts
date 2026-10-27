@@ -4,6 +4,7 @@ import { IsIn, IsOptional, IsString, Matches } from 'class-validator';
 import { CurrentUser, Public, SellerOnly, StaffOnly } from '../../common/auth/decorators';
 import type { AuthUser } from '../../common/auth/principal';
 import { AnalyticsService, type TrendId } from './analytics.service';
+import { RequireFeature } from '../../common/auth/feature.guard';
 
 class VisitDto {
   /** A random id the app keeps per browser (no personal data). */
@@ -36,6 +37,7 @@ export class AnalyticsController {
   }
 
   @SellerOnly()
+  @RequireFeature('seller-analytics')
   @Get('seller/analytics')
   seller(@CurrentUser() user: AuthUser, @Query() query: SellerRangeDto) {
     return this.analytics.sellerAnalytics(user.id, query.range ?? '12m');

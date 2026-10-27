@@ -9,6 +9,7 @@ import { PageQueryDto } from '../../common/util/pagination';
 import { WalletService } from '../wallet/wallet.service';
 import { DeliverOrderDto, OrdersQueryDto, ReasonDto, ShipOrderDto } from './dto/orders.dto';
 import { OrdersService } from './orders.service';
+import { RequireFeature } from '../../common/auth/feature.guard';
 
 class RecentQueryDto {
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(20) limit?: number;
@@ -99,6 +100,7 @@ export class SellerOrdersController {
   /** The Withdraw dialog: amount and password; the provider transfers to the seller's bank. */
   @RequireVerifiedEmail()
   @AuthThrottle()
+  @RequireFeature('payouts')
   @Post('payouts')
   withdraw(@CurrentUser() user: AuthUser, @Body() body: WithdrawDto) {
     return this.wallet.requestPayout(user, body);

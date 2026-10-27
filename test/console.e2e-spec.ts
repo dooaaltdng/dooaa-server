@@ -46,7 +46,7 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       data(await http.post(`/orders/${order.id}/dispute`, { reason: 'The kit lens was missing from the box.' }, buyer.token));
 
       const profile = data(await http.get(`/admin/buyers/${buyer.id}`, superadmin.token));
-      expect(profile).toMatchObject({ kycLevel: 1, kycHeadline: 'Level 1 — Awaiting ID', totalPurchase: 1 });
+      expect(profile).toMatchObject({ verificationStatus: null, verificationId: null, documents: [], totalPurchase: 1 });
       expect(profile.transactions[0]).toMatchObject({ orderId: order.number, item: 'Canon EOS R50', sellerEmail: seller.email, status: 'shipped' });
       expect(profile.disputes[0]).toMatchObject({ orderId: order.number, status: 'review' });
       expect(profile.messages[0]).toMatchObject({ reference: profile.disputes[0].reference });
@@ -231,9 +231,9 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
   });
 
   describe('content', () => {
-    it('serves the six published pages, including under the client’s route names', async () => {
+    it('serves the seven published pages, including under the client’s route names', async () => {
       const pages = data(await http.get('/content'));
-      expect(pages.map((page: any) => page.title)).toEqual(['About Us', 'Help Center', 'Privacy Policy', 'Terms & Conditions', 'Refund & Return Policy', 'Safety Tips for Transactions']);
+      expect(pages.map((page: any) => page.title)).toEqual(['Home Page', 'About Us', 'Help Center', 'Privacy Policy', 'Terms & Conditions', 'Refund & Return Policy', 'Safety Tips for Transactions']);
       expect(data(await http.get('/content/refund-policy')).slug).toBe('refunds');
       expect(data(await http.get('/content/safety-tips')).body).toContain('<h2>');
       failure(await http.get('/content/nope'), 404, 'PAGE_NOT_FOUND');
@@ -255,6 +255,33 @@ describe('Console users, content, dashboard, support and jobs (e2e)', () => {
       expect(data(await http.get('/content/about')).body).toBe('<h2>About DOOAA</h2><p>Hello</p>');
       failure(await http.post('/admin/content/about/publish', { body: '<script></script>' }, superadmin.token), 400, 'EMPTY_PAGE');
       expect(original.title).toBe('About Us');
+    });
+
+    it('publishes the home page as sections and renders its body from them', async () => {
+      const home = data(await http.get('/content/home'));
+      expect(home.sections.whyChoose.features.map((feature: any) => feature.title)).toEqual(['Escrow Payment', 'Used & New Products', 'Secure Transactions', 'Full Transparency']);
+      expect(home.sections.faq.items.length).toBeGreaterThan(0);
+
+      const sections = structuredClone(home.sections);
+      sections.whyChoose.features[0] = { id: 'escrow', title: '  Protected Payments ', description: 'Held until you confirm <b>delivery</b>' };
+      sections.faq.items = [{ question: 'Is it free?', answer: 'Buying is free.' }];
+      const published = data(await http.post('/admin/content/home/publish', { sections }, superadmin.token));
+      expect(published.page.sections.whyChoose.features[0]).toEqual({ id: 'escrow', title: 'Protected Payments', description: 'Held until you confirm <b>delivery</b>' });
+      expect(published.page.body).toContain('<h3>Is it free?</h3><p>Buying is free.</p>');
+      expect(published.page.body).toContain('&lt;b&gt;delivery&lt;/b&gt;');
+      expect(published.version.sections.faq.items).toHaveLength(1);
+
+      failure(await http.post('/admin/content/home/publish', { body: '<p>Plain</p>' }, superadmin.token), 400, 'INVALID_HOME_CONTENT');
+      const missingCard = structuredClone(sections);
+      missingCard.whyChoose.features.pop();
+      failure(await http.post('/admin/content/home/publish', { sections: missingCard }, superadmin.token), 400, 'INVALID_HOME_CONTENT');
+      const blankAnswer = structuredClone(sections);
+      blankAnswer.faq.items[0].answer = '   ';
+      failure(await http.post('/admin/content/home/publish', { sections: blankAnswer }, superadmin.token), 400, 'INVALID_HOME_CONTENT');
+
+      const history = data(await http.get('/admin/content/home/history', superadmin.token));
+      data(await http.post('/admin/content/home/versions/' + history[0].id + '/restore', {}, superadmin.token));
+      expect(data(await http.get('/content/home')).sections.faq.items).toEqual([{ question: 'Is it free?', answer: 'Buying is free.' }]);
     });
 
     it('needs content.publish', async () => {

@@ -6,11 +6,12 @@ import { isUuid } from '../../common/util/uuid';
 import { InjectDb, type Database } from '../../database/database';
 import { contentPages, contentVersions } from '../../database/schema';
 import { AuditService } from '../audit/audit.service';
+import { HOME_SLUG, homeHtml, parseHomeSections } from './home';
 import { sanitizeContent } from './sanitize';
 import { defaultPages } from './seed/pages';
 
-export type ContentPageView = { id: string; slug: string; title: string; summary: string; updatedOn: string; updatedAt: string; body: string };
-export type ContentVersionView = { id: string; savedAt: string; author: string; note: string; body: string; title: string };
+export type ContentPageView = { id: string; slug: string; title: string; summary: string; updatedOn: string; updatedAt: string; body: string; sections: Record<string, unknown> | null };
+export type ContentVersionView = { id: string; savedAt: string; author: string; note: string; body: string; title: string; sections: Record<string, unknown> | null };
 
 type ContentPage = typeof contentPages.$inferSelect;
 type ContentVersion = typeof contentVersions.$inferSelect;
@@ -48,6 +49,7 @@ export class ContentService {
       updatedOn: dayKey(page.updatedAt),
       updatedAt: page.updatedAt.toISOString(),
       body: page.body,
+      sections: page.sections ?? null,
     };
   }
 
@@ -59,6 +61,7 @@ export class ContentService {
       note: version.note,
       body: version.body,
       title: version.title,
+      sections: version.sections ?? null,
     };
   }
 
@@ -68,6 +71,8 @@ export class ContentService {
 
   async list(): Promise<ContentPageView[]> {
     const rows = await this.db.find(contentPages, {}, { sort: { order: 1, title: 1 } });
+    // Home leads the list whatever order older databases stored the other pages under.
+    rows.sort((a, b) => Number(b.slug === HOME_SLUG) - Number(a.slug === HOME_SLUG));
     return rows.map((row) => this.view(row));
   }
 
@@ -87,23 +92,35 @@ export class ContentService {
    * "Publish Changes": stores the sanitised body, records it as a version
    * and returns both, so the console can update the row, the preview and
    * the History tab from one response.
+   *
+   * The home page is published as `sections` (its fields); its body is
+   * rendered from them rather than taken from the request.
    */
-  async publish(staff: AuthStaff, slug: string, input: { body: string; title?: string; summary?: string; note?: string }): Promise<{ page: ContentPageView; version: ContentVersionView }> {
+  async publish(staff: AuthStaff, slug: string, input: { body?: string; sections?: unknown; title?: string; summary?: string; note?: string }): Promise<{ page: ContentPageView; version: ContentVersionView }> {
     const current = await this.page(slug);
     if (!current) throw Errors.notFound('That page is no longer published.', 'PAGE_NOT_FOUND');
-    const body = sanitizeContent(input.body);
+    let sections: Record<string, unknown> | null = null;
+    let html = input.body ?? '';
+    if (current.slug === HOME_SLUG) {
+      if (input.sections === undefined) throw Errors.badRequest('The home page is published as sections.', 'INVALID_HOME_CONTENT');
+      const parsed = parseHomeSections(input.sections);
+      sections = parsed;
+      html = homeHtml(parsed);
+    }
+    const body = sanitizeContent(html);
     if (!body.replace(/<[^>]*>/g, '').trim()) throw Errors.badRequest('The page cannot be empty.', 'EMPTY_PAGE');
     const author = `${staff.firstName} ${staff.lastName}`;
     const { page, version } = await this.db.transaction(async (tx) => {
       const updated = (await tx.update(
         contentPages,
         { id: current.id },
-        { body, title: input.title?.trim() || current.title, summary: input.summary?.trim() ?? current.summary, updatedBy: author },
+        { body, sections, title: input.title?.trim() || current.title, summary: input.summary?.trim() ?? current.summary, updatedBy: author },
       ))!;
       const saved = await tx.insert(contentVersions, {
         slug: current.slug,
         title: updated.title,
         body,
+        sections,
         author,
         authorId: staff.id,
         note: input.note?.trim() || 'Published from the console.',
@@ -118,7 +135,7 @@ export class ContentService {
   async restore(staff: AuthStaff, slug: string, versionId: string) {
     const version = isUuid(versionId) ? await this.db.findOne(contentVersions, { id: versionId, slug: this.resolve(slug) }) : null;
     if (!version) throw Errors.notFound('That version no longer exists.', 'VERSION_NOT_FOUND');
-    return this.publish(staff, slug, { body: version.body, title: version.title, note: `Restored the version from ${dayKey(version.createdAt)}.` });
+    return this.publish(staff, slug, { body: version.body, sections: version.sections ?? undefined, title: version.title, note: `Restored the version from ${dayKey(version.createdAt)}.` });
   }
 
   /** Inserts any default page that does not exist yet. Never overwrites published copy. */

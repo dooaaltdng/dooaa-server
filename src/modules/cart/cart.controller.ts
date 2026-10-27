@@ -5,6 +5,7 @@ import { CurrentUser } from '../../common/auth/decorators';
 import type { AuthUser } from '../../common/auth/principal';
 import { CartService } from './cart.service';
 import { AddCartItemDto, CouponDto, DeliveryInfoDto, MergeCartDto, SetQuantityDto } from './dto/cart.dto';
+import { RequireFeature } from '../../common/auth/feature.guard';
 
 @ApiTags('Cart')
 @ApiBearerAuth('user')
@@ -17,6 +18,7 @@ export class CartController {
     return this.cart.view(user);
   }
 
+  @RequireFeature('checkout')
   @Post('items')
   add(@CurrentUser() user: AuthUser, @Body() body: AddCartItemDto) {
     return this.cart.add(user, body.productId, body.quantity ?? 1);
@@ -37,6 +39,7 @@ export class CartController {
     return this.cart.clear(user);
   }
 
+  @RequireFeature('coupons')
   @Post('coupon')
   applyCoupon(@CurrentUser() user: AuthUser, @Body() body: CouponDto) {
     return this.cart.applyCoupon(user, body.code);

@@ -5,6 +5,7 @@ import { CurrentUser, SellerOnly } from '../../common/auth/decorators';
 import type { AuthUser } from '../../common/auth/principal';
 import { CreateProductDto, SellerProductStatusDto, SellerProductsQueryDto, UpdateProductDto } from './dto/product.dto';
 import { ProductsService } from './products.service';
+import { RequireFeature } from '../../common/auth/feature.guard';
 
 /** The seller's Products tab, product page and the Add New Product wizard. */
 @ApiTags('Seller · Products')
@@ -19,6 +20,7 @@ export class SellerProductsController {
     return this.products.sellerList(user, query);
   }
 
+  @RequireFeature('selling')
   @Post()
   create(@CurrentUser() user: AuthUser, @Body() body: CreateProductDto) {
     return this.products.create(user, body);

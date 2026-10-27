@@ -21,6 +21,7 @@ export type AuthResult = { user: PublicUser; tokens: TokenPair };
 
 type ResetTokenPayload = { sub: string; typ: 'reset'; ver: number };
 
+import { SettingsService } from '../settings/settings.service';
 @Injectable()
 export class AuthService {
   constructor(
@@ -31,6 +32,7 @@ export class AuthService {
     private readonly mail: MailService,
     private readonly jwt: JwtService,
     @InjectConfig() private readonly config: AppConfig,
+    private readonly settings: SettingsService,
   ) {}
 
   /** OTP lookups are keyed by account, whatever channel the code travels on. */
@@ -288,6 +290,7 @@ export class AuthService {
    */
   async setRole(user: AuthUser, role: UserRole): Promise<PublicUser> {
     if (user.role === role) return toPublicUser(await this.users.getById(user.id));
+    if (role === 'seller') await this.settings.requireFeature('selling');
     if (user.role === 'seller' && role === 'buyer') {
       const record = await this.users.getById(user.id);
       if (record.stats.activeListings > 0) {

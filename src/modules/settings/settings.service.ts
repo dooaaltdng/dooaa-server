@@ -12,6 +12,9 @@ import { AuditService } from '../audit/audit.service';
 import { SECTION_DTO } from './dto/settings.dto';
 import {
   defaultSettings,
+  FEATURE_FLAGS,
+  FEATURE_OFF_MESSAGE,
+  type FeatureFlag,
   type PlatformSettings,
   type SettingsSection,
 } from './settings.defaults';
@@ -24,6 +27,7 @@ const SECTION_LABEL: Record<SettingsSection, string> = {
   notifications: 'Notifications',
   roles: 'Roles & permissions',
   commerce: 'Checkout & payouts',
+  features: 'Features',
 };
 
 const RECORD_ID = 'platform';
@@ -89,6 +93,11 @@ export class SettingsService {
 
   async can(role: StaffRole, permission: Permission): Promise<boolean> {
     return (await this.permissionsFor(role)).includes(permission);
+  }
+
+  /** Throws FEATURE_OFF when the console has switched `flag` off on the Features page. */
+  async requireFeature(flag: FeatureFlag): Promise<void> {
+    if (!(await this.section('features'))[flag]) throw Errors.forbidden(FEATURE_OFF_MESSAGE[flag], 'FEATURE_OFF');
   }
 
   /** Validates and replaces one section. Panes save a section at a time, never the whole. */
@@ -161,6 +170,7 @@ export class SettingsService {
         activeCategories: settings.marketplace.activeCategories,
         regions: settings.marketplace.regions,
       },
+      features: settings.features,
     };
   }
 }
@@ -172,6 +182,14 @@ function describeChange<K extends SettingsSection>(key: K, before: PlatformSetti
     const a = after as PlatformSettings['escrow'];
     if (b.enabled !== a.enabled) return a.enabled ? 'Switched escrow on' : 'Switched escrow off';
     if (b.feePercent !== a.feePercent) return `Changed the escrow fee (${b.feePercent}% → ${a.feePercent}%)`;
+  }
+  if (key === 'features') {
+    const b = before as PlatformSettings['features'];
+    const a = after as PlatformSettings['features'];
+    const off = FEATURE_FLAGS.filter((flag) => b[flag] && !a[flag]);
+    const on = FEATURE_FLAGS.filter((flag) => !b[flag] && a[flag]);
+    const parts = [on.length ? `on: ${on.join(', ')}` : '', off.length ? `off: ${off.join(', ')}` : ''].filter(Boolean);
+    if (parts.length) return `Switched features ${parts.join('; ')}`;
   }
   return `Updated ${SECTION_LABEL[key].toLowerCase()} settings`;
 }

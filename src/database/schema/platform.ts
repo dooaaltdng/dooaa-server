@@ -113,14 +113,16 @@ export type ContentPageRow = Timestamps & {
   summary: string;
   /** Sanitised rich text, exactly what the editor saves. */
   body: string;
+  /** Structured copy for pages the storefront lays out itself (the home page); null for rich-text pages. */
+  sections: Record<string, unknown> | null;
   updatedBy: string | null;
   order: number;
 };
 
 export const contentPages = table<ContentPageRow>()('content_pages', {
   key: 'id',
-  defaults: () => ({ summary: '', body: '', order: 0 }),
-  nullable: ['updatedBy'],
+  defaults: () => ({ summary: '', body: '', sections: null, order: 0 }),
+  nullable: ['updatedBy', 'sections'],
   indexes: [index('content_pages_slug_key', { slug: 1 }, { unique: true })],
 });
 
@@ -130,6 +132,7 @@ export type ContentVersionRow = Timestamps & {
   slug: string;
   title: string;
   body: string;
+  sections: Record<string, unknown> | null;
   author: string;
   authorId: string | null;
   note: string;
@@ -137,8 +140,8 @@ export type ContentVersionRow = Timestamps & {
 
 export const contentVersions = table<ContentVersionRow>()('content_versions', {
   key: 'id',
-  defaults: () => ({ note: '' }),
-  nullable: ['authorId'],
+  defaults: () => ({ note: '', sections: null }),
+  nullable: ['authorId', 'sections'],
   indexes: [index('content_versions_slug_idx', { slug: 1, createdAt: -1 })],
 });
 

@@ -21,7 +21,11 @@ export const DEFAULT_CATEGORY_SLUGS = [
 ];
 
 export type EscrowSettings = {
-  /** With escrow off, "DOOAA — Escrow Services" disappears for new listings and nothing can be force-released or reversed. */
+  /**
+   * Off by default: buyers chat a marketplace seller and settle between
+   * themselves. On, escrow sits inside that chat — offers agree a price and
+   * the buyer pays into escrow from the thread.
+   */
   enabled: boolean;
   /** Buyer-paid escrow fee, a percentage of the item price. */
   feePercent: number;
@@ -86,6 +90,50 @@ export type CommerceSettings = {
   autoPayout: boolean;
 };
 
+/**
+ * The console's Features page: each marketplace feature a user can touch, on
+ * or off. Escrow is not here — it is `escrow.enabled`, which the Features page
+ * reads and writes too.
+ */
+export const FEATURE_FLAGS = [
+  'checkout',
+  'coupons',
+  'search',
+  'selling',
+  'payouts',
+  'seller-analytics',
+  'verification',
+  'reviews',
+  'messaging',
+  'offers',
+  'meetups',
+  'disputes',
+  'cancellations',
+  'sign-ups',
+  'social-sign-in',
+] as const;
+export type FeatureFlag = (typeof FEATURE_FLAGS)[number];
+export type FeatureSettings = Record<FeatureFlag, boolean>;
+
+/** What a user sees when they reach a switched-off feature through the API. */
+export const FEATURE_OFF_MESSAGE: Record<FeatureFlag, string> = {
+  checkout: 'Buying through the cart is switched off right now.',
+  coupons: 'Coupons are switched off right now.',
+  search: 'Search suggestions are switched off right now.',
+  selling: 'New selling is switched off right now.',
+  payouts: 'Payouts are paused right now.',
+  'seller-analytics': 'Seller analytics are switched off right now.',
+  verification: 'Identity verification is switched off right now.',
+  reviews: 'Reviews are switched off right now.',
+  messaging: 'Messaging is switched off right now.',
+  offers: 'Offers are switched off right now.',
+  meetups: 'Meetups are switched off right now.',
+  disputes: 'Disputes are switched off right now. Contact support instead.',
+  cancellations: 'Cancellation requests are switched off right now. Message the seller instead.',
+  'sign-ups': 'New sign-ups are closed right now.',
+  'social-sign-in': 'Social sign-in is switched off right now. Use your email instead.',
+};
+
 export type PlatformSettings = {
   escrow: EscrowSettings;
   disputes: DisputeSettings;
@@ -94,6 +142,7 @@ export type PlatformSettings = {
   notifications: NotificationSettings;
   roles: RolePermissions;
   commerce: CommerceSettings;
+  features: FeatureSettings;
 };
 
 export type SettingsSection = keyof PlatformSettings;
@@ -105,6 +154,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   'notifications',
   'roles',
   'commerce',
+  'features',
 ];
 
 export const PAYOUT_METHODS = ['Bank Transfer', 'Card — Verve', 'Credit Card', 'USSD'] as const;
@@ -112,7 +162,7 @@ export const PAYOUT_METHODS = ['Bank Transfer', 'Card — Verve', 'Credit Card',
 export function defaultSettings(): PlatformSettings {
   return {
     escrow: {
-      enabled: true,
+      enabled: false,
       feePercent: 0.5,
       minimumFee: 500,
       autoReleaseDays: 7,
@@ -154,5 +204,7 @@ export function defaultSettings(): PlatformSettings {
       unpaidOrderTtlMinutes: 60,
       autoPayout: false,
     },
+    // Everything on: the marketplace as it is built today.
+    features: Object.fromEntries(FEATURE_FLAGS.map((flag) => [flag, true])) as FeatureSettings,
   };
 }

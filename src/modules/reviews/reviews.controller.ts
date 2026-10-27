@@ -8,6 +8,7 @@ import type { AuthStaff, AuthUser } from '../../common/auth/principal';
 import { PageQueryDto } from '../../common/util/pagination';
 import { Trim } from '../../common/util/transforms';
 import { ReviewsService } from './reviews.service';
+import { RequireFeature } from '../../common/auth/feature.guard';
 
 class AspectsDto {
   @IsOptional() @IsInt() @Min(1) @Max(5) communication?: number;
@@ -42,6 +43,7 @@ export class ReviewsController {
   constructor(private readonly reviews: ReviewsService) {}
 
   /** "Write a review" / the feedback dialog after a completed order. */
+  @RequireFeature('reviews')
   @Post('orders/:id/review')
   create(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() body: CreateReviewDto) {
     return this.reviews.create(user, id, body);

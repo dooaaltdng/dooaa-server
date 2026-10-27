@@ -67,6 +67,25 @@ export class CommerceSettingsDto {
   @IsBoolean() autoPayout: boolean;
 }
 
+/** Features page — one switch per FEATURE_FLAGS entry. */
+export class FeatureSettingsDto {
+  @IsBoolean() checkout: boolean;
+  @IsBoolean() coupons: boolean;
+  @IsBoolean() search: boolean;
+  @IsBoolean() selling: boolean;
+  @IsBoolean() payouts: boolean;
+  @IsBoolean() 'seller-analytics': boolean;
+  @IsBoolean() verification: boolean;
+  @IsBoolean() reviews: boolean;
+  @IsBoolean() messaging: boolean;
+  @IsBoolean() offers: boolean;
+  @IsBoolean() meetups: boolean;
+  @IsBoolean() disputes: boolean;
+  @IsBoolean() cancellations: boolean;
+  @IsBoolean() 'sign-ups': boolean;
+  @IsBoolean() 'social-sign-in': boolean;
+}
+
 export const SECTION_DTO = {
   escrow: EscrowSettingsDto,
   disputes: DisputeSettingsDto,
@@ -75,6 +94,7 @@ export const SECTION_DTO = {
   notifications: NotificationSettingsDto,
   roles: RolesSettingsDto,
   commerce: CommerceSettingsDto,
+  features: FeatureSettingsDto,
 } as const;
 
 /** Body of `PUT /admin/settings/:section` — the section's full value. */

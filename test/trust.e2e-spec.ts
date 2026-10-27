@@ -114,26 +114,37 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
   });
 
   describe('identity verification', () => {
+    /** The outcome email is sent after the request returns, so wait for it briefly. */
+    async function mailTo(email: string, subject: string) {
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        await t.mail.idle();
+        const found = t.mail.sent.find((entry) => entry.to.toLowerCase() === email.toLowerCase() && entry.subject === subject);
+        if (found) return found;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      throw new Error(`No "${subject}" mail to ${email}`);
+    }
+
     it('submits documents, links the payout bank and waits for review', async () => {
       const admin = await staffToken(t, 'admin');
       const seller = await registerSeller(t, { verifiedIdentity: false });
       const front = await kycUpload(seller.token);
-      const selfie = await kycUpload(seller.token);
+      const back = await kycUpload(seller.token);
       const body = {
         idType: 'national-id',
-        documents: { idFront: front, selfie },
-        livenessPassed: true,
+        documents: { idFront: front, idBack: back },
         bank: { method: 'instant', bankCode: '058', accountNumber: '0123456700' },
         consents: [true, true, true],
       };
-      failure(await http.post('/me/verification', { ...body, livenessPassed: false }, seller.token), 400, 'LIVENESS_REQUIRED');
+      // ID only: a selfie is no longer part of the contract.
+      failure(await http.post('/me/verification', { ...body, documents: { ...body.documents, selfie: front } }, seller.token), 400, 'VALIDATION_FAILED');
       failure(await http.post('/me/verification', { ...body, consents: [true, false, true] }, seller.token), 400, 'CONSENT_REQUIRED');
       failure(await http.post('/me/verification', { ...body, bank: { ...body.bank, method: 'micro' } }, seller.token), 400, 'MICRO_DEPOSITS_UNAVAILABLE');
       const stranger = await registerUser(t);
       failure(await http.post('/me/verification', body, stranger.token), 400, 'MEDIA_NOT_FOUND');
 
       const submitted = data(await http.post('/me/verification', body, seller.token));
-      expect(submitted).toMatchObject({ identity: 'pending', verification: { status: 'pending', idTypeLabel: 'National ID', bank: { bankName: 'Guaranty Trust Bank', last4: '6700' } } });
+      expect(submitted).toMatchObject({ identity: 'pending', verification: { status: 'pending', idTypeLabel: 'NIN (National ID)', bank: { bankName: 'Guaranty Trust Bank', last4: '6700' } } });
       failure(await http.post('/me/verification', body, seller.token), 409, 'VERIFICATION_PENDING');
       expect(data(await http.get('/me/verification', seller.token))).toMatchObject({ identity: 'pending', latest: { status: 'pending' } });
       const accounts = data(await http.get('/me/payment-accounts', seller.token));
@@ -147,14 +158,13 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       const seller = await registerSeller(t, { verifiedIdentity: false });
       const product = await createProduct(t, seller.id, { sellerVerified: false });
       const front = await kycUpload(seller.token);
-      const selfie = await kycUpload(seller.token);
-      data(await http.post('/me/verification', { idType: 'passport', documents: { idFront: front, selfie }, livenessPassed: true, consents: [true, true, true] }, seller.token));
+      data(await http.post('/me/verification', { idType: 'passport', documents: { idFront: front }, consents: [true, true, true] }, seller.token));
 
       const moderator = await staffToken(t, 'moderator');
       const pending = data(await http.get('/admin/verifications?status=pending', moderator.token));
       const row = pending.rows.find((entry: any) => entry.userId === seller.id);
       const detail = data(await http.get(`/admin/verifications/${row.id}`, moderator.token));
-      expect(detail.documents.map((doc: any) => doc.label)).toEqual(['ID Document (Passport)', 'Selfie Verification']);
+      expect(detail.documents.map((doc: any) => doc.label)).toEqual(['ID Document (International Passport)']);
       const link = new URL(detail.documents[0].asset);
       expect((await request(t.server).get(`${link.pathname}${link.search}`)).status).toBe(200);
       failure(await http.post(`/admin/verifications/${row.id}/approve`, {}, moderator.token), 403, 'PERMISSION_DENIED');
@@ -165,19 +175,40 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       expect(data(await http.get('/auth/me', seller.token))).toMatchObject({ identity: 'verified', verificationLevel: 'high-value' });
       expect((await model(t, 'Product').findById(product.id).lean())!.sellerVerified).toBe(true);
       failure(await http.post(`/admin/verifications/${row.id}/reject`, { reason: 'Too late now' }, admin.token), 409, 'VERIFICATION_NOT_PENDING');
+      const mail = await mailTo(seller.email, 'Your DOOAA identity is verified');
+      expect(mail.text).toContain('International Passport');
+      expect(mail.text).toContain('verified badge on your listings');
+    });
+
+    it('lets staff approve a buyer from the buyer profile, and emails them', async () => {
+      const buyer = await registerUser(t);
+      const front = await kycUpload(buyer.token);
+      data(await http.post('/me/verification', { idType: 'drivers-license', documents: { idFront: front, idBack: await kycUpload(buyer.token) }, consents: [true, true, true] }, buyer.token));
+
+      const admin = await staffToken(t, 'admin');
+      const profile = data(await http.get(`/admin/buyers/${buyer.id}`, admin.token));
+      expect(profile).toMatchObject({ identity: 'pending', verificationStatus: 'pending', verificationId: expect.any(String) });
+      expect(profile.documents.map((doc: any) => doc.label)).toEqual(["ID Document (Driver's Licence)", "ID Document — back (Driver's Licence)"]);
+
+      data(await http.post(`/admin/verifications/${profile.verificationId}/approve`, {}, admin.token));
+      expect(data(await http.get(`/admin/buyers/${buyer.id}`, admin.token))).toMatchObject({ identity: 'verified', verificationStatus: 'approved' });
+      expect(data(await http.get('/me/verification', buyer.token)).identity).toBe('verified');
+      const mail = await mailTo(buyer.email, 'Your DOOAA identity is verified');
+      expect(mail.text).toContain("Driver's Licence");
+      expect(mail.text).not.toContain('listings');
     });
 
     it('rejects with a reason the user can act on, then accepts a new submission', async () => {
       const buyer = await registerUser(t);
       const front = await kycUpload(buyer.token);
-      const selfie = await kycUpload(buyer.token);
-      const body = { idType: 'drivers-license', documents: { idFront: front, selfie }, livenessPassed: true, consents: [true, true, true] };
+      const body = { idType: 'voters-card', documents: { idFront: front }, consents: [true, true, true] };
       data(await http.post('/me/verification', body, buyer.token));
       const admin = await staffToken(t, 'admin');
       const row = data(await http.get('/admin/verifications?status=pending', admin.token)).rows.find((entry: any) => entry.userId === buyer.id);
       data(await http.post(`/admin/verifications/${row.id}/reject`, { reason: 'The photo is blurry. Retake it in good light.' }, admin.token));
       expect(data(await http.get('/me/verification', buyer.token))).toMatchObject({ identity: 'rejected', latest: { rejectionReason: 'The photo is blurry. Retake it in good light.' } });
-      const retry = { ...body, documents: { idFront: await kycUpload(buyer.token), selfie: await kycUpload(buyer.token) } };
+      expect((await mailTo(buyer.email, 'We could not verify your identity')).text).toContain('The photo is blurry.');
+      const retry = { ...body, documents: { idFront: await kycUpload(buyer.token) } };
       expect(data(await http.post('/me/verification', retry, buyer.token)).identity).toBe('pending');
     });
   });

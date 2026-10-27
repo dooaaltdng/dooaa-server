@@ -9,6 +9,7 @@ import type { AppConfig } from '../../../config/configuration';
 import { REFRESH_COOKIE } from '../auth.controller';
 import { OAuthExchangeDto, OAuthStartQueryDto } from './oauth.dto';
 import { OAuthService } from './oauth.service';
+import { RequireFeature } from '../../../common/auth/feature.guard';
 
 export const OAUTH_NONCE_COOKIE = 'dooaa_oauth';
 const COOKIE_PATH = '/api/v1/auth/oauth';
@@ -34,6 +35,7 @@ export class OAuthController {
 
   @Public()
   @AuthThrottle()
+  @RequireFeature('social-sign-in')
   @Get(':provider/start')
   async start(@Param('provider') provider: string, @Query() query: OAuthStartQueryDto, @Res() response: Response) {
     try {
