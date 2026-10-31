@@ -31,12 +31,6 @@ const env: Record<string, string> = {
   COOKIE_SAMESITE: 'lax',
   COOKIE_SECURE: 'false',
   OTP_DEV_CODE: '123456',
-  OAUTH_DRIVER: 'sandbox',
-  GOOGLE_CLIENT_ID: '',
-  GOOGLE_CLIENT_SECRET: '',
-  FACEBOOK_APP_ID: '',
-  FACEBOOK_APP_SECRET: '',
-  FACEBOOK_GRAPH_VERSION: 'v21.0',
   PAYMENT_CALLBACK_URL: 'http://localhost:3000/checkout/callback',
   BACHS_SECRET_KEY: '',
   BACHS_WEBHOOK_SECRET: '',
@@ -63,10 +57,5 @@ const env: Record<string, string> = {
   THROTTLE_LIMIT: '10000',
   AUTH_THROTTLE_LIMIT: '10000',
   SCHEDULER_ENABLED: 'false',
-  SEED_SUPERADMIN_EMAIL: 'nelson@dooaa.com',
-  SEED_SUPERADMIN_PASSWORD: '',
-  SEED_SUPERADMIN_FIRST_NAME: 'Nelson',
-  SEED_SUPERADMIN_LAST_NAME: 'Doe',
-  SEED_DEMO: 'false',
 };
 for (const [key, value] of Object.entries(env)) process.env[key] = value;

@@ -16,7 +16,6 @@ The backend for **DOOAA.NG** — the marketplace (`dooaa-client`) and the manage
 npm install
 cp .env.local .env                # fill in Cloudinary keys (or STORAGE_DRIVER=local offline)
 npm run start:dev                      # http://localhost:4000/api/v1  ·  docs at /docs
-npm run seed                           # superadmin + demo buyer/seller/listings
 ```
 
 Production:
@@ -24,7 +23,6 @@ Production:
 ```bash
 cp .env.production .env                # fill every value marked REQUIRED IN PRODUCTION
 npm ci && npm run build
-npm run seed:prod                      # creates the first console superadmin (needs SEED_SUPERADMIN_PASSWORD)
 npm run start:prod                     # node dist/main
 ```
 
@@ -38,7 +36,6 @@ The server refuses to boot in production when a required secret is missing (data
 | --- | --- |
 | `npm run start:dev` | Watch mode |
 | `npm run build` / `start:prod` | Compile to `dist/` and run it |
-| `npm run seed` / `seed:prod` | Idempotent seed (superadmin; demo data with `SEED_DEMO=true`, refused in production) |
 | `npm test` | All tests (unit + e2e) |
 | `npm run test:unit` / `test:e2e` | One project |
 | `npm run test:cov` | Coverage |
@@ -63,7 +60,6 @@ The e2e suite boots the real app against an in-memory MongoDB (one database per 
 
 Access tokens last 15 minutes. Refresh tokens rotate on every use; replaying an old one revokes the whole sign-in. A ban or closure ends every session immediately; a suspension keeps the user signed in but limits them to their profile, sign-out and support. Passwords are bcrypt; OTPs are hashed, expire, have an attempt budget and a resend cooldown.
 
-**Google / Facebook sign-in.** The client links to `GET /auth/oauth/:provider/start?next=/path`. The API redirects to the provider with a signed state bound to an httpOnly nonce cookie (blocks login CSRF). The provider then returns to `/auth/oauth/:provider/callback`, which redirects to the client's `/auth/callback?code=…`. The client trades that one-time, two-minute code with `POST /auth/oauth/exchange` for the usual `{ user, tokens }` plus `isNewUser` (send them to the role step) and `next`. Failures land on `/sign-in?error=CODE` (`OAUTH_CANCELLED`, `OAUTH_EMAIL_REQUIRED`, `OAUTH_EMAIL_UNVERIFIED`, `OAUTH_STATE_INVALID`, `OAUTH_FAILED`, `OAUTH_UNAVAILABLE`, `ACCOUNT_BANNED`, `ACCOUNT_CLOSED`). A provider identity links to an existing account by verified email. If that account's email was never verified, the provider's proof wins: the old password and sessions are revoked. Accounts created this way have no usable password until the owner sets one through "Forgot password".
 
 ## The money flow (third-party only)
 
@@ -109,7 +105,7 @@ Connect with `io(API_ORIGIN + '/realtime', { auth: { token: accessToken } })` (u
 
 Full, interactive reference: **`/docs`** (Swagger; JSON at `/docs/json`).
 
-- **Auth** `/auth/*` — sign-up, sign-in, refresh, sign-out(-all), OTP send/verify, forgot/reset password, verify password, role, me; social sign-in `/auth/oauth/providers`, `/auth/oauth/:provider/start|callback`, `/auth/oauth/exchange`
+- **Auth** `/auth/*` — sign-up, sign-in, refresh, sign-out(-all), OTP send/verify, forgot/reset password, verify password, role, me
 - **Account** `/me`, `/me/summary`, `/me/avatar`, `/me/notification-preferences`, `/me/password(/code)`, `/me/close`, `/me/payment-accounts`, `/me/verification`
 - **Catalog** `/categories`, `/catalog/home`, `/products`, `/products/suggest`, `/products/:id`, `/products/:id/reviews`, `/sellers/:id/products`, `/sellers/:id/reviews`
 - **Shopping** `/wishlist`, `/cart/*`, `/checkout`, `/checkout/escrow(/:productId/quote)`, `/payments/*`
@@ -134,7 +130,6 @@ src/
     payments (paystack + sandbox providers), orders (checkout, escrow, lifecycle), wallet (earnings, payouts)
     conversations, realtime, notifications, reviews, verification, disputes
     content, analytics, admin-users, support, jobs, account
-  seed/                   idempotent seed (+ demo data)
 test/                     e2e suites and helpers
 ```
 

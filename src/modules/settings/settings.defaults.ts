@@ -110,7 +110,6 @@ export const FEATURE_FLAGS = [
   'disputes',
   'cancellations',
   'sign-ups',
-  'social-sign-in',
 ] as const;
 export type FeatureFlag = (typeof FEATURE_FLAGS)[number];
 export type FeatureSettings = Record<FeatureFlag, boolean>;
@@ -131,7 +130,6 @@ export const FEATURE_OFF_MESSAGE: Record<FeatureFlag, string> = {
   disputes: 'Disputes are switched off right now. Contact support instead.',
   cancellations: 'Cancellation requests are switched off right now. Message the seller instead.',
   'sign-ups': 'New sign-ups are closed right now.',
-  'social-sign-in': 'Social sign-in is switched off right now. Use your email instead.',
 };
 
 export type PlatformSettings = {

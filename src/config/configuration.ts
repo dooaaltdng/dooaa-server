@@ -13,13 +13,11 @@
 
 export type NodeEnv = 'development' | 'production' | 'test';
 export type SmsDriver = 'termii' | 'memory' | 'log';
-/** `live` talks to Google/Facebook; `sandbox` signs in offline with a fake profile (development and tests). */
-export type OAuthDriver = 'live' | 'sandbox';
 
 export interface AppConfig {
   env: NodeEnv;
   port: number;
-  /** Public base URL of this API including the /api/v1 prefix, used for links it hands out (media, OAuth callbacks). */
+  /** Public base URL of this API including the /api/v1 prefix, used for links it hands out (media). */
   apiUrl: string;
   platformUrl: string;
   adminUrl: string;
@@ -86,21 +84,8 @@ export interface AppConfig {
       baseUrl: string;
     };
   };
-  oauth: {
-    driver: OAuthDriver;
-    google: { clientId?: string; clientSecret?: string };
-    facebook: { appId?: string; appSecret?: string; graphVersion: string };
-  };
   throttle: { ttlMs: number; limit: number; authLimit: number };
   scheduler: { enabled: boolean };
-  seed: {
-    superadminEmail: string;
-    superadminPassword?: string;
-    superadminFirstName: string;
-    superadminLastName: string;
-    /** Also seed the demo buyer, seller and listings. */
-    demo: boolean;
-  };
 }
 
 /**
@@ -244,31 +229,12 @@ export function loadConfig(): AppConfig {
         baseUrl: url('BACHS_BASE_URL'),
       },
     },
-    oauth: {
-      driver: oneOf<OAuthDriver>('OAUTH_DRIVER', ['live', 'sandbox']),
-      google: {
-        clientId: opt('GOOGLE_CLIENT_ID'),
-        clientSecret: opt('GOOGLE_CLIENT_SECRET'),
-      },
-      facebook: {
-        appId: opt('FACEBOOK_APP_ID'),
-        appSecret: opt('FACEBOOK_APP_SECRET'),
-        graphVersion: str('FACEBOOK_GRAPH_VERSION'),
-      },
-    },
     throttle: {
       ttlMs: num('THROTTLE_TTL_MS'),
       limit: num('THROTTLE_LIMIT'),
       authLimit: num('AUTH_THROTTLE_LIMIT'),
     },
     scheduler: { enabled: bool('SCHEDULER_ENABLED') },
-    seed: {
-      superadminEmail: str('SEED_SUPERADMIN_EMAIL').toLowerCase(),
-      superadminPassword: opt('SEED_SUPERADMIN_PASSWORD'),
-      superadminFirstName: str('SEED_SUPERADMIN_FIRST_NAME'),
-      superadminLastName: str('SEED_SUPERADMIN_LAST_NAME'),
-      demo: bool('SEED_DEMO'),
-    },
   };
 
   if (undeclared.length) {
@@ -311,11 +277,10 @@ export function assertConfig(config: AppConfig): void {
     need(config.otp.pepper, 'OTP_PEPPER');
     need(config.storage.signingSecret, 'MEDIA_SIGNING_SECRET');
     if (config.sms.driver === 'termii') want(config.sms.termii.apiKey, 'TERMII_API_KEY');
+    // A placeholder key only breaks payments, not the rest of the API, so it warns like the other integrations.
     if (config.payments.bachs.secretKey && !config.payments.bachs.secretKey.startsWith('sk_live_')) {
-      missing.push('BACHS_SECRET_KEY (production needs a live key, sk_live_…)');
+      optional.push('BACHS_SECRET_KEY (production needs a live key, sk_live_…)');
     }
-    // Social sign-in is optional (a provider without credentials is just hidden), but never the fake one.
-    if (config.oauth.driver === 'sandbox') missing.push('OAUTH_DRIVER (sandbox is for development only; use live)');
     for (const [name, secret] of [
       ['JWT_ACCESS_SECRET', config.jwt.accessSecret],
       ['JWT_REFRESH_SECRET', config.jwt.refreshSecret],

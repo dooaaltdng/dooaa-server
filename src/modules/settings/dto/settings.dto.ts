@@ -83,7 +83,6 @@ export class FeatureSettingsDto {
   @IsBoolean() disputes: boolean;
   @IsBoolean() cancellations: boolean;
   @IsBoolean() 'sign-ups': boolean;
-  @IsBoolean() 'social-sign-in': boolean;
 }
 
 export const SECTION_DTO = {

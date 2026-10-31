@@ -23,9 +23,6 @@ export type ModeratedStatus = (typeof MODERATED_STATUSES)[number];
 export const VERIFICATION_LEVELS = ['normal', 'high-value'] as const;
 export type VerificationLevel = (typeof VERIFICATION_LEVELS)[number];
 
-/** Social sign-in providers an account can be linked to. */
-export const OAUTH_PROVIDERS = ['google', 'facebook'] as const;
-export type OAuthProviderId = (typeof OAUTH_PROVIDERS)[number];
 
 /** Who a session, an upload or a notification belongs to. */
 export const SUBJECT_TYPES = ['user', 'staff'] as const;

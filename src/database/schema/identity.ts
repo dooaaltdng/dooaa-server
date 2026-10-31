@@ -3,7 +3,6 @@ import {
   type AccountStatus,
   type Gender,
   type IdentityStatus,
-  type OAuthProviderId,
   type OtpChannel,
   type OtpPurpose,
   type StaffRole,
@@ -112,28 +111,6 @@ export const users = table<UserRow>()('users', {
   ],
 });
 
-/** A Google or Facebook account that signs in to a user. */
-export type UserOauthIdentityRow = {
-  id: string;
-  userId: string;
-  provider: OAuthProviderId;
-  /** The provider's stable account id (Google `sub`, Facebook `id`). */
-  subject: string;
-  email: string | null;
-  linkedAt: Date;
-};
-
-export const userOauthIdentities = table<UserOauthIdentityRow>()('user_oauth_identities', {
-  key: 'id',
-  timestamps: false,
-  defaults: () => ({ linkedAt: new Date() }),
-  nullable: ['email'],
-  indexes: [
-    index('user_oauth_identities_provider_subject_key', { provider: 1, subject: 1 }, { unique: true }),
-    index('user_oauth_identities_user_idx', { userId: 1 }),
-  ],
-});
-
 /** Console accounts. The console is invite-only: there is no sign-up path. */
 export type StaffRow = Timestamps & {
   id: string;
@@ -197,27 +174,6 @@ export const sessions = table<SessionRow>()('sessions', {
     index('sessions_family_idx', { family: 1 }),
     index('sessions_expires_at_idx', { expiresAt: 1 }),
   ],
-});
-
-/**
- * The one-time code the OAuth callback hands the client in its redirect. The
- * client trades it for tokens with a POST, so tokens never travel in a URL.
- */
-export type OauthGrantRow = {
-  id: string;
-  codeHash: string;
-  userId: string;
-  isNewUser: boolean;
-  next: string;
-  expiresAt: Date;
-  createdAt: Date;
-};
-
-export const oauthGrants = table<OauthGrantRow>()('oauth_grants', {
-  key: 'id',
-  timestamps: false,
-  defaults: () => ({ isNewUser: false, next: '', createdAt: new Date() }),
-  indexes: [index('oauth_grants_code_hash_key', { codeHash: 1 }, { unique: true }), index('oauth_grants_expires_at_idx', { expiresAt: 1 })],
 });
 
 /** A one-time code. Only its hash is stored; expired rows are purged by a job. */
