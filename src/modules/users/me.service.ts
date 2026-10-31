@@ -19,6 +19,8 @@ import type { UserStats } from './user.model';
 import { toPublicUser, type PublicUser } from './user.presenter';
 import { UsersService, type UserPatch } from './users.service';
 
+const OFFICIAL_STORE_EMAIL = 'store@dooaa.ng';
+
 @Injectable()
 export class MeService {
   constructor(
@@ -58,7 +60,19 @@ export class MeService {
         patch.phoneVerified = false;
       }
     }
-    if (input.storeName !== undefined) patch.sellerStoreName = input.storeName;
+    if (input.storeName !== undefined) {
+      const name = input.storeName.replace(/\s+/g, ' ').trim();
+      if (name) {
+        // "DOOAA" belongs to DOOAA: only the official store account may trade under it.
+        if (UsersService.storeNameKey(name).includes('dooaa') && user.email !== OFFICIAL_STORE_EMAIL) {
+          throw Errors.conflict('Store names cannot include “DOOAA”. Please choose another name.', 'STORE_NAME_RESERVED');
+        }
+        if (await this.users.storeNameTaken(name, user.id)) {
+          throw Errors.conflict('Another store already uses that name. Please choose a different one.', 'STORE_NAME_TAKEN');
+        }
+      }
+      patch.sellerStoreName = name || null;
+    }
     if (input.dispatchDays !== undefined) patch.sellerDispatchDays = input.dispatchDays;
     if (input.responseLabel !== undefined) patch.sellerResponseLabel = input.responseLabel;
     if (input.deliveryLabel !== undefined) patch.sellerDeliveryLabel = input.deliveryLabel;

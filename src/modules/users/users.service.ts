@@ -47,6 +47,21 @@ export class UsersService {
     return user;
   }
 
+  /**
+   * Store names compare without case, spaces or punctuation: "Ada Gadgets",
+   * "ada-gadgets" and "ADA GADGETS" are one name, so only one store gets it.
+   */
+  static storeNameKey(name: string): string {
+    return name.normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
+  }
+
+  /** Whether another account already trades under this store name. */
+  async storeNameTaken(name: string, exceptUserId: string): Promise<boolean> {
+    const key = UsersService.storeNameKey(name);
+    const rows = await this.db.find(users, { sellerStoreName: { $ne: null }, id: { $ne: exceptUserId } }, { omit: userOmit });
+    return rows.some((row) => row.sellerStoreName && UsersService.storeNameKey(row.sellerStoreName) === key);
+  }
+
   async findByEmail(email: string): Promise<User | null> {
     const row = await this.db.findOne(users, { email: normalizeEmail(email) }, { omit: userOmit });
     return row ? toUser(row) : null;
