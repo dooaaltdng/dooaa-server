@@ -69,40 +69,48 @@ export class NotificationsListener implements OnModuleInit {
     const buyerLink = `/orders/${order.reference}`;
     const sellerLink = `/seller/orders/${order.reference}`;
     const items = this.itemsLabel(order);
+    // Only orders paid through escrow talk about escrow; with escrow switched off there are none.
+    const escrow = Boolean(order.escrow);
 
     switch (event) {
       case 'paid': {
         await this.notifications.notifyUser(seller, {
           type: 'order.new',
           title: `New order ${number}`,
-          body: `${items} — ${formatNaira(order.sellerEarning)} is held in escrow for you. Confirm it within 24 hours.`,
+          body: escrow ? `${items} — ${formatNaira(order.sellerEarning)} is held in escrow for you. Confirm it within 24 hours.` : `${items} — confirm it within 24 hours.`,
           tone: 'green',
           link: sellerLink,
           data: { orderId: order.reference },
           email: {
-            subject: `New order ${number} on DOOAA`,
-            heading: 'You have a new order',
+            subject: `You made a sale! Order ${number}`,
+            preheader: order.shipBy ? `Ship it by ${longDate(order.shipBy)} to keep your buyer happy.` : 'Confirm it and ship it soon to keep your buyer happy.',
+            heading: 'Congratulations, you have a new order',
             paragraphs: [
-              `${items} was just bought from your store. The buyer's payment is held safely in escrow.`,
-              order.shipBy ? `Confirm the order and ship it by ${longDate(order.shipBy)}.` : 'Confirm the order and ship it soon.',
+              escrow
+                ? `${items} was just bought from your store. The buyer's payment is held safely until they receive it.`
+                : `${items} was just bought from your store.`,
+              order.shipBy ? `Confirm the order and ship it by ${longDate(order.shipBy)}. Fast shipping earns great reviews.` : 'Confirm the order and ship it soon. Fast shipping earns great reviews.',
             ],
-            cta: { label: 'View order', url: this.clientLink(sellerLink) },
+            cta: { label: 'Confirm the order', url: this.clientLink(sellerLink) },
           },
           sms: `DOOAA: New order ${number} for ${items}. Ship by ${order.shipBy ? longDate(order.shipBy) : 'soon'}.`,
         });
         await this.notifications.notifyUser(buyer, {
           type: 'order.placed',
           title: `Order ${number} placed`,
-          body: `Your payment of ${formatNaira(order.total)} is held in escrow until the item is delivered.`,
+          body: escrow ? `Your payment of ${formatNaira(order.total)} is held in escrow until the item is delivered.` : `We have your order for ${items}.`,
           tone: 'green',
           link: buyerLink,
           data: { orderId: order.reference },
           email: {
-            subject: `Your DOOAA order ${number}`,
-            heading: 'Thanks for your order',
+            subject: `Order confirmed: ${number}`,
+            preheader: `Thanks for shopping on DOOAA. We will keep you posted at every step.`,
+            heading: 'Thanks for your order!',
             paragraphs: [
-              `We received your order for ${items}.`,
-              `${formatNaira(order.total)} is held safely in escrow. The seller is paid only after you confirm the item arrived as described.`,
+              `Good news: we have your order for ${items} (${formatNaira(order.total)}).`,
+              escrow
+                ? 'Your payment is held safely and the seller is paid only after you confirm the item arrived as described.'
+                : 'The seller has been told and will get it ready. We will email you as soon as it ships.',
             ],
             cta: { label: 'Track your order', url: this.clientLink(buyerLink) },
           },
@@ -135,12 +143,15 @@ export class NotificationsListener implements OnModuleInit {
           tone: 'green',
           link: buyerLink,
           email: {
-            subject: `Order ${number} has shipped`,
+            subject: `Good news! Order ${number} has shipped`,
+            preheader: order.shipment?.trackingNumber ? `Tracking number ${order.shipment.trackingNumber}` : 'Your item is on its way to you.',
             heading: 'Your order is on its way',
             paragraphs: [
               `${items} was handed to ${order.shipment?.carrier ?? 'the courier'}.`,
               order.shipment?.trackingNumber ? `Tracking number: ${order.shipment.trackingNumber}` : 'The seller will share tracking details in your conversation.',
-              'When it arrives, check it before confirming — confirming releases payment to the seller.',
+              escrow
+                ? 'When it arrives, check it before confirming: confirming releases payment to the seller.'
+                : 'When it arrives, give it a quick check and let the seller know everything is right.',
             ],
             cta: { label: 'Track your order', url: this.clientLink(buyerLink) },
           },
@@ -159,15 +170,18 @@ export class NotificationsListener implements OnModuleInit {
         await this.notifications.notifyUser(buyer, {
           type: 'order.delivered',
           title: `Order ${number} marked as delivered`,
-          body: `Check the item. Payment releases to the seller when you confirm${order.escrow?.inspectionEndsAt ? ` or on ${longDate(order.escrow.inspectionEndsAt)}` : ''}. Something wrong? Open a dispute before then.`,
+          body: escrow ? `Check the item. Payment releases to the seller when you confirm${order.escrow?.inspectionEndsAt ? ` or on ${longDate(order.escrow.inspectionEndsAt)}` : ''}. Something wrong? Open a dispute before then.` : 'Check the item and confirm it arrived as described. Something wrong? Let us know.',
           tone: 'blue',
           link: buyerLink,
           email: {
-            subject: `Order ${number} was delivered`,
+            subject: `Your order ${number} has arrived`,
+            preheader: 'Take a quick look and let us know it is all good.',
             heading: 'Your order was delivered',
             paragraphs: [
-              `The seller marked ${items} as delivered.`,
-              `Inspect it and confirm when you are happy. If something is wrong, open a dispute${order.escrow?.inspectionEndsAt ? ` before ${longDate(order.escrow.inspectionEndsAt)}` : ''} and payment stays on hold.`,
+              `The seller marked ${items} as delivered. We hope you love it!`,
+              escrow
+                ? `Check it and confirm when you are happy. If something is wrong, open a dispute${order.escrow?.inspectionEndsAt ? ` before ${longDate(order.escrow.inspectionEndsAt)}` : ''} and payment stays on hold.`
+                : 'Check it and confirm when you are happy. If something is wrong, open your order and tell us, and we will help.',
             ],
             cta: { label: 'Review your order', url: this.clientLink(buyerLink) },
           },
@@ -181,8 +195,9 @@ export class NotificationsListener implements OnModuleInit {
           tone: 'green',
           link: '/seller/earnings',
           email: {
-            subject: `Payment released for order ${number}`,
-            heading: 'You have been paid',
+            subject: `You have been paid for order ${number}`,
+            preheader: 'Your earnings are ready to withdraw.',
+            heading: 'Ka-ching! You have been paid',
             paragraphs: [`${formatNaira(order.sellerEarning)} from order ${number} is now available to withdraw.`],
             cta: { label: 'Withdraw', url: this.clientLink('/seller/earnings') },
           },
@@ -210,7 +225,8 @@ export class NotificationsListener implements OnModuleInit {
           body: `${formatNaira(order.total)} is being returned to your original payment method.`,
           link: buyerLink,
           email: {
-            subject: `Refund for order ${number}`,
+            subject: `Your refund for order ${number} is on its way`,
+            preheader: 'Banks usually take 3 to 5 business days.',
             heading: 'Your refund is on its way',
             paragraphs: [
               `Order ${number} was cancelled${note ? `: ${note}` : '.'}`,
@@ -290,9 +306,10 @@ export class NotificationsListener implements OnModuleInit {
   private async onOffer({ conversation, offer, action, recipientId }: ConversationOfferEvent): Promise<void> {
     const title = conversation.subject?.title ?? 'your listing';
     const link = `/messages?c=${conversation.id}`;
+    const escrow = (await this.settings.section('escrow')).enabled;
     const copy: Record<ConversationOfferEvent['action'], { title: string; body: string; tone: 'blue' | 'green' | 'red' }> = {
       made: { title: `New offer: ${formatNaira(offer.amount)}`, body: `On ${title} (listed at ${formatNaira(offer.listed)}).`, tone: 'blue' },
-      accepted: { title: 'Offer accepted', body: `${formatNaira(offer.agreedAmount ?? offer.amount)} was agreed for ${title}. Pay through escrow to secure it.`, tone: 'green' },
+      accepted: { title: 'Offer accepted', body: `${formatNaira(offer.agreedAmount ?? offer.amount)} was agreed for ${title}. ${escrow ? 'Pay through escrow to secure it.' : 'Agree the next steps with the seller in your chat.'}`, tone: 'green' },
       countered: { title: `Counter offer: ${formatNaira(offer.counter?.amount ?? 0)}`, body: `The seller countered your offer on ${title}.`, tone: 'blue' },
       declined: { title: 'Offer declined', body: `Your offer on ${title} was declined.`, tone: 'red' },
       withdrawn: { title: 'Offer withdrawn', body: `The buyer withdrew their offer on ${title}.`, tone: 'red' },

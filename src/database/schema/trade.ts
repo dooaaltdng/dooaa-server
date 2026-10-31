@@ -248,12 +248,15 @@ export type ConversationRow = Timestamps & {
   sellerUnread: number;
   buyerReadAt: Date | null;
   sellerReadAt: Date | null;
+  /** When each side was last emailed about an unread message (jobs: reminders). */
+  buyerRemindedAt?: Date | null;
+  sellerRemindedAt?: Date | null;
 };
 
 export const conversations = table<ConversationRow>()('conversations', {
   key: 'id',
   defaults: () => ({ lastMessagePreview: '', buyerUnread: 0, sellerUnread: 0 }),
-  nullable: ['productId', 'subject', 'orderId', 'disputeId', 'lastMessageKind', 'lastMessageAt', 'lastMessageSenderId', 'buyerReadAt', 'sellerReadAt'],
+  nullable: ['productId', 'subject', 'orderId', 'disputeId', 'lastMessageKind', 'lastMessageAt', 'lastMessageSenderId', 'buyerReadAt', 'sellerReadAt', 'buyerRemindedAt', 'sellerRemindedAt'],
   indexes: [
     index('conversations_buyer_idx', { buyerId: 1, lastMessageAt: -1 }),
     index('conversations_seller_idx', { sellerId: 1, lastMessageAt: -1 }),

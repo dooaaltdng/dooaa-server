@@ -1,4 +1,4 @@
-import { escapeHtml, otpMail, renderMail } from './mail.templates';
+import { escapeHtml, otpMail, renderMail, welcomeMail } from './mail.templates';
 
 describe('mail templates', () => {
   it('escapes everything interpolated into the HTML', () => {
@@ -17,9 +17,9 @@ describe('mail templates', () => {
 
   it('renders one-time codes in both parts', () => {
     const rendered = renderMail(otpMail('reset-password', '048213', 10));
-    expect(rendered.subject).toBe('Reset your DOOAA password');
+    expect(rendered.subject).toBe('Your DOOAA password reset code');
     expect(rendered.html).toContain('048213');
-    expect(rendered.text).toContain('Code: 048213');
+    expect(rendered.text).toContain('Your code: 048213');
     expect(rendered.text).toContain('expires in 10 minutes');
   });
 
@@ -27,4 +27,15 @@ describe('mail templates', () => {
     expect(otpMail('unknown', '111111', 5).subject).toBe('Your DOOAA verification code');
     expect(escapeHtml("'")).toBe('&#39;');
   });
+
+  it('keeps escrow out of the layout, and out of the welcome email while escrow is off', () => {
+    const off = renderMail(welcomeMail('Ada', 'https://dooaa.com', false));
+    expect(off.subject).toBe('Welcome to DOOAA, Ada');
+    expect(off.html).not.toMatch(/escrow/i);
+    expect(off.text).not.toMatch(/escrow/i);
+    const on = renderMail(welcomeMail('Ada', 'https://dooaa.com', true));
+    expect(on.text).toContain('hold the money safely');
+    expect(renderMail(otpMail('sign-in', '123456', 10)).html).not.toMatch(/escrow/i);
+  });
 });
+

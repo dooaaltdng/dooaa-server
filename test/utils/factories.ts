@@ -36,7 +36,7 @@ export function uniquePhone(): string {
 export async function codeFromMail(t: TestApp, email: string): Promise<string> {
   await t.mail.idle();
   const mail = t.mail.lastTo(email);
-  const match = mail?.text.match(/Code: (\d{6})/);
+  const match = mail?.text.match(/code: (\d{6})/i);
   if (!match) throw new Error(`No code mailed to ${email}`);
   return match[1];
 }

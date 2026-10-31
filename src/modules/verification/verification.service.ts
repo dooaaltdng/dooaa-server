@@ -120,7 +120,8 @@ export class VerificationService {
     await this.users.update(user.id, { identity: 'pending' });
 
     void this.mail.send(record.email, {
-      subject: 'We are reviewing your documents',
+      subject: 'Thanks! We are reviewing your documents',
+      preheader: 'This usually takes up to 24 hours.',
       heading: 'Verification submitted',
       paragraphs: [`Thanks, ${record.firstName}. Our team is reviewing your ${ID_TYPE_LABEL[input.idType]}.`, 'This usually takes up to 24 hours. We will email you as soon as it is done.'],
     });
@@ -219,7 +220,8 @@ export class VerificationService {
       tone: 'green',
       link: '/verification',
       email: {
-        subject: 'Your DOOAA identity is verified',
+        subject: `You're verified, ${user.firstName}!`,
+        preheader: 'Your verified badge is live.',
         heading: 'You are verified',
         paragraphs: [
           `Great news, ${user.firstName} — our team has checked your ${ID_TYPE_LABEL[row.idType]} and confirmed your identity.`,
@@ -241,8 +243,9 @@ export class VerificationService {
       tone: 'red',
       link: '/verification',
       email: {
-        subject: 'We could not verify your identity',
-        heading: 'Please try again',
+        subject: 'We need a little more to verify you',
+        preheader: 'It only takes a few minutes to try again.',
+        heading: 'Let us try that again',
         paragraphs: [`Hi ${user.firstName}, we could not confirm your identity from the documents you sent.`, `Reason: ${reason}`, 'You can submit new documents from the verification page.'],
       },
     });

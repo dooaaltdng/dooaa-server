@@ -175,7 +175,8 @@ export class StaffService {
     const link = `${this.config.adminUrl}/accept-invite?token=${encodeURIComponent(token)}`;
     void this.mail.send(email, {
       subject: 'You have been invited to the DOOAA console',
-      heading: `Join the DOOAA team, ${input.firstName}`,
+      preheader: `Your invitation expires in ${INVITE_TTL_DAYS} days.`,
+      heading: `Welcome to the team, ${input.firstName}!`,
       paragraphs: [
         `${actor.firstName} ${actor.lastName} invited you to the DOOAA management console as ${STAFF_ROLE_LABEL[input.role].toLowerCase()}.`,
         `Set a password to activate your account. The invitation expires in ${INVITE_TTL_DAYS} days.`,

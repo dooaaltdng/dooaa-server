@@ -128,7 +128,8 @@ export class MeService {
     const fresh = await this.users.getById(user.id);
     void this.mail.send(fresh.email, {
       subject: 'Your DOOAA password was changed',
-      heading: 'Password changed',
+      preheader: 'If this was you, there is nothing else to do.',
+      heading: 'Your password was changed',
       paragraphs: [
         `Hi ${fresh.firstName}, the password on your DOOAA account was just changed. Other devices have been signed out.`,
         'If this was not you, reset your password immediately and contact support.',
@@ -176,10 +177,11 @@ export class MeService {
 
     void this.mail.send(before.email, {
       subject: 'Your DOOAA account has been deleted',
-      heading: 'Account deleted',
+      preheader: 'We are sorry to see you go.',
+      heading: 'Your account has been deleted',
       paragraphs: [
         `Hi ${before.firstName}, your DOOAA account has been deleted and you have been signed out everywhere.`,
-        'Your name, email, phone number and photo have been removed. You are welcome to sign up again at any time.',
+        'Your name, email, phone number and photo have been removed. We are sorry to see you go, and you are always welcome back.',
       ],
     });
     return { closed: true };

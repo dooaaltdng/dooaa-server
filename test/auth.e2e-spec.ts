@@ -115,7 +115,7 @@ describe('Auth (e2e)', () => {
       expect(result.verified).toBe(true);
       expect(result.user.verified).toBe(true);
       await t.mail.idle();
-      expect(t.mail.lastTo(body.email)?.subject).toBe('Welcome to DOOAA');
+      expect(t.mail.lastTo(body.email)?.subject).toMatch(/^Welcome to DOOAA, /);
     });
 
     it('rejects a wrong code and reports attempts left', async () => {

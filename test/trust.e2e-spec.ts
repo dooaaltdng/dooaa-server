@@ -115,10 +115,10 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
 
   describe('identity verification', () => {
     /** The outcome email is sent after the request returns, so wait for it briefly. */
-    async function mailTo(email: string, subject: string) {
+    async function mailTo(email: string, subject: string | RegExp) {
       for (let attempt = 0; attempt < 40; attempt += 1) {
         await t.mail.idle();
-        const found = t.mail.sent.find((entry) => entry.to.toLowerCase() === email.toLowerCase() && entry.subject === subject);
+        const found = t.mail.sent.find((entry) => entry.to.toLowerCase() === email.toLowerCase() && (typeof subject === 'string' ? entry.subject === subject : subject.test(entry.subject)));
         if (found) return found;
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
@@ -175,7 +175,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       expect(data(await http.get('/auth/me', seller.token))).toMatchObject({ identity: 'verified', verificationLevel: 'high-value' });
       expect((await model(t, 'Product').findById(product.id).lean())!.sellerVerified).toBe(true);
       failure(await http.post(`/admin/verifications/${row.id}/reject`, { reason: 'Too late now' }, admin.token), 409, 'VERIFICATION_NOT_PENDING');
-      const mail = await mailTo(seller.email, 'Your DOOAA identity is verified');
+      const mail = await mailTo(seller.email, /^You're verified/);
       expect(mail.text).toContain('International Passport');
       expect(mail.text).toContain('verified badge on your listings');
     });
@@ -193,7 +193,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       data(await http.post(`/admin/verifications/${profile.verificationId}/approve`, {}, admin.token));
       expect(data(await http.get(`/admin/buyers/${buyer.id}`, admin.token))).toMatchObject({ identity: 'verified', verificationStatus: 'approved' });
       expect(data(await http.get('/me/verification', buyer.token)).identity).toBe('verified');
-      const mail = await mailTo(buyer.email, 'Your DOOAA identity is verified');
+      const mail = await mailTo(buyer.email, /^You're verified/);
       expect(mail.text).toContain("Driver's Licence");
       expect(mail.text).not.toContain('listings');
     });
@@ -207,7 +207,7 @@ describe('Reviews, identity verification and disputes (e2e)', () => {
       const row = data(await http.get('/admin/verifications?status=pending', admin.token)).rows.find((entry: any) => entry.userId === buyer.id);
       data(await http.post(`/admin/verifications/${row.id}/reject`, { reason: 'The photo is blurry. Retake it in good light.' }, admin.token));
       expect(data(await http.get('/me/verification', buyer.token))).toMatchObject({ identity: 'rejected', latest: { rejectionReason: 'The photo is blurry. Retake it in good light.' } });
-      expect((await mailTo(buyer.email, 'We could not verify your identity')).text).toContain('The photo is blurry.');
+      expect((await mailTo(buyer.email, 'We need a little more to verify you')).text).toContain('The photo is blurry.');
       const retry = { ...body, documents: { idFront: await kycUpload(buyer.token) } };
       expect(data(await http.post('/me/verification', retry, buyer.token)).identity).toBe('pending');
     });

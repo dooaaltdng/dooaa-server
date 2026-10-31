@@ -209,10 +209,11 @@ export class DisputesService implements OnModuleInit {
       link: `/messages?c=${conversation.id}`,
       email: {
         subject: `A buyer opened a dispute on order #${order.reference}`,
-        heading: 'A dispute needs your response',
+        preheader: `Please reply within ${settings.responseHours} hours.`,
+        heading: 'A buyer needs your help with an order',
         paragraphs: [
           `The buyer of ${order.items[0].title} says: “${input.reason}”`,
-          `Payment is on hold. Reply with your side and any evidence within ${settings.responseHours} hours.`,
+          `${order.escrow ? 'Payment is on hold while we look into it. ' : ''}Reply with your side and any photos or evidence within ${settings.responseHours} hours, and we will help you both sort it out.`,
         ],
         cta: { label: 'Respond', url: `${this.config.platformUrl}/messages?c=${conversation.id}` },
       },

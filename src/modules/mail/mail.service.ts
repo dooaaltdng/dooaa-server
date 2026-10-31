@@ -25,7 +25,7 @@ export class MailService implements OnModuleDestroy {
   /** Queues a message and returns a promise that settles when it is delivered or given up on. */
   send(to: string, content: MailContent, options: { replyTo?: string } = {}): Promise<void> {
     const rendered = renderMail(content);
-    const job = this.deliver({ from: this.config.mail.from, to, ...rendered, replyTo: options.replyTo });
+    const job = this.deliver({ from: this.config.mail.from, to, ...rendered, replyTo: options.replyTo ?? this.config.mail.supportInbox });
     this.inflight.add(job);
     void job.finally(() => this.inflight.delete(job));
     return job;

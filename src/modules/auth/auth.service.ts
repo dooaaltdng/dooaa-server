@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { welcomeMail } from '../mail/mail.templates';
 import { randomBytes } from 'node:crypto';
 import { JwtService } from '@nestjs/jwt';
 import { Errors } from '../../common/api/app-error';
@@ -127,6 +128,12 @@ export class AuthService {
   }
 
   /** Step 2 for both: a correct code signs the person in (and confirms the email on sign-up). */
+  /** The welcome email; it speaks about escrow only while escrow is switched on. */
+  private async sendWelcome(email: string, firstName: string): Promise<void> {
+    const escrow = (await this.settings.section('escrow')).enabled;
+    await this.mail.send(email, welcomeMail(firstName, this.config.platformUrl, escrow));
+  }
+
   async verifyCode(input: VerifyCodeDto, meta: SessionMeta): Promise<AuthResult> {
     const user = await this.users.findByEmail(input.email);
     if (!user) throw Errors.badRequest('That code has expired. Request a new one.', 'OTP_EXPIRED');
@@ -135,15 +142,7 @@ export class AuthService {
     await this.otp.verify({ key: AuthService.otpKey(user.id), purpose, code: input.code });
     if (!user.emailVerified) {
       await this.users.update(user.id, { emailVerified: true });
-      void this.mail.send(user.email, {
-        subject: 'Welcome to DOOAA',
-        heading: `Welcome, ${user.firstName}!`,
-        paragraphs: [
-          'Your email is confirmed and your account is ready.',
-          'Every purchase on DOOAA can be held in escrow until you confirm the item arrived as described — keep payments and chats on DOOAA so we can protect you.',
-        ],
-        cta: { label: 'Start exploring', url: this.config.platformUrl },
-      });
+      void this.sendWelcome(user.email, user.firstName);
     }
     await this.users.recordSignIn(user.id);
     const tokens = await this.tokens.issue('user', user.id, user.tokenVersion, meta);
@@ -229,15 +228,7 @@ export class AuthService {
     if (input.purpose === 'verify-email') {
       const updated = await this.users.update(user.id, { emailVerified: true });
       if (!user.emailVerified) {
-        void this.mail.send(updated.email, {
-          subject: 'Welcome to DOOAA',
-          heading: `Welcome, ${updated.firstName}!`,
-          paragraphs: [
-            'Your email is confirmed and your account is ready.',
-            'Every purchase on DOOAA can be held in escrow until you confirm the item arrived as described — keep payments and chats on DOOAA so we can protect you.',
-          ],
-          cta: { label: 'Start exploring', url: this.config.platformUrl },
-        });
+        void this.sendWelcome(updated.email, updated.firstName);
       }
       return { verified: true, user: toPublicUser(updated) };
     }
@@ -267,7 +258,8 @@ export class AuthService {
     await this.users.setPassword(user.id, await this.passwords.hash(password));
     void this.mail.send(user.email, {
       subject: 'Your DOOAA password was changed',
-      heading: 'Password changed',
+      preheader: 'If this was you, there is nothing else to do.',
+      heading: 'Your password was changed',
       paragraphs: [
         `Hi ${user.firstName}, the password on your DOOAA account was just changed and you have been signed out everywhere.`,
         'If this was not you, reset your password immediately and contact support.',

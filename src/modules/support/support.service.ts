@@ -90,7 +90,8 @@ export class SupportService {
     );
     void this.mail.send(email, {
       subject: `We received your message (${reference})`,
-      heading: 'Thanks — we have your message',
+      preheader: 'We usually reply within one business day.',
+      heading: 'Thanks, we have your message',
       paragraphs: [`Hi ${name.split(' ')[0]}, our support team has your message about “${input.topic.toLowerCase()}”.`, 'We usually reply within one business day. Reply to this email to add anything.'],
     });
     return this.view(created);
