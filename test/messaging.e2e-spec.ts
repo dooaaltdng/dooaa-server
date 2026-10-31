@@ -2,7 +2,7 @@ import { io, type Socket } from 'socket.io-client';
 import { createTestApp, type TestApp } from './utils/app';
 import { Http, data, failure } from './utils/http';
 import { eventually } from './utils/eventually';
-import { createProduct, model, registerSeller, registerUser, staffToken, uploadImage, type TestUser } from './utils/factories';
+import { createProduct, model, registerSeller, registerUser, setSettings, staffToken, uploadImage, type TestUser } from './utils/factories';
 import { DELIVERY, payAndVerify, settle } from './utils/commerce';
 
 describe('Messaging, offers, meetups and realtime (e2e)', () => {
@@ -159,6 +159,46 @@ describe('Messaging, offers, meetups and realtime (e2e)', () => {
 
       const quote = data(await http.get(`/checkout/escrow/${product.id}/quote?offerId=${offerId}`, buyer.token));
       expect(quote.quote).toMatchObject({ itemPrice: 4_000_000, escrowFee: 20_000, total: 4_025_000 });
+    });
+
+    it('with escrow off, sends the buyer to the chat instead of a payment, and the deal stays in the thread', async () => {
+      await setSettings(t, 'escrow', { enabled: false });
+      try {
+        const product = await createProduct(t, seller.id, { title: 'Sony PlayStation 5', price: 650_000, pricing: 'negotiable' });
+        expect(data(await http.get(`/products/${product.id}`)).purchaseMode).toBe('contact');
+        failure(await http.post('/cart/items', { productId: product.id }, buyer.token), 409, 'CHAT_SELLER');
+        failure(await http.post('/checkout/escrow', { productId: product.id, method: 'card', delivery: DELIVERY }, buyer.token), 400, 'ESCROW_DISABLED');
+
+        const thread = data(await http.post('/conversations', { productId: product.id, body: 'Is this still available?' }, buyer.token));
+        expect(thread).toMatchObject({ escrowEnabled: false, escrow: null });
+        data(await http.post(`/conversations/${thread.id}/messages`, { body: 'Yes it is. Lekki pickup works.' }, seller.token));
+        const offered = data(await http.post(`/conversations/${thread.id}/offers`, { amount: 600_000 }, buyer.token));
+        const accepted = data(await http.post(`/offers/${offered.offer.id}/accept`, {}, seller.token));
+        expect(accepted.messages.at(-1)).toMatchObject({ kind: 'system', systemLead: 'Offer accepted.', body: expect.stringContaining('Arrange payment and delivery with each other') });
+
+        const seen = data(await http.get(`/conversations/${thread.id}`, buyer.token));
+        expect(seen.messages.map((message: any) => message.body)).toEqual(expect.arrayContaining(['Is this still available?', 'Yes it is. Lekki pickup works.']));
+      } finally {
+        await setSettings(t, 'escrow', { enabled: true });
+      }
+      const product = await createProduct(t, seller.id);
+      expect(data(await http.get(`/products/${product.id}`)).purchaseMode).toBe('escrow');
+      expect(data(await http.post('/conversations', { productId: product.id }, buyer.token)).escrowEnabled).toBe(true);
+    });
+
+    it('refuses switched-off features (Features page) and says so publicly', async () => {
+      const product = await createProduct(t, seller.id, { pricing: 'negotiable' });
+      const thread = data(await http.post('/conversations', { productId: product.id }, buyer.token));
+      await setSettings(t, 'features', { offers: false, meetups: false });
+      try {
+        expect(data(await http.get('/settings/public')).features).toMatchObject({ offers: false, meetups: false, messaging: true });
+        failure(await http.post(`/conversations/${thread.id}/offers`, { amount: 300_000 }, buyer.token), 403, 'FEATURE_OFF');
+        failure(await http.post(`/conversations/${thread.id}/meetups`, { place: 'Ikeja City Mall', date: '2026-12-01', from: '10:00', to: '11:00' }, buyer.token), 403, 'FEATURE_OFF');
+        data(await http.post(`/conversations/${thread.id}/messages`, { body: 'Chat still works' }, buyer.token));
+      } finally {
+        await setSettings(t, 'features', { offers: true, meetups: true });
+      }
+      data(await http.post(`/conversations/${thread.id}/offers`, { amount: 300_000 }, buyer.token));
     });
 
     it('lets the seller decline and the buyer withdraw', async () => {

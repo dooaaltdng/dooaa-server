@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { APP_GUARD, Reflector } from '@nestjs/core';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { FeatureGuard } from './common/auth/feature.guard';
 import { LoggerModule } from 'nestjs-pino';
 import { CacheModule } from './cache/cache.module';
 import { AUTH_THROTTLE } from './common/auth/throttle';
@@ -123,6 +124,9 @@ const reflector = new Reflector();
     StaffModule,
     HealthModule,
   ],
-  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
+  providers: [
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
+    { provide: APP_GUARD, useClass: FeatureGuard },
+  ],
 })
 export class AppModule {}

@@ -23,9 +23,6 @@ export type ModeratedStatus = (typeof MODERATED_STATUSES)[number];
 export const VERIFICATION_LEVELS = ['normal', 'high-value'] as const;
 export type VerificationLevel = (typeof VERIFICATION_LEVELS)[number];
 
-/** Social sign-in providers an account can be linked to. */
-export const OAUTH_PROVIDERS = ['google', 'facebook'] as const;
-export type OAuthProviderId = (typeof OAUTH_PROVIDERS)[number];
 
 /** Who a session, an upload or a notification belongs to. */
 export const SUBJECT_TYPES = ['user', 'staff'] as const;
@@ -318,12 +315,14 @@ export const REVIEW_ASPECT_LABEL: Record<ReviewAspect, string> = {
 
 /* --- Verification -------------------------------------------------------- */
 
-export const ID_TYPES = ['drivers-license', 'passport', 'national-id'] as const;
+/** Nigerian government IDs DOOAA accepts. Values are what records store; labels are what people see. */
+export const ID_TYPES = ['national-id', 'passport', 'drivers-license', 'voters-card'] as const;
 export type IdType = (typeof ID_TYPES)[number];
 export const ID_TYPE_LABEL: Record<IdType, string> = {
-  'drivers-license': "Driver's License",
-  passport: 'Passport',
-  'national-id': 'National ID',
+  'national-id': 'NIN (National ID)',
+  passport: 'International Passport',
+  'drivers-license': "Driver's Licence",
+  'voters-card': "Voter's Card",
 };
 
 export const BANK_VERIFICATION_METHODS = ['instant', 'micro'] as const;
@@ -332,6 +331,7 @@ export type BankVerificationMethod = (typeof BANK_VERIFICATION_METHODS)[number];
 export const VERIFICATION_STATUSES = ['pending', 'approved', 'rejected'] as const;
 export type VerificationStatus = (typeof VERIFICATION_STATUSES)[number];
 
+/** 'selfie' only appears on records from before verification became ID-only. */
 export const VERIFICATION_DOCUMENT_KINDS = ['id-front', 'id-back', 'selfie'] as const;
 export type VerificationDocumentKind = (typeof VERIFICATION_DOCUMENT_KINDS)[number];
 

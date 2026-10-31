@@ -20,8 +20,7 @@ export type Verification = typeof verifications.$inferSelect;
 
 export type SubmitVerificationInput = {
   idType: IdType;
-  documents: { idFront: string; idBack?: string; selfie: string };
-  livenessPassed: boolean;
+  documents: { idFront: string; idBack?: string };
   bank?: { method: BankVerificationMethod; bankCode: string; accountNumber: string };
   consents: boolean[];
 };
@@ -73,7 +72,7 @@ export class VerificationService {
   }
 
   /**
-   * The wizard's Submit: ID photos, selfie with liveness, the payout bank
+   * The wizard's Submit: photos of a government ID (no selfie), the payout bank
    * (confirmed with the bank through the provider) and the three consents.
    * Review is manual, so the account lands as pending.
    */
@@ -81,11 +80,10 @@ export class VerificationService {
     const record = await this.users.getById(user.id);
     if (record.identity === 'verified') throw Errors.conflict('Your identity is already verified.', 'ALREADY_VERIFIED');
     if (record.identity === 'pending') throw Errors.conflict('Your documents are already being reviewed.', 'VERIFICATION_PENDING');
-    if (!input.livenessPassed) throw Errors.badRequest('Complete the selfie and liveness check first.', 'LIVENESS_REQUIRED');
     if (input.consents.length < 3 || input.consents.some((consent) => consent !== true)) {
       throw Errors.badRequest('Agree to each statement before submitting.', 'CONSENT_REQUIRED');
     }
-    const ids = [input.documents.idFront, input.documents.selfie, ...(input.documents.idBack ? [input.documents.idBack] : [])];
+    const ids = [input.documents.idFront, ...(input.documents.idBack ? [input.documents.idBack] : [])];
     await this.media.ownedByIds(ids, { id: user.id, type: 'user' }, 'kyc');
 
     let bank: VerificationBank | null = null;
@@ -114,9 +112,7 @@ export class VerificationService {
         documents: [
           { kind: 'id-front', mediaId: input.documents.idFront, uploadedAt },
           ...(input.documents.idBack ? [{ kind: 'id-back' as const, mediaId: input.documents.idBack, uploadedAt }] : []),
-          { kind: 'selfie', mediaId: input.documents.selfie, uploadedAt },
         ],
-        livenessPassed: true,
         bank,
         consents: input.consents,
         submittedAt: now,
@@ -126,7 +122,7 @@ export class VerificationService {
     void this.mail.send(record.email, {
       subject: 'We are reviewing your documents',
       heading: 'Verification submitted',
-      paragraphs: [`Thanks, ${record.firstName}. Our team is reviewing your ${ID_TYPE_LABEL[input.idType].toLowerCase()} and selfie.`, 'This usually takes up to 24 hours. We will email you as soon as it is done.'],
+      paragraphs: [`Thanks, ${record.firstName}. Our team is reviewing your ${ID_TYPE_LABEL[input.idType]}.`, 'This usually takes up to 24 hours. We will email you as soon as it is done.'],
     });
     const alerts = await this.settings.section('notifications');
     if (alerts.kycSubmission) {
@@ -214,14 +210,22 @@ export class VerificationService {
     const row = await this.decide(id, { status: 'approved', reviewedBy: staff.id, reviewedAt: new Date() });
     const user = await this.users.update(row.userId, { identity: 'verified', ...(level ? { verificationLevel: level } : {}) });
     await this.products.syncSellerVerified(row.userId, true);
+    const seller = user.role === 'seller';
     await this.audit.record(staff, { action: 'Approved an identity verification', target: `${user.firstName} ${user.lastName}`, targetType: 'user', targetId: row.userId });
     void this.notifications.notifyUser(row.userId, {
       type: 'kyc.approved',
       title: 'You are verified',
-      body: 'Your identity has been confirmed. Buyers will now see the verified badge on your profile.',
+      body: seller ? 'Your identity has been confirmed. Buyers will now see the verified badge on your profile.' : 'Your identity has been confirmed.',
       tone: 'green',
       link: '/verification',
-      email: { subject: 'Your DOOAA identity is verified', heading: 'You are verified', paragraphs: [`Great news, ${user.firstName} — your identity has been confirmed.`, 'Buyers now see the verified badge on your listings and in chat.'] },
+      email: {
+        subject: 'Your DOOAA identity is verified',
+        heading: 'You are verified',
+        paragraphs: [
+          `Great news, ${user.firstName} — our team has checked your ${ID_TYPE_LABEL[row.idType]} and confirmed your identity.`,
+          seller ? 'Buyers now see the verified badge on your listings and in chat.' : 'Your DOOAA account is now verified. Thanks for helping keep DOOAA safe.',
+        ],
+      },
     });
     return this.get(id);
   }

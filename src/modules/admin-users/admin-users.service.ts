@@ -213,13 +213,12 @@ export class AdminUsersService {
     const recent = await this.recentOrders(and(eq(orders.buyerId, user.id), ne(orders.status, 'awaiting-payment')), 5);
     const sellers = await this.userService.findByIds(recent.map((order) => order.sellerId));
     const sellerEmail = new Map(sellers.map((seller) => [seller.id, seller.email]));
-    const verified = user.identity === 'verified';
-    const kycHeadline = verified ? 'Level 2 Verified' : user.identity === 'pending' ? 'Level 1 — ID under review' : user.identity === 'rejected' ? 'Level 1 — ID rejected' : 'Level 1 — Awaiting ID';
+    const verification = await this.verification.latestFor(user.id);
     return {
       ...this.buyerRow(user),
-      kycLevel: verified ? 2 : 1,
-      kycHeadline,
-      kycDetail: verified ? 'ID and Proof of selfie is confirmed' : user.emailVerified ? 'Email and phone confirmed. No ID on file.' : 'Email not yet confirmed.',
+      verificationStatus: verification?.status ?? null,
+      verificationId: verification?.id ?? null,
+      documents: verification ? await this.verification.documentsFor(verification) : [],
       transactions: recent.map((order) => ({
         id: order.id,
         orderId: `#${order.reference}`,

@@ -1,14 +1,61 @@
-/** Test-wide environment. The external services are replaced in test/utils/app.ts. */
-process.env.NODE_ENV = 'test';
-process.env.LOG_LEVEL = process.env.LOG_LEVEL ?? 'silent';
-process.env.JWT_ACCESS_SECRET = 'test-access-secret-0123456789abcdef';
-process.env.JWT_REFRESH_SECRET = 'test-refresh-secret-0123456789abcdef';
-process.env.JWT_STAFF_SECRET = 'test-staff-secret-0123456789abcdef';
-process.env.SMS_DRIVER = 'memory';
-process.env.SMTP_FROM = 'DOOAA <no-reply@dooaa.test>';
-process.env.SCHEDULER_ENABLED = 'false';
-process.env.THROTTLE_LIMIT = '10000';
-process.env.AUTH_THROTTLE_LIMIT = '10000';
-process.env.APP_URL = 'http://localhost:4000';
-process.env.CLIENT_URL = 'http://localhost:3000';
-process.env.ADMIN_URL = 'http://localhost:3001';
+/** Test-wide environment: every variable the env files declare. The external services are replaced in test/utils/app.ts. */
+const env: Record<string, string> = {
+  NODE_ENV: 'test',
+  PORT: '4000',
+  API_URL: 'http://localhost:4000/api/v1',
+  PLATFORM_URL: 'http://localhost:3000',
+  ADMIN_URL: 'http://localhost:3001',
+  CORS_ORIGINS: '',
+  LOG_LEVEL: process.env.LOG_LEVEL ?? 'silent',
+  SWAGGER_ENABLED: 'false',
+  MONGODB_URI: '',
+  MONGODB_DB: 'dooaa_test',
+  DATABASE_POOL_MAX: '10',
+  REDIS_URL: '',
+  REDIS_KEY_PREFIX: 'dooaa:test:',
+  JWT_ACCESS_SECRET: 'test-access-secret-0123456789abcdef',
+  JWT_REFRESH_SECRET: 'test-refresh-secret-0123456789abcdef',
+  JWT_STAFF_SECRET: 'test-staff-secret-0123456789abcdef',
+  OTP_PEPPER: 'test-otp-pepper',
+  MEDIA_SIGNING_SECRET: 'test-media-secret',
+  JWT_ACCESS_TTL_SECONDS: '900',
+  JWT_REFRESH_TTL_DAYS: '30',
+  JWT_STAFF_ACCESS_TTL_SECONDS: '900',
+  JWT_STAFF_REFRESH_TTL_DAYS: '1',
+  OTP_TTL_SECONDS: '600',
+  OTP_RESEND_COOLDOWN_SECONDS: '60',
+  OTP_MAX_ATTEMPTS: '5',
+  AUTH_MAX_FAILED_SIGNINS: '5',
+  AUTH_LOCK_MINUTES: '15',
+  BCRYPT_ROUNDS: '4',
+  COOKIE_SAMESITE: 'lax',
+  COOKIE_SECURE: 'false',
+  OTP_DEV_CODE: '123456',
+  PAYMENT_CALLBACK_URL: 'http://localhost:3000/checkout/callback',
+  BACHS_SECRET_KEY: '',
+  BACHS_WEBHOOK_SECRET: '',
+  BACHS_BASE_URL: 'https://sandbox-api.bachs.io',
+  CLOUDINARY_CLOUD_NAME: '',
+  CLOUDINARY_API_KEY: '',
+  CLOUDINARY_API_SECRET: '',
+  CLOUDINARY_FOLDER: 'dooaa',
+  MAX_IMAGE_MB: '10',
+  MAX_VIDEO_MB: '50',
+  MAX_FILE_MB: '10',
+  SMTP_HOST: '',
+  SMTP_PORT: '587',
+  SMTP_SECURE: 'false',
+  SMTP_USER: '',
+  SMTP_PASS: '',
+  SMTP_FROM: 'DOOAA <no-reply@dooaa.test>',
+  SUPPORT_INBOX: 'support@dooaa.ng',
+  SMS_DRIVER: 'memory',
+  TERMII_API_KEY: '',
+  TERMII_SENDER_ID: 'DOOAA',
+  TERMII_BASE_URL: 'https://api.ng.termii.com',
+  THROTTLE_TTL_MS: '60000',
+  THROTTLE_LIMIT: '10000',
+  AUTH_THROTTLE_LIMIT: '10000',
+  SCHEDULER_ENABLED: 'false',
+};
+for (const [key, value] of Object.entries(env)) process.env[key] = value;

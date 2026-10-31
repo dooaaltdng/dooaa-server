@@ -4,7 +4,7 @@ import { DAY } from '../../common/util/dates';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
 import { InjectDb, type Database } from '../../database/database';
-import { notifications, oauthGrants, otps, providerEvents, sessions, visitorDays } from '../../database/schema';
+import { notifications, otps, providerEvents, sessions, visitorDays } from '../../database/schema';
 import { OrdersService } from '../orders/orders.service';
 import { PaymentsService } from '../payments/payments.service';
 import { SettingsService } from '../settings/settings.service';
@@ -73,7 +73,6 @@ export class JobsService implements OnApplicationBootstrap, OnModuleDestroy {
     return {
       sessions: await this.db.deleteMany(sessions, { expiresAt: { $lt: now } }),
       otps: await this.db.deleteMany(otps, { expiresAt: { $lt: now } }),
-      oauthGrants: await this.db.deleteMany(oauthGrants, { expiresAt: { $lt: now } }),
       notifications: await this.db.deleteMany(notifications, { createdAt: { $lt: before(RETENTION.notifications) } }),
       visitorDays: await this.db.deleteMany(visitorDays, { at: { $lt: before(RETENTION.visitorDays) } }),
       providerEvents: await this.db.deleteMany(providerEvents, { receivedAt: { $lt: before(RETENTION.providerEvents) } }),

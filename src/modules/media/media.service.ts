@@ -274,7 +274,7 @@ export class MediaService {
   }
 
   private contentUrl(id: string): string {
-    return `${this.config.appUrl}/api/v1/media/${id}/content`;
+    return `${this.config.apiUrl}/media/${id}/content`;
   }
 
   /** A link to a private file that works in an <img> for fifteen minutes. */

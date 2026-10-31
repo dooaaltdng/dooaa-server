@@ -201,8 +201,6 @@ const MODELS = {
   Conversation: schema.conversations,
   Message: schema.messages,
   Review: schema.reviews,
-  OAuthGrant: schema.oauthGrants,
-  UserOauthIdentity: schema.userOauthIdentities,
   Notification: schema.notifications,
   Verification: schema.verifications,
   Session: schema.sessions,

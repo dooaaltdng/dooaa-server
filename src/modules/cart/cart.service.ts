@@ -86,6 +86,8 @@ export class CartService {
     const byId = new Map(rows.map((row) => [row.id, row]));
     const cardById = new Map(cards.map((card) => [card.id, card]));
 
+    // With escrow off, marketplace sellers are paid outside DOOAA: their listings are bought through a chat, not the cart.
+    const chatOnly = !(await this.settings.section('escrow')).enabled;
     const entries: CartEntry[] = [];
     const pricedLines: { productId: string; sellerId: string; unitPrice: number; quantity: number }[] = [];
     for (const line of cart.lines) {
@@ -94,10 +96,11 @@ export class CartService {
       if (!product || !card || product.deletedAt) continue;
       let issue: string | null = null;
       if (product.sellerId === user.id) issue = 'This is your own listing.';
+      else if (chatOnly && product.listedAs === 'seller') issue = 'Chat the seller to buy this item.';
       else if (product.status !== 'active') issue = 'This item is no longer available.';
       else if (product.stock <= 0) issue = 'Sold out.';
       else if (product.stock < line.quantity) issue = `Only ${product.stock} left — we will check out ${product.stock}.`;
-      const available = issue === null || (product.stock > 0 && product.status === 'active' && product.sellerId !== user.id);
+      const available = issue === null || (product.stock > 0 && product.status === 'active' && product.sellerId !== user.id && !(chatOnly && product.listedAs === 'seller'));
       const quantity = available ? Math.min(line.quantity, product.stock) : line.quantity;
       if (available) pricedLines.push({ productId: product.id, sellerId: product.sellerId, unitPrice: product.price, quantity });
       entries.push({ product: card, quantity, lineTotal: Math.round(product.price * quantity * 100) / 100, available, issue });
@@ -122,6 +125,9 @@ export class CartService {
   private async assertBuyable(user: AuthUser, productId: string, quantity: number) {
     const product = await this.products.findPublic(productId);
     if (product.sellerId === user.id) throw Errors.forbidden('You cannot buy your own listing.', 'OWN_LISTING');
+    if (product.listedAs === 'seller' && !(await this.settings.section('escrow')).enabled) {
+      throw Errors.conflict('Chat the seller to buy this item.', 'CHAT_SELLER');
+    }
     if (product.stock <= 0) throw Errors.conflict('This item is sold out.', 'OUT_OF_STOCK');
     if (quantity > product.stock) throw Errors.conflict(`Only ${product.stock} left in stock.`, 'INSUFFICIENT_STOCK', { available: product.stock });
     return product;

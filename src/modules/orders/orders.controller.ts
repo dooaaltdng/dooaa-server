@@ -9,6 +9,7 @@ import { CartService } from '../cart/cart.service';
 import { CheckoutService } from './checkout.service';
 import { CheckoutDto, EscrowCheckoutDto, EscrowQuoteQueryDto, OrdersQueryDto, ReasonDto, ReleaseCodeDto, ReleaseDto } from './dto/orders.dto';
 import { OrdersService } from './orders.service';
+import { RequireFeature } from '../../common/auth/feature.guard';
 
 class RecentQueryDto {
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(20) limit?: number;
@@ -23,6 +24,7 @@ export class CheckoutController {
   /** Pays for the cart. Returns the orders and where to send the buyer to pay. */
   @RequireVerifiedEmail()
   @AuthThrottle()
+  @RequireFeature('checkout')
   @Post()
   cart(@CurrentUser() user: AuthUser, @Body() body: CheckoutDto) {
     return this.checkout.checkoutCart(user, {
@@ -83,6 +85,7 @@ export class OrdersController {
   }
 
   @HttpCode(200)
+  @RequireFeature('cancellations')
   @Post(':id/request-cancellation')
   requestCancellation(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() body: ReasonDto) {
     return this.orders.requestCancellation(user, id, body.reason);

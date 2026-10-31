@@ -28,6 +28,7 @@ import {
   VerifyCodeDto,
 } from './dto/auth.dto';
 import type { TokenPair } from './token.service';
+import { RequireFeature } from '../../common/auth/feature.guard';
 
 export const REFRESH_COOKIE = 'dooaa_rt';
 
@@ -60,6 +61,7 @@ export class AuthController {
 
   @Public()
   @AuthThrottle()
+  @RequireFeature('sign-ups')
   @Post('sign-up')
   async signUp(@Body() body: SignUpDto, @RequestMeta() meta: RequestMetaValue, @Res({ passthrough: true }) response: Response) {
     const result = await this.auth.signUp(body, meta);
@@ -70,6 +72,7 @@ export class AuthController {
   @Public()
   @AuthThrottle()
   @HttpCode(200)
+  @RequireFeature('sign-ups')
   @Post('code/sign-up')
   startSignUp(@Body() body: StartSignUpDto) {
     return this.auth.startSignUp(body);

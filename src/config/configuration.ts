@@ -1,5 +1,8 @@
 /**
  * Typed configuration, read from the environment once per app instance.
+ * There are no defaults here: every value lives in `.env.local` /
+ * `.env.production` (or the host's environment), and both files declare the
+ * same variables.
  *
  * Every environment runs the same stack: PostgreSQL, Redis, Bachs, Cloudinary
  * and SMTP (development points them at sandboxes and test accounts). Money
@@ -10,18 +13,18 @@
 
 export type NodeEnv = 'development' | 'production' | 'test';
 export type SmsDriver = 'termii' | 'memory' | 'log';
-/** `live` talks to Google/Facebook; `sandbox` signs in offline with a fake profile (development and tests). */
-export type OAuthDriver = 'live' | 'sandbox';
 
 export interface AppConfig {
   env: NodeEnv;
   port: number;
-  /** Public base URL of this API, used for links it hands out (media, webhooks). */
-  appUrl: string;
-  clientUrl: string;
+  /** Public base URL of this API including the /api/v1 prefix, used for links it hands out (media). */
+  apiUrl: string;
+  platformUrl: string;
   adminUrl: string;
   corsOrigins: string[];
   logLevel: string;
+  /** Serve the API docs at /docs. */
+  swaggerEnabled: boolean;
   database: {
     /** MongoDB connection string (Atlas or local). */
     url: string;
@@ -81,174 +84,163 @@ export interface AppConfig {
       baseUrl: string;
     };
   };
-  oauth: {
-    driver: OAuthDriver;
-    google: { clientId?: string; clientSecret?: string };
-    facebook: { appId?: string; appSecret?: string; graphVersion: string };
-  };
   throttle: { ttlMs: number; limit: number; authLimit: number };
   scheduler: { enabled: boolean };
-  seed: {
-    superadminEmail: string;
-    superadminPassword?: string;
-    superadminFirstName: string;
-    superadminLastName: string;
-  };
 }
 
-function str(name: string, fallback?: string): string {
+/**
+ * Every setting comes from the environment (`.env.local` / `.env.production`);
+ * nothing is defaulted in code. A variable that is not declared at all is
+ * collected and reported at once, so a missing line in an env file fails the
+ * boot instead of silently picking a value.
+ */
+const undeclared: string[] = [];
+
+function raw(name: string): string {
   const value = process.env[name];
-  if (value === undefined || value === '') {
-    if (fallback === undefined) return '';
-    return fallback;
+  if (value === undefined) {
+    undeclared.push(name);
+    return '';
   }
+  return value.trim();
+}
+
+/** A required value: must be declared and non-empty. */
+function str(name: string): string {
+  const value = raw(name);
+  if (value === '' && !undeclared.includes(name)) undeclared.push(`${name} (empty)`);
   return value;
 }
 
-function num(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return fallback;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) ? parsed : fallback;
+/** Must be declared, but may be left empty (an integration that is switched off). */
+function opt(name: string): string | undefined {
+  return raw(name) || undefined;
 }
 
-function bool(name: string, fallback: boolean): boolean {
-  const raw = process.env[name];
-  if (raw === undefined || raw === '') return fallback;
-  return ['1', 'true', 'yes', 'on'].includes(raw.toLowerCase());
+function num(name: string): number {
+  const value = str(name);
+  const parsed = Number(value);
+  if (value !== '' && !Number.isFinite(parsed)) undeclared.push(`${name} (not a number)`);
+  return parsed;
 }
 
-function oneOf<T extends string>(name: string, allowed: readonly T[], fallback: T): T {
-  const raw = process.env[name] as T | undefined;
-  return raw && allowed.includes(raw) ? raw : fallback;
+function bool(name: string): boolean {
+  return ['1', 'true', 'yes', 'on'].includes(str(name).toLowerCase());
 }
 
-/** Bachs keys say which environment they belong to; the base URL follows unless set explicitly. */
-export function bachsBaseUrl(secretKey: string): string {
-  return secretKey.startsWith('sk_live_') ? 'https://api.bachs.io' : 'https://sandbox-api.bachs.io';
+function oneOf<T extends string>(name: string, allowed: readonly T[]): T {
+  const value = str(name) as T;
+  if (value && !allowed.includes(value)) undeclared.push(`${name} (one of ${allowed.join(', ')})`);
+  return value;
 }
+
+const url = (name: string) => str(name).replace(/\/$/, '');
 
 export function loadConfig(): AppConfig {
-  const env = oneOf<NodeEnv>('NODE_ENV', ['development', 'production', 'test'], 'development');
+  undeclared.length = 0;
+  const env = oneOf<NodeEnv>('NODE_ENV', ['development', 'production', 'test']);
   const production = env === 'production';
-  const port = num('PORT', 4000);
-  const appUrl = str('APP_URL', `http://localhost:${port}`).replace(/\/$/, '');
-  const clientUrl = str('CLIENT_URL', 'http://localhost:3000').replace(/\/$/, '');
-  const adminUrl = str('ADMIN_URL', 'http://localhost:3001').replace(/\/$/, '');
-  const extraOrigins = str('CORS_ORIGINS')
+  const otpDevCode = opt('OTP_DEV_CODE');
+  const platformUrl = url('PLATFORM_URL');
+  const adminUrl = url('ADMIN_URL');
+  const extraOrigins = (opt('CORS_ORIGINS') ?? '')
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean);
 
-  // Development secrets are deterministic so restarts keep sessions; production must set them.
-  const devSecret = (label: string) => `dooaa-dev-${label}-secret-change-me`;
-  const bachsSecretKey = str('BACHS_SECRET_KEY');
-
-  return {
+  const config: AppConfig = {
     env,
-    port,
-    appUrl,
-    clientUrl,
+    port: num('PORT'),
+    apiUrl: url('API_URL'),
+    platformUrl,
     adminUrl,
-    corsOrigins: Array.from(new Set([clientUrl, adminUrl, ...extraOrigins])),
-    logLevel: str('LOG_LEVEL', production ? 'info' : env === 'test' ? 'silent' : 'debug'),
+    corsOrigins: Array.from(new Set([platformUrl, adminUrl, ...extraOrigins])),
+    logLevel: str('LOG_LEVEL'),
+    swaggerEnabled: bool('SWAGGER_ENABLED'),
     database: {
       url: str('MONGODB_URI'),
-      name: str('MONGODB_DB', env === 'test' ? 'dooaa_test' : 'dooaa'),
-      poolMax: num('DATABASE_POOL_MAX', 10),
+      name: str('MONGODB_DB'),
+      poolMax: num('DATABASE_POOL_MAX'),
     },
     redis: {
-      url: str('REDIS_URL'),
-      keyPrefix: str('REDIS_KEY_PREFIX', `dooaa:${env}:`),
+      url: opt('REDIS_URL') ?? '',
+      keyPrefix: str('REDIS_KEY_PREFIX'),
     },
     jwt: {
-      accessSecret: str('JWT_ACCESS_SECRET', production ? '' : devSecret('access')),
-      refreshSecret: str('JWT_REFRESH_SECRET', production ? '' : devSecret('refresh')),
-      staffSecret: str('JWT_STAFF_SECRET', production ? '' : devSecret('staff')),
-      accessTtl: num('JWT_ACCESS_TTL_SECONDS', 15 * 60),
-      staffAccessTtl: num('JWT_STAFF_ACCESS_TTL_SECONDS', 15 * 60),
-      refreshTtlDays: num('JWT_REFRESH_TTL_DAYS', 30),
-      staffRefreshTtlDays: num('JWT_STAFF_REFRESH_TTL_DAYS', 1),
+      accessSecret: str('JWT_ACCESS_SECRET'),
+      refreshSecret: str('JWT_REFRESH_SECRET'),
+      staffSecret: str('JWT_STAFF_SECRET'),
+      accessTtl: num('JWT_ACCESS_TTL_SECONDS'),
+      staffAccessTtl: num('JWT_STAFF_ACCESS_TTL_SECONDS'),
+      refreshTtlDays: num('JWT_REFRESH_TTL_DAYS'),
+      staffRefreshTtlDays: num('JWT_STAFF_REFRESH_TTL_DAYS'),
     },
     otp: {
-      ttlSeconds: num('OTP_TTL_SECONDS', 10 * 60),
-      resendCooldownSeconds: num('OTP_RESEND_COOLDOWN_SECONDS', 60),
-      maxAttempts: num('OTP_MAX_ATTEMPTS', 5),
-      devCode: production ? undefined : str('OTP_DEV_CODE') || undefined,
-      pepper: str('OTP_PEPPER', production ? '' : devSecret('otp')),
+      ttlSeconds: num('OTP_TTL_SECONDS'),
+      resendCooldownSeconds: num('OTP_RESEND_COOLDOWN_SECONDS'),
+      maxAttempts: num('OTP_MAX_ATTEMPTS'),
+      devCode: production ? undefined : otpDevCode,
+      pepper: str('OTP_PEPPER'),
     },
     auth: {
-      maxFailedSignIns: num('AUTH_MAX_FAILED_SIGNINS', 5),
-      lockMinutes: num('AUTH_LOCK_MINUTES', 15),
-      bcryptRounds: num('BCRYPT_ROUNDS', env === 'test' ? 4 : 12),
-      cookieSameSite: oneOf<'lax' | 'strict' | 'none'>('COOKIE_SAMESITE', ['lax', 'strict', 'none'], production ? 'none' : 'lax'),
-      cookieSecure: bool('COOKIE_SECURE', production),
+      maxFailedSignIns: num('AUTH_MAX_FAILED_SIGNINS'),
+      lockMinutes: num('AUTH_LOCK_MINUTES'),
+      bcryptRounds: num('BCRYPT_ROUNDS'),
+      cookieSameSite: oneOf<'lax' | 'strict' | 'none'>('COOKIE_SAMESITE', ['lax', 'strict', 'none']),
+      cookieSecure: bool('COOKIE_SECURE'),
     },
     mail: {
-      from: str('SMTP_FROM', 'DOOAA <no-reply@dooaa.ng>'),
-      supportInbox: str('SUPPORT_INBOX', 'support@dooaa.ng'),
+      from: str('SMTP_FROM'),
+      supportInbox: str('SUPPORT_INBOX'),
       smtp: {
-        host: str('SMTP_HOST'),
-        port: num('SMTP_PORT', 587),
-        secure: bool('SMTP_SECURE', false),
-        user: str('SMTP_USER') || undefined,
-        pass: str('SMTP_PASS') || undefined,
+        host: opt('SMTP_HOST') ?? '',
+        port: num('SMTP_PORT'),
+        secure: bool('SMTP_SECURE'),
+        user: opt('SMTP_USER'),
+        pass: opt('SMTP_PASS'),
       },
     },
     sms: {
-      driver: oneOf<SmsDriver>('SMS_DRIVER', ['termii', 'memory', 'log'], production ? 'termii' : 'log'),
+      driver: oneOf<SmsDriver>('SMS_DRIVER', ['termii', 'memory', 'log']),
       termii: {
-        apiKey: str('TERMII_API_KEY') || undefined,
-        senderId: str('TERMII_SENDER_ID', 'DOOAA'),
-        baseUrl: str('TERMII_BASE_URL', 'https://api.ng.termii.com'),
+        apiKey: opt('TERMII_API_KEY'),
+        senderId: str('TERMII_SENDER_ID'),
+        baseUrl: url('TERMII_BASE_URL'),
       },
     },
     storage: {
-      maxImageMb: num('MAX_IMAGE_MB', 10),
-      maxVideoMb: num('MAX_VIDEO_MB', 50),
-      maxFileMb: num('MAX_FILE_MB', 10),
-      signingSecret: str('MEDIA_SIGNING_SECRET', production ? '' : devSecret('media')),
+      maxImageMb: num('MAX_IMAGE_MB'),
+      maxVideoMb: num('MAX_VIDEO_MB'),
+      maxFileMb: num('MAX_FILE_MB'),
+      signingSecret: str('MEDIA_SIGNING_SECRET'),
       cloudinary: {
-        cloudName: str('CLOUDINARY_CLOUD_NAME'),
-        apiKey: str('CLOUDINARY_API_KEY'),
-        apiSecret: str('CLOUDINARY_API_SECRET'),
-        folder: str('CLOUDINARY_FOLDER', 'dooaa'),
+        cloudName: opt('CLOUDINARY_CLOUD_NAME') ?? '',
+        apiKey: opt('CLOUDINARY_API_KEY') ?? '',
+        apiSecret: opt('CLOUDINARY_API_SECRET') ?? '',
+        folder: str('CLOUDINARY_FOLDER'),
       },
     },
     payments: {
       currency: 'NGN',
-      callbackUrl: str('PAYMENT_CALLBACK_URL', `${clientUrl}/checkout/callback`),
+      callbackUrl: url('PAYMENT_CALLBACK_URL'),
       bachs: {
-        secretKey: bachsSecretKey,
-        webhookSecret: str('BACHS_WEBHOOK_SECRET'),
-        baseUrl: str('BACHS_BASE_URL', bachsBaseUrl(bachsSecretKey)).replace(/\/$/, ''),
-      },
-    },
-    oauth: {
-      driver: oneOf<OAuthDriver>('OAUTH_DRIVER', ['live', 'sandbox'], env === 'production' ? 'live' : 'sandbox'),
-      google: {
-        clientId: str('GOOGLE_CLIENT_ID') || undefined,
-        clientSecret: str('GOOGLE_CLIENT_SECRET') || undefined,
-      },
-      facebook: {
-        appId: str('FACEBOOK_APP_ID') || undefined,
-        appSecret: str('FACEBOOK_APP_SECRET') || undefined,
-        graphVersion: str('FACEBOOK_GRAPH_VERSION', 'v21.0'),
+        secretKey: opt('BACHS_SECRET_KEY') ?? '',
+        webhookSecret: opt('BACHS_WEBHOOK_SECRET') ?? '',
+        baseUrl: url('BACHS_BASE_URL'),
       },
     },
     throttle: {
-      ttlMs: num('THROTTLE_TTL_MS', 60_000),
-      limit: num('THROTTLE_LIMIT', 300),
-      authLimit: num('AUTH_THROTTLE_LIMIT', 20),
+      ttlMs: num('THROTTLE_TTL_MS'),
+      limit: num('THROTTLE_LIMIT'),
+      authLimit: num('AUTH_THROTTLE_LIMIT'),
     },
-    scheduler: { enabled: bool('SCHEDULER_ENABLED', env !== 'test') },
-    seed: {
-      superadminEmail: str('SEED_SUPERADMIN_EMAIL', 'nelson@dooaa.com').toLowerCase(),
-      superadminPassword: str('SEED_SUPERADMIN_PASSWORD') || undefined,
-      superadminFirstName: str('SEED_SUPERADMIN_FIRST_NAME', 'Nelson'),
-      superadminLastName: str('SEED_SUPERADMIN_LAST_NAME', 'Doe'),
-    },
+    scheduler: { enabled: bool('SCHEDULER_ENABLED') },
   };
+
+  if (undeclared.length) {
+    throw new Error(`These variables are missing from the ${env} env file: ${undeclared.join(', ')}`);
+  }
+  return config;
 }
 
 /**
@@ -285,11 +277,10 @@ export function assertConfig(config: AppConfig): void {
     need(config.otp.pepper, 'OTP_PEPPER');
     need(config.storage.signingSecret, 'MEDIA_SIGNING_SECRET');
     if (config.sms.driver === 'termii') want(config.sms.termii.apiKey, 'TERMII_API_KEY');
+    // A placeholder key only breaks payments, not the rest of the API, so it warns like the other integrations.
     if (config.payments.bachs.secretKey && !config.payments.bachs.secretKey.startsWith('sk_live_')) {
-      missing.push('BACHS_SECRET_KEY (production needs a live key, sk_live_…)');
+      optional.push('BACHS_SECRET_KEY (production needs a live key, sk_live_…)');
     }
-    // Social sign-in is optional (a provider without credentials is just hidden), but never the fake one.
-    if (config.oauth.driver === 'sandbox') missing.push('OAUTH_DRIVER (sandbox is for development only; use live)');
     for (const [name, secret] of [
       ['JWT_ACCESS_SECRET', config.jwt.accessSecret],
       ['JWT_REFRESH_SECRET', config.jwt.refreshSecret],

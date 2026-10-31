@@ -1,3 +1,4 @@
+import { defaultHomeSections, homeHtml, HOME_SLUG } from '../home';
 import { POLICIES, type Policy, type PolicyBlock } from './policies';
 
 function escape(text: string): string {
@@ -40,7 +41,7 @@ const POLICY_SLUG: Record<string, string> = {
   'safety-tips': 'safety',
 };
 
-export type SeedPage = { slug: string; title: string; summary: string; body: string; order: number };
+export type SeedPage = { slug: string; title: string; summary: string; body: string; sections?: Record<string, unknown>; order: number };
 
 export function defaultPages(): SeedPage[] {
   const policies = POLICIES.map((policy) => ({
@@ -50,7 +51,15 @@ export function defaultPages(): SeedPage[] {
     body: policyHtml(policy),
   }));
   const bySlug = new Map(policies.map((page) => [page.slug, page]));
+  const home = defaultHomeSections();
   const ordered: Omit<SeedPage, 'order'>[] = [
+    {
+      slug: HOME_SLUG,
+      title: 'Home Page',
+      summary: 'The "Why Choose DOOAA?" cards and the FAQ on the storefront landing page.',
+      body: homeHtml(home),
+      sections: home,
+    },
     {
       slug: 'about',
       title: 'About Us',
@@ -77,5 +86,6 @@ export function defaultPages(): SeedPage[] {
     bySlug.get('refunds')!,
     bySlug.get('safety')!,
   ].filter(Boolean);
-  return ordered.map((page, index) => ({ ...page, order: index + 1 }));
+  // Home is 0 so it sorts first without renumbering pages already stored as 1–6.
+  return ordered.map((page, index) => ({ ...page, order: index }));
 }

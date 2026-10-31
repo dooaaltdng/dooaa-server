@@ -214,7 +214,7 @@ export class DisputesService implements OnModuleInit {
           `The buyer of ${order.items[0].title} says: “${input.reason}”`,
           `Payment is on hold. Reply with your side and any evidence within ${settings.responseHours} hours.`,
         ],
-        cta: { label: 'Respond', url: `${this.config.clientUrl}/messages?c=${conversation.id}` },
+        cta: { label: 'Respond', url: `${this.config.platformUrl}/messages?c=${conversation.id}` },
       },
     });
     const alerts = await this.settings.section('notifications');

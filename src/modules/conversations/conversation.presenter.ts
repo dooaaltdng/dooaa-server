@@ -119,6 +119,8 @@ export type ConversationSummary = {
 
 export type ConversationDetail = Omit<ConversationSummary, 'escrow'> & {
   escrow: ConversationEscrow | null;
+  /** Whether escrow is switched on (Settings → Escrow): the chat offers "Buy via Escrow" only then. */
+  escrowEnabled: boolean;
   messages: MessageView[];
   hasMore: boolean;
 };

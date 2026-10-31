@@ -7,6 +7,7 @@ import type { AuthStaff, AuthUser } from '../../common/auth/principal';
 import { DISPUTE_OUTCOMES, DISPUTE_STATES, type DisputeOutcome, type DisputeState } from '../../common/domain';
 import { ToArray, Trim } from '../../common/util/transforms';
 import { DisputesService } from './disputes.service';
+import { RequireFeature } from '../../common/auth/feature.guard';
 
 const URL = { require_tld: false, require_protocol: true };
 
@@ -48,6 +49,7 @@ export class DisputesController {
   constructor(private readonly disputes: DisputesService) {}
 
   /** "Report" from the order or the thread: freezes the payment until DOOAA rules. */
+  @RequireFeature('disputes')
   @Post('orders/:id/dispute')
   open(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() body: OpenDisputeDto) {
     return this.disputes.open(user, id, body);

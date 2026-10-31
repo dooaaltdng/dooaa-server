@@ -54,7 +54,7 @@ export class NotificationsListener implements OnModuleInit {
   }
 
   private clientLink(path: string): string {
-    return `${this.config.clientUrl}${path}`;
+    return `${this.config.platformUrl}${path}`;
   }
 
   private itemsLabel(order: Order): string {

@@ -5,6 +5,7 @@ import { CurrentUser, RequireVerifiedEmail } from '../../common/auth/decorators'
 import type { AuthUser } from '../../common/auth/principal';
 import { ConversationsService } from './conversations.service';
 import { ConversationsQueryDto, MeetupDto, MessagesQueryDto, OfferDto, SendMessageDto, StartConversationDto } from './dto/conversations.dto';
+import { RequireFeature } from '../../common/auth/feature.guard';
 
 @ApiTags('Messages')
 @ApiBearerAuth('user')
@@ -19,6 +20,7 @@ export class ConversationsController {
 
   /** "Message seller" from a listing or a seller page. */
   @RequireVerifiedEmail()
+  @RequireFeature('messaging')
   @Post('conversations')
   start(@CurrentUser() user: AuthUser, @Body() body: StartConversationDto) {
     return this.conversations.start(user, body);
@@ -41,6 +43,7 @@ export class ConversationsController {
   }
 
   @RequireVerifiedEmail()
+  @RequireFeature('messaging')
   @Post('conversations/:id/messages')
   send(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Body() body: SendMessageDto) {
     return this.conversations.send(user, id, body);
@@ -54,6 +57,7 @@ export class ConversationsController {
 
   /** "Make an Offer". */
   @RequireVerifiedEmail()
+  @RequireFeature('offers')
   @Post('conversations/:id/offers')
   offer(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Body() body: OfferDto) {
     return this.conversations.makeOffer(user, id, body);
@@ -72,6 +76,7 @@ export class ConversationsController {
   }
 
   @HttpCode(200)
+  @RequireFeature('offers')
   @Post('offers/:id/counter')
   counter(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Body() body: OfferDto) {
     return this.conversations.counterOffer(user, id, body);
@@ -84,6 +89,7 @@ export class ConversationsController {
   }
 
   /** "Propose a Meetup". */
+  @RequireFeature('meetups')
   @Post('conversations/:id/meetups')
   propose(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Body() body: MeetupDto) {
     return this.conversations.proposeMeetup(user, id, body);

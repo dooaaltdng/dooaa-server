@@ -21,6 +21,7 @@ export type AuthResult = { user: PublicUser; tokens: TokenPair };
 
 type ResetTokenPayload = { sub: string; typ: 'reset'; ver: number };
 
+import { SettingsService } from '../settings/settings.service';
 @Injectable()
 export class AuthService {
   constructor(
@@ -31,6 +32,7 @@ export class AuthService {
     private readonly mail: MailService,
     private readonly jwt: JwtService,
     @InjectConfig() private readonly config: AppConfig,
+    private readonly settings: SettingsService,
   ) {}
 
   /** OTP lookups are keyed by account, whatever channel the code travels on. */
@@ -140,7 +142,7 @@ export class AuthService {
           'Your email is confirmed and your account is ready.',
           'Every purchase on DOOAA can be held in escrow until you confirm the item arrived as described — keep payments and chats on DOOAA so we can protect you.',
         ],
-        cta: { label: 'Start exploring', url: this.config.clientUrl },
+        cta: { label: 'Start exploring', url: this.config.platformUrl },
       });
     }
     await this.users.recordSignIn(user.id);
@@ -234,7 +236,7 @@ export class AuthService {
             'Your email is confirmed and your account is ready.',
             'Every purchase on DOOAA can be held in escrow until you confirm the item arrived as described — keep payments and chats on DOOAA so we can protect you.',
           ],
-          cta: { label: 'Start exploring', url: this.config.clientUrl },
+          cta: { label: 'Start exploring', url: this.config.platformUrl },
         });
       }
       return { verified: true, user: toPublicUser(updated) };
@@ -288,6 +290,7 @@ export class AuthService {
    */
   async setRole(user: AuthUser, role: UserRole): Promise<PublicUser> {
     if (user.role === role) return toPublicUser(await this.users.getById(user.id));
+    if (role === 'seller') await this.settings.requireFeature('selling');
     if (user.role === 'seller' && role === 'buyer') {
       const record = await this.users.getById(user.id);
       if (record.stats.activeListings > 0) {

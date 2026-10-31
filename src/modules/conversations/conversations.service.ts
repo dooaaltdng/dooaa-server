@@ -17,6 +17,7 @@ import { PaymentMethodsService } from '../payments/payment-methods.service';
 import { ProductsService } from '../products/products.service';
 import { SERVER_EVENTS } from '../realtime/realtime.events';
 import { RealtimeService } from '../realtime/realtime.service';
+import { SettingsService } from '../settings/settings.service';
 import { UsersService } from '../users/users.service';
 import { toConversation, type Conversation, type ConversationRow, type Message, type Offer } from './conversation.model';
 import {
@@ -77,6 +78,7 @@ export class ConversationsService implements OnModuleInit {
     private readonly methods: PaymentMethodsService,
     private readonly realtime: RealtimeService,
     private readonly events: EventBus,
+    private readonly settings: SettingsService,
   ) {}
 
   onModuleInit(): void {
@@ -213,7 +215,8 @@ export class ConversationsService implements OnModuleInit {
       ]);
       escrow = toConversationEscrow(order, buyer, seller, payout?.last4);
     }
-    return { ...summary, escrow, messages: thread, hasMore };
+    const escrowEnabled = (await this.settings.section('escrow')).enabled;
+    return { ...summary, escrow, escrowEnabled, messages: thread, hasMore };
   }
 
   /** The order a thread follows, with its items, for the escrow panel. */
@@ -560,7 +563,8 @@ export class ConversationsService implements OnModuleInit {
 
   /**
    * The seller accepts a pending offer, or the buyer accepts the seller's
-   * counter. Either way the agreed price is what escrow checkout charges.
+   * counter. Either way the agreed price is what escrow checkout charges —
+   * or, with escrow off, what the two settle between themselves.
    */
   async acceptOffer(user: AuthUser, offerId: string): Promise<ConversationDetail> {
     const { offer, conversation, role } = await this.offerFor(user, offerId);
@@ -575,7 +579,9 @@ export class ConversationsService implements OnModuleInit {
       senderName: user.firstName,
       kind: 'system',
       systemLead: 'Offer accepted.',
-      body: `${formatNaira(agreed)} was agreed. The buyer can now pay through escrow.`,
+      body: (await this.settings.section('escrow')).enabled
+        ? `${formatNaira(agreed)} was agreed. The buyer can now pay through escrow.`
+        : `${formatNaira(agreed)} was agreed. Arrange payment and delivery with each other here in the chat.`,
     });
     this.events.publish<ConversationOfferEvent>(CONVERSATION_EVENTS.offer, { conversation, offer: updated, action: 'accepted', actorId: user.id, recipientId: role === 'seller' ? offer.buyerId : offer.sellerId });
     return this.detail(user, conversation.id);
