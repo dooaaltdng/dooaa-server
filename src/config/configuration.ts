@@ -90,9 +90,10 @@ export interface AppConfig {
 
 /**
  * Every setting comes from the environment (`.env.local` / `.env.production`);
- * nothing is defaulted in code. A variable that is not declared at all is
- * collected and reported at once, so a missing line in an env file fails the
- * boot instead of silently picking a value.
+ * nothing is defaulted in code. A required variable that is missing or empty
+ * is collected and reported at once, so a missing line fails the boot instead
+ * of silently picking a value. Optional integration keys may be left out:
+ * hosts such as pxxl drop variables with empty values.
  */
 const undeclared: string[] = [];
 
@@ -112,9 +113,9 @@ function str(name: string): string {
   return value;
 }
 
-/** Must be declared, but may be left empty (an integration that is switched off). */
+/** May be missing or empty (an integration that is switched off). */
 function opt(name: string): string | undefined {
-  return raw(name) || undefined;
+  return process.env[name]?.trim() || undefined;
 }
 
 function num(name: string): number {
