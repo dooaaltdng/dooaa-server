@@ -127,13 +127,13 @@ export class AuthService {
     return this.otp.issue({ key: AuthService.otpKey(user.id), purpose, channel: 'email', to: user.email, userId: user.id });
   }
 
-  /** Step 2 for both: a correct code signs the person in (and confirms the email on sign-up). */
   /** The welcome email; it speaks about escrow only while escrow is switched on. */
   private async sendWelcome(email: string, firstName: string): Promise<void> {
     const escrow = (await this.settings.section('escrow')).enabled;
     await this.mail.send(email, welcomeMail(firstName, this.config.platformUrl, escrow));
   }
 
+  /** Step 2 for both: a correct code signs the person in (and confirms the email on sign-up). */
   async verifyCode(input: VerifyCodeDto, meta: SessionMeta): Promise<AuthResult> {
     const user = await this.users.findByEmail(input.email);
     if (!user) throw Errors.badRequest('That code has expired. Request a new one.', 'OTP_EXPIRED');
