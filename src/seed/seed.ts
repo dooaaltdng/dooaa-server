@@ -42,7 +42,7 @@ async function main(): Promise<void> {
     await app.get(ProductsService).officialStore();
     log('Official store account ready (store@dooaa.ng).');
 
-    if (process.env.SEED_DEMO === 'true') {
+    if (config.seed.demo) {
       if (config.env === 'production' && process.env.SEED_DEMO_IN_PRODUCTION !== 'true') {
         throw new Error('Refusing to seed demo data in production (set SEED_DEMO_IN_PRODUCTION=true to override).');
       }
@@ -102,7 +102,7 @@ async function main(): Promise<void> {
           delivery: listing.delivery,
           stock: listing.stock,
           location: listing.location,
-          images: [`${config.clientUrl}${listing.image}`],
+          images: [`${config.platformUrl}${listing.image}`],
           status: 'active',
           featured: Boolean(listing.featured),
           sellerVerified: true,

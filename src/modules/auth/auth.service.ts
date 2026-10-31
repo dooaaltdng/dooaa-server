@@ -142,7 +142,7 @@ export class AuthService {
           'Your email is confirmed and your account is ready.',
           'Every purchase on DOOAA can be held in escrow until you confirm the item arrived as described — keep payments and chats on DOOAA so we can protect you.',
         ],
-        cta: { label: 'Start exploring', url: this.config.clientUrl },
+        cta: { label: 'Start exploring', url: this.config.platformUrl },
       });
     }
     await this.users.recordSignIn(user.id);
@@ -236,7 +236,7 @@ export class AuthService {
             'Your email is confirmed and your account is ready.',
             'Every purchase on DOOAA can be held in escrow until you confirm the item arrived as described — keep payments and chats on DOOAA so we can protect you.',
           ],
-          cta: { label: 'Start exploring', url: this.config.clientUrl },
+          cta: { label: 'Start exploring', url: this.config.platformUrl },
         });
       }
       return { verified: true, user: toPublicUser(updated) };

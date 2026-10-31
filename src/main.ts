@@ -14,7 +14,7 @@ async function bootstrap() {
   app.useLogger(app.get(Logger));
   const config = configureApp(app);
 
-  if (config.env !== 'production' || process.env.SWAGGER_ENABLED === 'true') {
+  if (config.swaggerEnabled) {
     const document = SwaggerModule.createDocument(
       app,
       new DocumentBuilder()

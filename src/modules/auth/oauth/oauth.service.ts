@@ -61,11 +61,11 @@ export class OAuthService {
   /** The client page every outcome lands on. */
   clientRedirect(params: Record<string, string>): string {
     const path = 'error' in params ? '/sign-in' : '/auth/callback';
-    return `${this.config.clientUrl}${path}?${new URLSearchParams(params)}`;
+    return `${this.config.platformUrl}${path}?${new URLSearchParams(params)}`;
   }
 
   redirectUri(provider: OAuthProviderId): string {
-    return `${this.config.appUrl}/api/v1/auth/oauth/${provider}/callback`;
+    return `${this.config.apiUrl}/auth/oauth/${provider}/callback`;
   }
 
   private provider(id: string) {
@@ -203,7 +203,7 @@ export class OAuthService {
         `Your account is ready and you can sign in with ${this.label(provider)}.`,
         'To also sign in with a password, use "Forgot password" on the sign-in page to set one.',
       ],
-      cta: { label: 'Start exploring', url: this.config.clientUrl },
+      cta: { label: 'Start exploring', url: this.config.platformUrl },
     });
     return { user, isNewUser: true };
   }

@@ -74,7 +74,7 @@ export class MeService {
           'If you made this change, there is nothing else to do.',
           'If this was not you, contact DOOAA support straight away so we can secure your account.',
         ],
-        cta: { label: 'Review your profile', url: `${this.config.clientUrl}/settings` },
+        cta: { label: 'Review your profile', url: `${this.config.platformUrl}/settings` },
       });
     }
     return toPublicUser(updated);

@@ -30,7 +30,7 @@ npm run start:prod                     # node dist/main
 
 The server refuses to boot in production when a required secret is missing (database, JWT secrets, Paystack, Cloudinary, SMTP, Termii).
 
-**Paystack setup:** in the dashboard set the webhook URL to `{APP_URL}/api/v1/payments/webhooks/paystack` and disable "OTP for transfers" so seller payouts can be automated.
+**Paystack setup:** in the dashboard set the webhook URL to `{API_URL}/api/v1/payments/webhooks/paystack` and disable "OTP for transfers" so seller payouts can be automated.
 
 ## Scripts
 
