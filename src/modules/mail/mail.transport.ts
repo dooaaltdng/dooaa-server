@@ -65,3 +65,27 @@ export function createSmtpTransport(config: AppConfig['mail']['smtp']): MailTran
     },
   };
 }
+
+/** Sends through Resend's HTTPS API (port 443), for hosts that block outbound SMTP. */
+export function createResendTransport(apiKey: string): MailTransport {
+  return {
+    async sendMail(message) {
+      const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          from: message.from,
+          to: [message.to],
+          subject: message.subject,
+          html: message.html,
+          text: message.text,
+          ...(message.replyTo ? { reply_to: message.replyTo } : {}),
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) throw new Error(`Resend responded ${response.status}: ${(await response.text()).slice(0, 300)}`);
+      return response.json();
+    },
+    close() {},
+  };
+}

@@ -61,6 +61,8 @@ export interface AppConfig {
     from: string;
     supportInbox: string;
     smtp: { host: string; port: number; secure: boolean; user?: string; pass?: string };
+    /** When set, mail goes through Resend's HTTPS API instead of SMTP (pxxl blocks outbound SMTP). */
+    resendApiKey?: string;
   };
   sms: {
     driver: SmsDriver;
@@ -193,6 +195,7 @@ export function loadConfig(): AppConfig {
     mail: {
       from: str('SMTP_FROM'),
       supportInbox: str('SUPPORT_INBOX'),
+      resendApiKey: opt('RESEND_API_KEY'),
       smtp: {
         host: opt('SMTP_HOST') ?? '',
         port: num('SMTP_PORT'),
