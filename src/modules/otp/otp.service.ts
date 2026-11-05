@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { createHash, randomInt, timingSafeEqual } from 'node:crypto';
 import { Errors } from '../../common/api/app-error';
 import type { OtpChannel, OtpPurpose } from '../../common/domain';
@@ -37,6 +37,7 @@ const OTP_LENGTH = 6;
 
 @Injectable()
 export class OtpService {
+  private readonly logger = new Logger(OtpService.name);
   constructor(
     @InjectDb() private readonly db: Database,
     @InjectConfig() private readonly config: AppConfig,
@@ -82,6 +83,7 @@ export class OtpService {
     });
 
     const minutes = Math.round(this.config.otp.ttlSeconds / 60);
+    this.logger.log(`OTP issued (${input.purpose}) via ${input.channel} to ${input.to}`);
     if (input.channel === 'email') {
       void this.mail.send(input.to, otpMail(input.purpose, code, minutes));
     } else {

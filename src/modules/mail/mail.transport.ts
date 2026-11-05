@@ -50,14 +50,13 @@ export function createSmtpTransport(config: AppConfig['mail']['smtp']): MailTran
 
   return {
     async sendMail(message) {
-      transporter ??= build();
+      const current = (transporter ??= build());
       try {
-        return await (await transporter).sendMail(message);
+        return await (await current).sendMail(message);
       } catch (err) {
         // Re-resolve on the next send in case the provider's address changed.
-        const old = transporter;
-        transporter = null;
-        void old.then((t) => t.close()).catch(() => undefined);
+        if (transporter === current) transporter = null;
+        void current.then((t) => t.close()).catch(() => undefined);
         throw err;
       }
     },

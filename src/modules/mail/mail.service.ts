@@ -40,8 +40,10 @@ export class MailService implements OnModuleDestroy {
     for (let attempt = 0; ; attempt += 1) {
       try {
         await this.transport.sendMail(mail);
+        this.logger.log(`Sent the email "${mail.subject}" to ${mail.to}${attempt ? ` (attempt ${attempt + 1})` : ''}`);
         return;
       } catch (error) {
+        this.logger.warn(explain(`Attempt ${attempt + 1} to send "${mail.subject}" to ${mail.to} failed`, error));
         if (attempt >= RETRY_DELAYS_MS.length) {
           this.logger.error(explain(`Could not send the email "${mail.subject}" to ${mail.to} after several tries, so it was dropped`, error));
           return;
