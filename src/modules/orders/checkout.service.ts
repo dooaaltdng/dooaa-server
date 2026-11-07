@@ -1,3 +1,4 @@
+import { NO_BUY_CATEGORIES } from '../products/products.service';
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { randomBytes } from 'node:crypto';
 import { Errors } from '../../common/api/app-error';
@@ -108,6 +109,7 @@ export class CheckoutService implements OnModuleInit {
   async quoteEscrow(user: AuthUser, productId: string, quantity = 1, offerId?: string): Promise<{ productId: string; title: string; image: string | null; seller: string; quote: EscrowQuote }> {
     const product = await this.products.findPublic(productId);
     if (product.sellerId === user.id) throw Errors.forbidden('You cannot buy your own listing.', 'OWN_LISTING');
+    if (NO_BUY_CATEGORIES.includes(product.categoryId)) throw Errors.conflict('Property is arranged by chat: message the agent to book an inspection.', 'CHAT_SELLER');
     const { price } = await this.agreedPrice(user, product, offerId);
     const quote = priceEscrow(price, quantity, await pricingSettings(this.settings));
     return { productId, title: product.title, image: product.images[0] ?? null, seller: product.sellerId, quote };
@@ -240,6 +242,7 @@ export class CheckoutService implements OnModuleInit {
     const quantity = input.quantity ?? 1;
     const product = await this.products.findPublic(input.productId);
     if (product.sellerId === user.id) throw Errors.forbidden('You cannot buy your own listing.', 'OWN_LISTING');
+    if (NO_BUY_CATEGORIES.includes(product.categoryId)) throw Errors.conflict('Property is arranged by chat: message the agent to book an inspection.', 'CHAT_SELLER');
     const { price, offerId } = await this.agreedPrice(user, product, input.offerId);
     const quote = priceEscrow(price, quantity, await pricingSettings(this.settings));
     const window = await this.expiryWindow();

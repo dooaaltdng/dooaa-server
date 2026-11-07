@@ -57,6 +57,11 @@ type ProductPatch = Partial<ProductRow>;
 type HomeRails = { topSellers: Product[]; featured: Product[]; popular: Product[] };
 
 const OFFICIAL_STORE_EMAIL = 'store@dooaa.ng';
+
+/** Never in the cart, even from DOOAA's store: property and vehicles. */
+export const CHAT_ONLY_CATEGORIES = ['properties', 'automative'];
+/** No Buy Now either — arranged by chat and inspection only: property. */
+export const NO_BUY_CATEGORIES = ['properties'];
 const MIN_LISTINGS_FOR_OUTLIER = 5;
 const HOME_KEY = 'catalog:home';
 const HOME_TTL_MS = 60_000;
@@ -253,7 +258,9 @@ export class ProductsService {
    *  - "contact": a marketplace seller while escrow is off (Settings → Escrow
    *    & Fees) — no platform payment; the buyer chats or calls the seller.
    */
-  async purchaseMode(product: Pick<Product, 'listedAs'>): Promise<'direct' | 'escrow' | 'contact'> {
+  async purchaseMode(product: Pick<Product, 'listedAs' | 'categoryId'>): Promise<'direct' | 'escrow' | 'contact'> {
+    // Rentals and property are arranged by chat and inspection, never through a cart.
+    if (NO_BUY_CATEGORIES.includes(product.categoryId)) return 'contact';
     if (product.listedAs !== 'seller') return 'direct';
     return (await this.settings.get()).escrow.enabled ? 'escrow' : 'contact';
   }

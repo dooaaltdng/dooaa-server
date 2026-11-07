@@ -1,3 +1,4 @@
+import { CHAT_ONLY_CATEGORIES } from '../products/products.service';
 import { Injectable } from '@nestjs/common';
 import { Errors } from '../../common/api/app-error';
 import type { AuthUser } from '../../common/auth/principal';
@@ -125,6 +126,7 @@ export class CartService {
   private async assertBuyable(user: AuthUser, productId: string, quantity: number) {
     const product = await this.products.findPublic(productId);
     if (product.sellerId === user.id) throw Errors.forbidden('You cannot buy your own listing.', 'OWN_LISTING');
+    if (CHAT_ONLY_CATEGORIES.includes(product.categoryId)) throw Errors.conflict('Property and vehicles are not bought through the cart: use Buy Now or chat the agent or dealer.', 'CHAT_SELLER');
     if (product.listedAs === 'seller' && !(await this.settings.section('escrow')).enabled) {
       throw Errors.conflict('Chat the seller to buy this item.', 'CHAT_SELLER');
     }
