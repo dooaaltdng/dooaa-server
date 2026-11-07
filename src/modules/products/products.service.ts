@@ -198,6 +198,17 @@ export class ProductsService {
    * Both match the start of any word, including the term's synonyms, so
    * "phone" suggests Gadgets and the Galaxy and Tecno listings.
    */
+  /** Three live listings with a photo, picked at random, for the empty search box. */
+  async randomSuggestions(count = 3): Promise<{ kind: 'product'; id: string; title: string; categoryId: string; image: string | null }[]> {
+    const where = and(PUBLIC_PRODUCT_FILTER, gt(products.stock, 0), { 'images.0': { $exists: true } } as Condition);
+    const total = await this.db.count(products, where);
+    if (!total) return [];
+    const offsets = new Set<number>();
+    while (offsets.size < Math.min(count, total)) offsets.add(Math.floor(Math.random() * total));
+    const rows = await Promise.all([...offsets].map((skip) => this.db.find(products, where, { sort: { id: 1 }, skip, limit: 1 })));
+    return rows.flat().map((row) => ({ kind: 'product' as const, id: row.id, title: row.title, categoryId: row.categoryId, image: row.images[0] ?? null }));
+  }
+
   async suggest(q: string): Promise<{ kind: 'category' | 'product'; id: string; title: string; categoryId: string; image: string | null }[]> {
     const words = expandSearch(q.trim()).split(' ').filter((word) => word.length >= 2).slice(0, 12);
     if (!words.length) return [];
@@ -210,12 +221,13 @@ export class ProductsService {
     const productCategories = new Set(rows.map((row) => row.categoryId));
     const categories = categoryRows
       .filter((category) => typed.test(category.name) || (productCategories.has(category.slug) && rows.filter((row) => row.categoryId === category.slug).length >= 2))
-      .slice(0, 3)
+      .slice(0, 2)
       .map((category) => ({ kind: 'category' as const, id: category.slug, title: category.name, categoryId: category.slug, image: category.image || null }));
+    // Never more than five lines in the dropdown.
     return [
       ...categories,
       ...rows.map((row) => ({ kind: 'product' as const, id: row.id, title: row.title, categoryId: row.categoryId, image: row.images[0] ?? null })),
-    ];
+    ].slice(0, 5);
   }
 
   /** The landing page: category tiles and the three rails. */

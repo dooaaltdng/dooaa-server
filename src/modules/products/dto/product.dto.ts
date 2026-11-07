@@ -55,7 +55,8 @@ export class CatalogQueryDto {
 }
 
 export class SuggestQueryDto {
-  @Trim() @IsString() @MinLength(1) @MaxLength(60) q: string;
+  /** Empty: a few random listings to suggest before the shopper types. */
+  @IsOptional() @Trim() @IsString() @MaxLength(60) q?: string;
 }
 
 /** Accepts the form labels ("Brand New", "Slightly Used") as well as the canonical values. */

@@ -44,7 +44,7 @@ export class CatalogController {
   @RequireFeature('search')
   @Get('products/suggest')
   suggest(@Query() query: SuggestQueryDto) {
-    return this.products.suggest(query.q);
+    return query.q ? this.products.suggest(query.q) : this.products.randomSuggestions();
   }
 
   /** The product page: gallery, specs, seller panel, rating, the latest reviews and related items. */
