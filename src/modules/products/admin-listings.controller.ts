@@ -22,6 +22,7 @@ class AdminListingsQueryDto extends PageQueryDto {
   @IsOptional() @Type(() => Number) @IsNumber() @Min(0) minStock?: number;
   @IsOptional() @Type(() => Number) @IsNumber() @Min(0) maxStock?: number;
   @IsOptional() @IsString() sellerId?: string;
+  @IsOptional() @IsIn(['seller', 'official', 'admin']) listedAs?: 'seller' | 'official' | 'admin';
 }
 
 class ModerateListingDto {

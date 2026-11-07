@@ -67,7 +67,7 @@ export type OrderView = {
 
 export type BuyerOrderView = OrderView & { actions: BuyerAction[] };
 export type SellerOrderView = OrderView & {
-  customer: { id: string; name: string; email: string; phone: string };
+  customer: { id: string; name: string; email: string; phone: string; avatarUrl: string | null };
   /** "One time" or "Escrow payment" in the Type column. */
   kindLabel: 'One time' | 'Escrow payment';
   sellerEarning: number;
@@ -226,6 +226,7 @@ export function toSellerOrderView(order: Order, buyer: User | null, seller: User
       name: buyer ? `${buyer.firstName} ${buyer.lastName}`.trim() : `${order.delivery.firstName} ${order.delivery.lastName}`.trim(),
       email: buyer?.email ?? order.delivery.email,
       phone: buyer?.phone || order.delivery.phone,
+      avatarUrl: buyer?.avatarUrl ?? null,
     },
     kindLabel: order.kind === 'escrow' ? 'Escrow payment' : 'One time',
     sellerEarning: order.sellerEarning,

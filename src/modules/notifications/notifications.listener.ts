@@ -15,6 +15,10 @@ import { WALLET_EVENTS, type PayoutUpdated } from '../wallet/wallet.service';
 import { WISHLIST_EVENTS, type RestockAlert } from '../wishlist/wishlist.service';
 import { NotificationsService } from './notifications.service';
 import { explain } from '../../common/util/explain-error';
+import { InjectDb, type Database } from '../../database/database';
+import { users } from '../../database/schema';
+
+const OFFICIAL_STORE_EMAIL = 'store@dooaa.ng';
 
 const MESSAGE_EMAIL_COOLDOWN_MS = 30 * 60_000;
 
@@ -33,7 +37,15 @@ export class NotificationsListener implements OnModuleInit {
     private readonly realtime: RealtimeService,
     private readonly events: EventBus,
     @InjectConfig() private readonly config: AppConfig,
+    @InjectDb() private readonly db: Database,
   ) {}
+
+  private storeId: string | null = null;
+
+  private async officialStoreId(): Promise<string | null> {
+    if (!this.storeId) this.storeId = (await this.db.findOne(users, { email: OFFICIAL_STORE_EMAIL }))?.id ?? null;
+    return this.storeId;
+  }
 
   onModuleInit(): void {
     this.events.on<OrderUpdated>(ORDER_EVENTS.updated, (event) => this.safe(() => this.onOrder(event)));
@@ -279,7 +291,19 @@ export class NotificationsListener implements OnModuleInit {
 
   private async onMessage({ conversation, message, recipientIds, senderName }: ConversationMessageEvent): Promise<void> {
     if (message.kind === 'system') return;
+    const storeId = await this.officialStoreId();
     for (const recipient of recipientIds) {
+      // Nobody signs in as the official store: its messages go to the console.
+      if (recipient === storeId) {
+        await this.notifications.notifyStaff({
+          type: 'store.message',
+          title: `New message to DOOAA Store from ${senderName}`,
+          body: message.body ? message.body.slice(0, 140) : 'Sent an attachment',
+          tone: 'blue',
+          link: `/official-store?tab=inbox&c=${conversation.id}`,
+        });
+        continue;
+      }
       const role = conversation.buyerId === recipient ? 'buyer' : 'seller';
       // One email per thread and recipient per cooldown, so a busy chat does not flood an inbox.
       const emailNow = !this.realtime.isOnline(recipient) && (await this.cache.claim(`mail-cooldown:message:${conversation.id}:${recipient}`, MESSAGE_EMAIL_COOLDOWN_MS));
@@ -330,6 +354,17 @@ export class NotificationsListener implements OnModuleInit {
   }
 
   private async onListingStatus(event: ProductStatusChanged): Promise<void> {
+    // A seller's listing that lands in the review queue has to reach the
+    // console, or it waits there unseen and buyers never see it.
+    if (event.by !== 'staff' && event.to === 'pending' && event.from !== 'pending') {
+      await this.notifications.notifyStaff({
+        type: 'listing.pending',
+        title: 'Listing awaiting approval',
+        body: `“${event.title}” is waiting for review.`,
+        tone: 'blue',
+        link: `/listings?search=${encodeURIComponent(event.title)}`,
+      });
+    }
     if (event.by === 'seller') return;
     const link = `/seller/products/${event.productId}`;
     const copy: Partial<Record<string, { title: string; body: string; tone: 'blue' | 'green' | 'red' }>> = {

@@ -50,8 +50,8 @@ export function mergeSettings(stored: Partial<Record<SettingsSection, unknown>> 
 
 /** Locks the superadmin row to everything and keeps the elevated verbs off every other row. */
 export function normalizeRoles(value: Record<StaffRole, Permission[]>): Record<StaffRole, Permission[]> {
-  const leaked = (['admin', 'moderator'] as const).flatMap((role) =>
-    value[role].filter((permission) => SUPERADMIN_ONLY.includes(permission)).map((permission) => `${role}: ${permission}`),
+  const leaked = (['admin', 'moderator', 'social'] as const).flatMap((role) =>
+    (value[role] ?? []).filter((permission) => SUPERADMIN_ONLY.includes(permission)).map((permission) => `${role}: ${permission}`),
   );
   if (leaked.length) {
     throw Errors.badRequest(
@@ -63,6 +63,7 @@ export function normalizeRoles(value: Record<StaffRole, Permission[]>): Record<S
     superadmin: [...PERMISSIONS],
     admin: [...new Set(value.admin)],
     moderator: [...new Set(value.moderator)],
+    social: [...new Set(value.social ?? [])],
   };
 }
 

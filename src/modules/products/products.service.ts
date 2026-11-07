@@ -482,6 +482,16 @@ export class ProductsService {
     const product = toProduct(row);
     await this.afterChange(product);
     this.flagIfSuspicious(product);
+    if (product.status === 'pending') {
+      this.events.publish<ProductStatusChanged>(PRODUCT_EVENTS.statusChanged, {
+        productId: product.id,
+        sellerId: product.sellerId,
+        title: product.title,
+        from: 'draft',
+        to: 'pending',
+        by: 'seller',
+      });
+    }
     return toSellerProduct(product, await this.categories.names());
   }
 
@@ -586,6 +596,16 @@ export class ProductsService {
     }))!;
     await this.afterChange(updated);
     this.flagIfSuspicious(updated);
+    if (updated.status === 'pending' && product.status !== 'pending') {
+      this.events.publish<ProductStatusChanged>(PRODUCT_EVENTS.statusChanged, {
+        productId: product.id,
+        sellerId: seller.id,
+        title: updated.title,
+        from: product.status,
+        to: 'pending',
+        by: 'seller',
+      });
+    }
     return toSellerProduct(updated, await this.categories.names());
   }
 
@@ -609,6 +629,7 @@ export class ProductsService {
     minStock?: number;
     maxStock?: number;
     sellerId?: string;
+    listedAs?: 'seller' | 'official' | 'admin';
   }): Promise<Page<AdminListingView>> {
     const search = query.search?.trim();
     const sellerMatches = search
@@ -619,6 +640,7 @@ export class ProductsService {
       query.statuses?.length ? inArray(products.status, query.statuses) : undefined,
       query.categories?.length ? inArray(products.categoryId, query.categories) : undefined,
       query.sellerId && isUuid(query.sellerId) ? eq(products.sellerId, query.sellerId) : undefined,
+      query.listedAs ? eq(products.listedAs, query.listedAs) : undefined,
       query.minPrice !== undefined ? gte(products.price, query.minPrice) : undefined,
       query.maxPrice !== undefined ? lte(products.price, query.maxPrice) : undefined,
       query.minStock !== undefined ? gte(products.stock, query.minStock) : undefined,

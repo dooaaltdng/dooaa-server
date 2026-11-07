@@ -94,7 +94,7 @@ export const CLOSE_REASONS = [
 
 /* --- Staff & permissions ------------------------------------------------- */
 
-export const STAFF_ROLES = ['superadmin', 'admin', 'moderator'] as const;
+export const STAFF_ROLES = ['superadmin', 'admin', 'moderator', 'social'] as const;
 export type StaffRole = (typeof STAFF_ROLES)[number];
 
 export const STAFF_STATUSES = ['invited', 'active', 'disabled'] as const;
@@ -104,6 +104,7 @@ export const STAFF_ROLE_LABEL: Record<StaffRole, string> = {
   superadmin: 'Superadmin',
   admin: 'Admin',
   moderator: 'Moderator',
+  social: 'Social Media Manager',
 };
 
 export const PERMISSIONS = [
@@ -139,6 +140,8 @@ export const DEFAULT_ROLE_PERMISSIONS: RolePermissions = {
     'content.publish',
   ],
   moderator: ['users.suspend', 'listings.moderate', 'disputes.rule'],
+  /** Sees the dashboard, users and listings, and changes nothing. */
+  social: [],
 };
 
 /* --- Catalog ------------------------------------------------------------- */
@@ -368,3 +371,12 @@ export const PRIVATE_MEDIA_PURPOSES: MediaPurpose[] = ['kyc'];
 /** Daily counters are kept for the whole site and per seller. */
 export const STAT_SCOPES = ['site', 'seller'] as const;
 export type StatScope = (typeof STAT_SCOPES)[number];
+
+/**
+ * The Social Media Manager only reads the dashboard, users and listings. Every
+ * other console route answers 403 for that role, whatever the matrix says.
+ */
+export const SOCIAL_ROUTES: { method: string; path: RegExp }[] = [
+  { method: '*', path: /^\/admin\/(auth|notifications)(\/|$)/ },
+  { method: 'GET', path: /^\/admin\/(dashboard|buyers|sellers|listings|categories|search|settings|stats\/(users|listings))(\/|$)/ },
+];

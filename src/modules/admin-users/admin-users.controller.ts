@@ -1,3 +1,4 @@
+import { Errors } from '../../common/api/app-error';
 import { Body, Controller, Get, HttpCode, Param, Patch, Post, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
@@ -5,7 +6,7 @@ import { IsArray, IsEmail, IsIn, IsInt, IsOptional, IsString, Matches, Max, MaxL
 import { UuidPipe } from '../../common/api/uuid.pipe';
 import { CurrentStaff, StaffOnly } from '../../common/auth/decorators';
 import type { AuthStaff } from '../../common/auth/principal';
-import { ACCOUNT_STATUSES, MODERATED_STATUSES, type AccountStatus, type ModeratedStatus } from '../../common/domain';
+import { ACCOUNT_STATUSES, IDENTITY_STATUSES, MODERATED_STATUSES, type AccountStatus, type IdentityStatus, type ModeratedStatus } from '../../common/domain';
 import { PageQueryDto } from '../../common/util/pagination';
 import { ToArray, Trim } from '../../common/util/transforms';
 import { AdminUsersService } from './admin-users.service';
@@ -19,6 +20,7 @@ class UsersQueryDto extends PageQueryDto {
   @IsOptional() @Type(() => Number) @IsInt() @Min(0) maxCount?: number;
   @IsOptional() @ToArray() @IsArray() @IsString({ each: true }) regions?: string[];
   @IsOptional() @ToArray() @IsArray() @IsIn(ACCOUNT_STATUSES, { each: true }) statuses?: AccountStatus[];
+  @IsOptional() @ToArray() @IsArray() @IsIn(IDENTITY_STATUSES, { each: true }) identities?: IdentityStatus[];
 }
 
 class ConsoleSearchDto {
@@ -54,6 +56,13 @@ export class AdminUsersController {
   @Get('search')
   search(@Query() query: ConsoleSearchDto) {
     return this.users.search(query.q ?? '');
+  }
+
+  /** Four headline figures for Users, Listings or Official Store. */
+  @Get('stats/:section')
+  stats(@Param('section') section: string) {
+    if (!['users', 'listings', 'official-store'].includes(section)) throw Errors.notFound('No stats for that page.', 'NOT_FOUND');
+    return this.users.stats(section as 'users' | 'listings' | 'official-store');
   }
 
   @Get('buyers')

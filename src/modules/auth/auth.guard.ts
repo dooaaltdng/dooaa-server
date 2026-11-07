@@ -1,3 +1,4 @@
+import { SOCIAL_ROUTES } from '../../common/domain';
 import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import type { Request } from 'express';
@@ -54,6 +55,11 @@ export class AuthGuard implements CanActivate {
       if (isPublic) return true;
       if (!token) throw Errors.unauthorized('Sign in to the console to continue.');
       request.staff = await this.authenticateStaff(token);
+      if (request.staff.role === 'social') {
+        const path = (request.path ?? '').replace(/^\/api\/v\d+/, '');
+        const allowed = SOCIAL_ROUTES.some((route) => (route.method === '*' || route.method === request.method) && route.path.test(path));
+        if (!allowed) throw Errors.forbidden('Your role does not allow this action.', 'PERMISSION_DENIED');
+      }
       await this.checkPermissions(request.staff, this.meta<Permission[]>(PERMISSIONS_KEY, context));
       return true;
     }

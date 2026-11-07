@@ -458,6 +458,28 @@ export class ConversationsService implements OnModuleInit {
   }
 
   /** DOOAA support speaking in a disputed thread. */
+  /**
+   * The DOOAA official store has no person behind its account, so staff
+   * answer its chats from the console, speaking as the store.
+   */
+  async storeActor(): Promise<AuthUser> {
+    const row = await this.products.officialStore();
+    return {
+      kind: 'user',
+      id: row.id,
+      email: row.email,
+      firstName: row.firstName,
+      lastName: row.lastName,
+      phone: row.phone,
+      role: row.role,
+      emailVerified: true,
+      identity: row.identity,
+      verificationLevel: row.verificationLevel,
+      status: row.status,
+      tokenVersion: row.tokenVersion,
+    };
+  }
+
   async postAdmin(conversationId: string, staff: AuthStaff, body: string, mediaUrl?: string): Promise<Message> {
     const conversation = await this.findById(conversationId);
     if (!conversation) throw Errors.notFound('That conversation does not exist.', 'CONVERSATION_NOT_FOUND');

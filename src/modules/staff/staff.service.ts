@@ -120,7 +120,7 @@ export class StaffService {
   /** The whole team: active and invited members by seniority, then anyone removed (so they can be restored). */
   async list(): Promise<StaffSession[]> {
     const members = await this.db.find(staff, {}, { sort: { createdAt: 1 }, omit: staffOmit });
-    const rank: Record<StaffRole, number> = { superadmin: 0, admin: 1, moderator: 2 };
+    const rank: Record<StaffRole, number> = { superadmin: 0, admin: 1, moderator: 2, social: 3 };
     const removed = (member: StaffMember) => (member.status === 'disabled' ? 1 : 0);
     return members.sort((a, b) => removed(a) - removed(b) || rank[a.role] - rank[b.role]).map((member) => this.session(member));
   }

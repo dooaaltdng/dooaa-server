@@ -1,7 +1,7 @@
 import { Body, Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { UuidPipe } from '../../common/api/uuid.pipe';
-import { CurrentUser, RequireVerifiedEmail } from '../../common/auth/decorators';
+import { CurrentUser, RequireVerifiedEmail, StaffOnly } from '../../common/auth/decorators';
 import type { AuthUser } from '../../common/auth/principal';
 import { ConversationsService } from './conversations.service';
 import { ConversationsQueryDto, MeetupDto, MessagesQueryDto, OfferDto, SendMessageDto, StartConversationDto } from './dto/conversations.dto';
@@ -105,5 +105,44 @@ export class ConversationsController {
   @Post('conversations/:id/meetups/:messageId/decline')
   declineMeetup(@CurrentUser() user: AuthUser, @Param('id', UuidPipe) id: string, @Param('messageId', UuidPipe) messageId: string) {
     return this.conversations.respondToMeetup(user, id, messageId, 'declined');
+  }
+}
+
+/** Console: buyers' chats with the DOOAA Official Store, answered by staff. */
+@ApiTags('Admin · Official store inbox')
+@StaffOnly()
+@Controller('admin/store-inbox')
+export class AdminStoreInboxController {
+  constructor(private readonly conversations: ConversationsService) {}
+
+  @Get()
+  async list(@Query() query: ConversationsQueryDto) {
+    return this.conversations.list(await this.conversations.storeActor(), query);
+  }
+
+  @Get('unread-count')
+  async unread() {
+    return this.conversations.unreadCount((await this.conversations.storeActor()).id);
+  }
+
+  @Get(':id')
+  async detail(@Param('id', UuidPipe) id: string) {
+    return this.conversations.detail(await this.conversations.storeActor(), id);
+  }
+
+  @Get(':id/messages')
+  async messages(@Param('id', UuidPipe) id: string, @Query() query: MessagesQueryDto) {
+    return this.conversations.messagesPage(await this.conversations.storeActor(), id, query);
+  }
+
+  @Post(':id/messages')
+  async send(@Param('id', UuidPipe) id: string, @Body() body: SendMessageDto) {
+    return this.conversations.send(await this.conversations.storeActor(), id, body);
+  }
+
+  @HttpCode(200)
+  @Post(':id/read')
+  async read(@Param('id', UuidPipe) id: string) {
+    return this.conversations.markRead(await this.conversations.storeActor(), id);
   }
 }

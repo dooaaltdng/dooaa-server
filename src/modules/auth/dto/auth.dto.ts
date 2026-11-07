@@ -64,6 +64,10 @@ export class StartSignUpDto {
   @ToLowerTrim() @IsEmail({}, { message: 'Enter a valid email address.' }) @MaxLength(254) email: string;
   @Trim() @IsPhoneNumber() phone: string;
   @IsBoolean() @Equals(true, { message: 'Accept the Terms & conditions to continue.' }) acceptedTerms: boolean;
+  /** DOOAA is for adults only: buyers and sellers enter into contracts. */
+  @IsBoolean() @Equals(true, { message: 'You must be 18 or older to use DOOAA.' }) confirmedAdult: boolean;
+  /** Explicit consent to process personal data (Nigeria Data Protection Act 2023). */
+  @IsBoolean() @Equals(true, { message: 'Agree to how DOOAA uses your data to continue.' }) acceptedDataProcessing: boolean;
 }
 
 export class StartSignInDto {

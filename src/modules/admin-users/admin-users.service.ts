@@ -7,7 +7,7 @@ import { pageWindow, toPage, type Page } from '../../common/util/pagination';
 import { excerpt, normalizeEmail } from '../../common/util/text';
 import { escapeRegex, InjectDb, isUniqueViolation, type Database } from '../../database/database';
 import { and, contains, eq, gte, inArray, isNotNull, isNull, lte, ne, or, type Condition } from '../../database/query';
-import { disputes, messages, orderItems, orders, products, users } from '../../database/schema';
+import { categories, contentPages, conversations, disputes, messages, orderItems, orders, products, staff, users } from '../../database/schema';
 import { AuditService } from '../audit/audit.service';
 import { MailService } from '../mail/mail.service';
 import type { Order } from '../orders/order.model';
@@ -28,6 +28,8 @@ export type UserFilters = {
   maxCount?: number;
   regions?: string[];
   statuses?: AccountStatus[];
+  /** Identity-check state: unverified, pending (uploaded, awaiting review), verified, rejected. */
+  identities?: IdentityStatus[];
 };
 
 type AccountRow = {
@@ -57,6 +59,8 @@ export type ConsoleSearchResults = {
   listings: { id: string; title: string; sellerName: string; status: string; href: string }[];
   transactions: { id: string; reference: string; orderNumber: string; item: string; amount: number; href: string }[];
   disputes: { id: string; reference: string; item: string; state: string; href: string }[];
+  /** Team members, categories, site pages and official-store chats. */
+  more: { id: string; group: string; title: string; detail: string; href: string }[];
 };
 
 type ProfileDispute = { id: string; reference: string; subject: string; orderId: string; status: 'review' | 'resolved' };
@@ -100,6 +104,7 @@ export class AdminUsersService {
       query.statuses?.length ? inArray(users.status, query.statuses) : ne(users.status, 'closed'),
     ];
     if (query.regions?.length) conditions.push(inArray(users.region, query.regions));
+    if (query.identities?.length) conditions.push(inArray(users.identity, query.identities));
     if (query.joinedFrom) conditions.push(gte(users.createdAt, new Date(`${query.joinedFrom}T00:00:00+01:00`)));
     if (query.joinedTo) conditions.push(lte(users.createdAt, new Date(`${query.joinedTo}T23:59:59.999+01:00`)));
     const countColumn = role === 'seller' ? users.statsActiveListings : users.statsPurchases;
@@ -146,11 +151,29 @@ export class AdminUsersService {
     };
   }
 
+  /**
+   * Accounts awaiting an identity review come first, then verified ones, then
+   * everyone who never applied (or was rejected) — newest first inside each.
+   */
   private async page(where: Condition, query: UserFilters): Promise<{ rows: User[]; total: number; window: ReturnType<typeof pageWindow> }> {
-    const total = await this.db.count(users, where);
+    const groups: Condition[] = [eq(users.identity, 'pending'), eq(users.identity, 'verified'), inArray(users.identity, ['unverified', 'rejected'])].map((group) => and(where, group));
+    const counts = await Promise.all(groups.map((group) => this.db.count(users, group)));
+    const total = counts.reduce((sum, count) => sum + count, 0);
     const window = pageWindow(total, query.page, query.limit ?? 7);
-    const rows = await this.db.find(users, where, { sort: { createdAt: -1, id: -1 }, skip: window.skip, limit: window.size, omit: userOmit });
-    return { rows: rows.map(toUser), total, window };
+    const rows: User[] = [];
+    let skip = window.skip;
+    let need = window.size;
+    for (let index = 0; index < groups.length && need > 0; index++) {
+      if (skip >= counts[index]) {
+        skip -= counts[index];
+        continue;
+      }
+      const found = await this.db.find(users, groups[index], { sort: { createdAt: -1, id: -1 }, skip, limit: need, omit: userOmit });
+      rows.push(...found.map(toUser));
+      need -= found.length;
+      skip = 0;
+    }
+    return { rows, total, window };
   }
 
   async listBuyers(query: UserFilters): Promise<Page<BuyerRow>> {
@@ -248,7 +271,7 @@ export class AdminUsersService {
       verificationStatus: verification?.status ?? null,
       verificationId: verification?.id ?? null,
       documents,
-      listings: listings.map((product) => ({ id: product.id, product: product.title, price: product.price, stock: product.stock, status: product.status, dateListed: dayKey(product.publishedAt ?? product.createdAt) })),
+      listings: listings.map((product) => ({ id: product.id, product: product.title, image: product.images[0] ?? null, price: product.price, stock: product.stock, status: product.status, dateListed: dayKey(product.publishedAt ?? product.createdAt) })),
       listingCount,
       sold: sold.map((order) => ({ id: order.id, item: order.items[0]?.title ?? 'Order', orderId: `#${order.reference}`, salePrice: order.total, dateListed: dayKey(order.payment.paidAt ?? order.createdAt) })),
       soldCount,
@@ -387,9 +410,49 @@ export class AdminUsersService {
    * transactions and disputes. Each group is capped, and every hit carries
    * the console route that opens it.
    */
+  /**
+   * The four cards above Users, Listings and Official Store: a figure each,
+   * and how many of them arrived in the last 30 days.
+   */
+  async stats(section: 'users' | 'listings' | 'official-store'): Promise<{ id: string; label: string; value: number; recent: number }[]> {
+    const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const pair = async (table: typeof users | typeof products | typeof conversations, where: Condition) => {
+      const [value, recent] = await Promise.all([this.db.count(table, where), this.db.count(table, and(where, gte(table.createdAt, since)))]);
+      return { value, recent };
+    };
+    const live = isNull(products.deletedAt);
+    if (section === 'users') {
+      const people = ne(users.email, OFFICIAL_STORE_EMAIL);
+      return [
+        { id: 'buyers', label: 'Total Buyers', ...(await pair(users, and(people, ne(users.role, 'seller')))) },
+        { id: 'sellers', label: 'Total Sellers', ...(await pair(users, and(people, eq(users.role, 'seller')))) },
+        { id: 'awaiting', label: 'Awaiting Verification', ...(await pair(users, and(people, eq(users.identity, 'pending')))) },
+        { id: 'verified', label: 'Verified Accounts', ...(await pair(users, and(people, eq(users.identity, 'verified')))) },
+      ];
+    }
+    if (section === 'listings') {
+      return [
+        { id: 'total', label: 'Total Listings', ...(await pair(products, live)) },
+        { id: 'active', label: 'Live Listings', ...(await pair(products, and(live, eq(products.status, 'active')))) },
+        { id: 'pending', label: 'Awaiting Approval', ...(await pair(products, and(live, eq(products.status, 'pending')))) },
+        { id: 'flagged', label: 'Flagged', ...(await pair(products, and(live, inArray(products.status, ['suspicious', 'rejected'])))) },
+      ];
+    }
+    const store = await this.db.findOne(users, { email: OFFICIAL_STORE_EMAIL });
+    const storeId = store?.id ?? '-';
+    const official = and(live, eq(products.listedAs, 'official'));
+    const chats = eq(conversations.sellerId, storeId);
+    return [
+      { id: 'products', label: 'Official Products', ...(await pair(products, official)) },
+      { id: 'live', label: 'Live Products', ...(await pair(products, and(official, eq(products.status, 'active')))) },
+      { id: 'chats', label: 'Conversations', ...(await pair(conversations, chats)) },
+      { id: 'unread', label: 'Awaiting Reply', ...(await pair(conversations, and(chats, gte(conversations.sellerUnread, 1)))) },
+    ];
+  }
+
   async search(raw: string): Promise<ConsoleSearchResults> {
     const term = raw.trim().slice(0, 80);
-    const empty: ConsoleSearchResults = { users: [], listings: [], transactions: [], disputes: [] };
+    const empty: ConsoleSearchResults = { users: [], listings: [], transactions: [], disputes: [], more: [] };
     if (term.length < 2) return empty;
     const bare = escapeRegex(term.replace(/^#/, ''));
     // References match from the start, with or without the leading "#".
@@ -423,6 +486,23 @@ export class AdminUsersService {
         .then((rows) => this.orderService.withItems(rows)),
       this.db.find(disputes, or(startsRef('reference'), startsRef('orderNumber'), contains(disputes.item, term)), { sort: { createdAt: -1 }, limit: 5 }),
     ]);
+
+    const [teamRows, categoryRows, pageRows, store] = await Promise.all([
+      this.db.find(staff, or(contains(staff.firstName, term), contains(staff.lastName, term), contains(staff.email, term)), { limit: 5 }),
+      this.db.find(categories, { name: { $regex: escapeRegex(term), $options: 'i' } } as Condition, { limit: 5 }),
+      this.db.find(contentPages, or(contains(contentPages.title, term), contains(contentPages.slug, term)), { limit: 5 }),
+      this.db.findOne(users, { email: OFFICIAL_STORE_EMAIL }),
+    ]);
+    const chats = store && userRows.length
+      ? await this.db.find(conversations, and(eq(conversations.sellerId, store.id), inArray(conversations.buyerId, userRows.map((row) => row.id))), { limit: 5 })
+      : [];
+    const buyerName = new Map(userRows.map((row) => [row.id, `${row.firstName} ${row.lastName}`.trim()]));
+    const more: ConsoleSearchResults['more'] = [
+      ...teamRows.map((member) => ({ id: `s_${member.id}`, group: 'Team', title: `${member.firstName} ${member.lastName}`.trim(), detail: `${member.email} · ${member.role}`, href: '/team' })),
+      ...categoryRows.map((category) => ({ id: `c_${category.slug}`, group: 'Categories', title: category.name, detail: 'Listing category', href: '/listings?tab=categories' })),
+      ...pageRows.map((page) => ({ id: `p_${page.id}`, group: 'Site content', title: page.title, detail: `/${page.slug}`, href: '/content' })),
+      ...chats.map((chat) => ({ id: `o_${chat.id}`, group: 'Official store', title: `Chat with ${buyerName.get(chat.buyerId) ?? 'buyer'}`, detail: chat.subject?.title ?? 'Official store inbox', href: `/official-store?tab=inbox&c=${chat.id}` })),
+    ];
 
     const sellers = await this.userService.findByIds(listings.map((product) => product.sellerId));
     const sellerName = new Map(sellers.map((seller) => [seller.id, seller.seller.storeName || `${seller.firstName} ${seller.lastName}`]));
@@ -461,6 +541,7 @@ export class AdminUsersService {
         state: dispute.state,
         href: `/disputes?id=${dispute.id}`,
       })),
+      more,
     };
   }
 }

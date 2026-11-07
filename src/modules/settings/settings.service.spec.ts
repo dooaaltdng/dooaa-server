@@ -16,7 +16,7 @@ describe('settings', () => {
   });
 
   it('always gives superadmin every permission', () => {
-    const roles = normalizeRoles({ superadmin: [], admin: ['users.ban'], moderator: [] });
+    const roles = normalizeRoles({ superadmin: [], admin: ['users.ban'], moderator: [], social: [] });
     expect(roles.superadmin).toEqual([...PERMISSIONS]);
     expect(roles.admin).toEqual(['users.ban']);
   });
