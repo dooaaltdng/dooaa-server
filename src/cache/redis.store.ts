@@ -1,17 +1,28 @@
 import { Logger } from '@nestjs/common';
 import Redis from 'ioredis';
 import type { CacheStore } from './cache.store';
+import { MemoryCacheStore } from './memory.store';
 import { explain } from '../common/util/explain-error';
 
 /**
  * The Redis-backed cache store. Commands fail fast while Redis is
  * unreachable (no offline queue), so a Redis outage turns into cache misses
  * instead of hung requests; ioredis keeps reconnecting in the background.
+ * While it is down, reads and writes go to an in-memory store instead, so
+ * caching (and the claim-once guards built on it) keeps working.
  */
 export class RedisCacheStore implements CacheStore {
   private readonly logger = new Logger('Redis');
   private readonly client: Redis;
   private lastErrorLog = 0;
+  private fallback: MemoryCacheStore | null = null;
+
+  /** Redis when it answers, memory otherwise. */
+  private get memory(): MemoryCacheStore | null {
+    if (this.client.status === 'ready') return null;
+    this.fallback ??= new MemoryCacheStore();
+    return this.fallback;
+  }
 
   constructor(url: string, keyPrefix: string) {
     this.client = new Redis(url, {
@@ -21,32 +32,37 @@ export class RedisCacheStore implements CacheStore {
       maxRetriesPerRequest: 1,
       connectTimeout: 5_000,
     });
-    this.client.on('error', (error: Error) => this.logError(explain('Cannot reach Redis (the cache server), so caching is off and requests are served from the database', error)));
+    this.client.on('error', (error: Error) => this.logError(explain('Cannot reach Redis (the cache server); caching in memory until it is back', error)));
     this.client.on('ready', () => this.logger.log('Connected to Redis'));
   }
 
   /** Connects at boot. A failure is logged, not thrown: the app serves from the database meanwhile. */
   async connect(): Promise<void> {
-    await this.client.connect().catch((error: Error) => this.logError(explain('Could not connect to Redis (the cache server) at startup; caching stays off until it reconnects', error)));
+    await this.client.connect().catch((error: Error) => this.logError(explain('Could not connect to Redis (the cache server) at startup; caching in memory until it reconnects', error)));
   }
 
   async get(key: string): Promise<string | null> {
+    if (this.memory) return this.memory.get(key);
     return this.client.get(key);
   }
 
   async set(key: string, value: string, ttlMs: number): Promise<void> {
+    if (this.memory) return this.memory.set(key, value, ttlMs);
     await this.client.set(key, value, 'PX', Math.max(1, Math.round(ttlMs)));
   }
 
   async setIfAbsent(key: string, value: string, ttlMs: number): Promise<boolean> {
+    if (this.memory) return this.memory.setIfAbsent(key, value, ttlMs);
     return (await this.client.set(key, value, 'PX', Math.max(1, Math.round(ttlMs)), 'NX')) === 'OK';
   }
 
   async delete(keys: string[]): Promise<void> {
+    if (this.memory) return this.memory.delete(keys);
     if (keys.length) await this.client.del(...keys);
   }
 
   async ping(): Promise<boolean> {
+    if (this.memory) return true;
     return this.client
       .ping()
       .then((reply) => reply === 'PONG')
@@ -54,6 +70,7 @@ export class RedisCacheStore implements CacheStore {
   }
 
   async close(): Promise<void> {
+    await this.fallback?.close();
     await this.client.quit().catch(() => this.client.disconnect());
   }
 
