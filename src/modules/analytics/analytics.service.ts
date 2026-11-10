@@ -144,6 +144,51 @@ export class AnalyticsService implements OnModuleInit {
     ];
   }
 
+  /**
+   * Analytics page: all users, sellers and buyers — totals, accounts active in
+   * the last 30 days (by last login) and new sign-ups for each of the last six
+   * Lagos months. Same population rules as dashboardMetrics.
+   */
+  async audiences() {
+    const people = { email: { $ne: OFFICIAL_STORE_EMAIL }, status: { $ne: 'closed' } };
+    const groups = [
+      { id: 'all', label: 'All Users', where: people },
+      { id: 'sellers', label: 'Sellers', where: { ...people, role: 'seller' } },
+      { id: 'buyers', label: 'Buyers', where: { ...people, role: { $ne: 'seller' } } },
+    ];
+    const thisMonth = dayKey().slice(0, 7);
+    const months: string[] = [];
+    for (let back = 5; back >= 0; back--) {
+      const d = new Date(`${thisMonth}-01T00:00:00Z`);
+      d.setUTCMonth(d.getUTCMonth() - back);
+      months.push(d.toISOString().slice(0, 7));
+    }
+    const from = new Date(`${months[0]}-01T00:00:00+01:00`);
+    const activeSince = new Date(Date.now() - 30 * 86_400_000);
+    const label = (key: string) => new Date(`${key}-15T00:00:00Z`).toLocaleString('en', { month: 'short', timeZone: 'UTC' });
+
+    return Promise.all(
+      groups.map(async (group) => {
+        const [total, active, rows] = await Promise.all([
+          this.countOf(users, group.where),
+          this.countOf(users, { ...group.where, lastLoginAt: { $gte: activeSince } }),
+          this.db.aggregate<{ _id: string; count: number }>(users, [
+            { $match: { ...group.where, createdAt: { $gte: from } } },
+            { $group: { _id: { $dateToString: { date: '$createdAt', format: '%Y-%m', timezone: TIME_ZONE } }, count: { $sum: 1 } } },
+          ]),
+        ]);
+        const byMonth = new Map(rows.map((row) => [row._id, row.count]));
+        return {
+          id: group.id,
+          label: group.label,
+          total,
+          active,
+          monthly: months.map((key) => ({ month: key, label: label(key), signups: byMonth.get(key) ?? 0 })),
+        };
+      }),
+    );
+  }
+
   /** A trend card: transaction volume or site activity, this period against the last. */
   async trend(id: TrendId, range: '7d' | '30d' | '90d') {
     const { current, previous, previousFrom, to } = buildBuckets(range, new Date());

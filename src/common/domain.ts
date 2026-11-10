@@ -119,6 +119,8 @@ export const PERMISSIONS = [
   'escrow.reverse',
   'content.publish',
   'settings.manage',
+  'analytics.view',
+  'analytics.social',
 ] as const;
 export type Permission = (typeof PERMISSIONS)[number];
 
@@ -138,10 +140,12 @@ export const DEFAULT_ROLE_PERMISSIONS: RolePermissions = {
     'disputes.rule',
     'escrow.release',
     'content.publish',
+    'analytics.view',
+    'analytics.social',
   ],
   moderator: ['users.suspend', 'listings.moderate', 'disputes.rule'],
-  /** Sees the dashboard, users and listings, and changes nothing. */
-  social: [],
+  /** Sees the dashboard, users and listings; on Analytics, views metrics and records social follower counts. */
+  social: ['analytics.view', 'analytics.social'],
 };
 
 /* --- Catalog ------------------------------------------------------------- */
@@ -373,10 +377,13 @@ export const STAT_SCOPES = ['site', 'seller'] as const;
 export type StatScope = (typeof STAT_SCOPES)[number];
 
 /**
- * The Social Media Manager only reads the dashboard, users and listings. Every
+ * The Social Media Manager reads the dashboard, users, listings and analytics,
+ * and records social follower counts. Every
  * other console route answers 403 for that role, whatever the matrix says.
  */
 export const SOCIAL_ROUTES: { method: string; path: RegExp }[] = [
   { method: '*', path: /^\/admin\/(auth|notifications)(\/|$)/ },
+  // Analytics: read the metrics, record social follower counts (still gated by the matrix).
+  { method: '*', path: /^\/admin\/social-metrics(\/|$)/ },
   { method: 'GET', path: /^\/admin\/(dashboard|buyers|sellers|listings|categories|search|settings|stats\/(users|listings))(\/|$)/ },
 ];

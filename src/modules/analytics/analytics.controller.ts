@@ -1,7 +1,7 @@
 import { Body, Controller, Get, HttpCode, Param, Post, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { IsIn, IsOptional, IsString, Matches } from 'class-validator';
-import { CurrentUser, Public, SellerOnly, StaffOnly } from '../../common/auth/decorators';
+import { CurrentUser, Public, RequirePermissions, SellerOnly, StaffOnly } from '../../common/auth/decorators';
 import type { AuthUser } from '../../common/auth/principal';
 import { AnalyticsService, type TrendId } from './analytics.service';
 import { RequireFeature } from '../../common/auth/feature.guard';
@@ -53,6 +53,12 @@ export class AdminDashboardController {
   @Get('metrics')
   metrics() {
     return this.analytics.dashboardMetrics();
+  }
+
+  @RequirePermissions('analytics.view')
+  @Get('audiences')
+  audiences() {
+    return this.analytics.audiences();
   }
 
   @Get('trends/:id')

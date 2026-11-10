@@ -232,3 +232,23 @@ export const visitorDays = table<VisitorDayRow>()('visitor_days', {
   defaults: () => ({ at: new Date() }),
   indexes: [index('visitor_days_visitor_day_key', { visitorId: 1, day: 1 }, { unique: true }), index('visitor_days_at_idx', { at: 1 })],
 });
+
+export const SOCIAL_PLATFORMS = ['x', 'tiktok', 'instagram', 'linkedin', 'facebook'] as const;
+export type SocialPlatform = (typeof SOCIAL_PLATFORMS)[number];
+
+/** A follower count for one of DOOAA's social accounts, entered by staff. One per platform per Lagos day. */
+export type SocialSnapshotRow = Timestamps & {
+  id: string;
+  platform: SocialPlatform;
+  /** YYYY-MM-DD, Lagos. */
+  day: string;
+  followers: number;
+  link: string;
+  handle: string;
+  recordedBy: string;
+};
+
+export const socialSnapshots = table<SocialSnapshotRow>()('social_snapshots', {
+  key: 'id',
+  indexes: [index('social_snapshots_platform_day_key', { platform: 1, day: 1 }, { unique: true })],
+});

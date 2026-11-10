@@ -34,6 +34,7 @@ import { DisputesModule } from './modules/disputes/disputes.module';
 import { ContentModule } from './modules/content/content.module';
 import { AdminUsersModule } from './modules/admin-users/admin-users.module';
 import { AnalyticsModule } from './modules/analytics/analytics.module';
+import { SocialMetricsModule } from './modules/social-metrics/social-metrics.module';
 import { SupportModule } from './modules/support/support.module';
 import { JobsModule } from './modules/jobs/jobs.module';
 import { AccountModule } from './modules/account/account.module';
@@ -115,6 +116,7 @@ const reflector = new Reflector();
     ContentModule,
     AdminUsersModule,
     AnalyticsModule,
+    SocialMetricsModule,
     SupportModule,
     JobsModule,
     AccountModule,
