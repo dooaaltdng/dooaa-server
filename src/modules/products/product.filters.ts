@@ -65,8 +65,7 @@ export function buildCatalogFilter(query: CatalogQuery, mode: SearchMode = 'text
   }
 
   if (query.category?.length) filter.categoryId = { $in: query.category };
-  if (query.collection === 'featured') filter.featured = true;
-  // Top sellers lists everything, best-selling first (see the sort); popular needs a cart add or a sale.
+  // Featured and top sellers list everything, their own products first (see the sort); popular needs a cart add or a sale.
   if (query.collection === 'popular') filter.statsPopularity = { $gt: 0 };
 
   if (query.condition?.length) {
@@ -119,6 +118,7 @@ export function catalogSort(query: CatalogQuery, mode: SearchMode): Sort {
     default:
       break;
   }
+  if (query.collection === 'featured') return { featured: -1, publishedAt: -1, createdAt: -1, _id: -1 };
   if (query.collection === 'top-sellers') return { statsUnitsSold: -1, statsRatingAverage: -1, _id: -1 };
   if (query.collection === 'popular') return { statsPopularity: -1, statsUnitsSold: -1, statsViews: -1, _id: -1 };
   const term = searchTerm(query);

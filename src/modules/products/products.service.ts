@@ -254,12 +254,28 @@ export class ProductsService {
       return { topSellers, featured, popular };
     });
     const [categoryTiles, topSellers, featured, popular] = await Promise.all([
-      this.categories.homeTiles(),
+      this.listedCategoryTiles(),
       this.toCards(rails.topSellers, viewer),
       this.toCards(rails.featured, viewer),
       this.toCards(rails.popular, viewer),
     ]);
     return { categories: categoryTiles, topSellers, featured, popular };
+  }
+
+  /**
+   * Landing "Browse Categories": only visible categories that hold at least one
+   * live, in-stock listing, each pictured by its first listing's first image.
+   */
+  private async listedCategoryTiles(): Promise<{ id: string; name: string; image: string }[]> {
+    const firsts = await this.db.aggregate<{ _id: string; image: string | null }>(products, [
+      { $match: { ...PUBLIC_PRODUCT_FILTER, stock: { $gt: 0 }, 'images.0': { $exists: true } } },
+      { $sort: { createdAt: 1 } },
+      { $group: { _id: '$categoryId', image: { $first: { $arrayElemAt: ['$images', 0] } } } },
+    ]);
+    const imageBySlug = new Map(firsts.map((row) => [row._id, row.image]));
+    return (await this.categories.homeTiles())
+      .filter((tile) => imageBySlug.get(tile.id))
+      .map((tile) => ({ ...tile, image: imageBySlug.get(tile.id)! }));
   }
 
   /**
