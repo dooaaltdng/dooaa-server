@@ -35,6 +35,16 @@ describe('analytics buckets', () => {
     expect(from.toISOString()).toBe('2025-10-31T23:00:00.000Z');
   });
 
+  it('builds this calendar year, Jan to Dec, against last year', () => {
+    const { current, previous, from, previousFrom } = buildBuckets('year', now);
+    expect(current.map((bucket) => bucket.label)).toEqual(['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']);
+    expect(current[0].keys).toEqual(['2026-01']);
+    expect(current.at(-1)!.keys).toEqual(['2026-12']);
+    expect(previous[0].keys).toEqual(['2025-01']);
+    expect(from.toISOString()).toBe('2025-12-31T23:00:00.000Z');
+    expect(previousFrom.toISOString()).toBe('2024-12-31T23:00:00.000Z');
+  });
+
   it('folds values into buckets and computes change', () => {
     const { current } = buildBuckets('90d', now);
     const values = new Map([[current[0].keys[0], 10], [current[0].keys[6], 5.5], [current[3].keys[2], 1]]);

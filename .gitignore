@@ -8,3 +8,6 @@ uploads
 !.env.development.example
 *.tsbuildinfo
 .DS_Store
+
+# City lookup database (DB-IP Lite), downloaded by the server at runtime
+.geo

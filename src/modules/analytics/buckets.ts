@@ -1,6 +1,7 @@
 import { DAY, dayKey } from '../../common/util/dates';
 
-export type RangeId = '7d' | '30d' | '90d' | '12m';
+/** `year` is the calendar year so far (Jan → Dec, later months empty); `12m` is the rolling last twelve months. */
+export type RangeId = '7d' | '30d' | '90d' | '12m' | 'year';
 
 export type Bucket = {
   /** Axis label: "Mon", "23", "W3", "Jan". */
@@ -27,6 +28,21 @@ function monthKeyOf(year: number, month: number): string {
  */
 export function buildBuckets(range: RangeId, now: Date = new Date()): { current: Bucket[]; previous: Bucket[]; from: Date; previousFrom: Date; to: Date } {
   const to = new Date(now.getTime());
+  if (range === 'year') {
+    const year = Number(dayKey(now).slice(0, 4));
+    const months = (y: number): Bucket[] =>
+      Array.from({ length: 12 }, (_, m) => {
+        const sample = new Date(Date.UTC(y, m, 15, 12));
+        return { label: MONTH.format(sample), date: MONTH_LONG.format(sample), keys: [monthKeyOf(y, m)] };
+      });
+    return {
+      current: months(year),
+      previous: months(year - 1),
+      from: new Date(`${year}-01-01T00:00:00+01:00`),
+      previousFrom: new Date(`${year - 1}-01-01T00:00:00+01:00`),
+      to,
+    };
+  }
   if (range === '12m') {
     const [year, month] = dayKey(now).split('-').map(Number);
     const months = (offset: number) =>

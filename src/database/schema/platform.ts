@@ -233,6 +233,47 @@ export const visitorDays = table<VisitorDayRow>()('visitor_days', {
   indexes: [index('visitor_days_visitor_day_key', { visitorId: 1, day: 1 }, { unique: true }), index('visitor_days_at_idx', { at: 1 })],
 });
 
+/**
+ * Site visits per place per Lagos day, for the dashboard map. Places come from
+ * the visitor's IP (DB-IP Lite city database); the IP itself is never stored.
+ */
+export type VisitLocationRow = Timestamps & {
+  id: string;
+  /** YYYY-MM-DD. */
+  day: string;
+  /** Two-letter ISO country code, e.g. "NG". */
+  countryCode: string;
+  country: string;
+  city: string;
+  region: string | null;
+  lat: number;
+  lng: number;
+  visits: number;
+};
+
+export const visitLocations = table<VisitLocationRow>()('visit_locations', {
+  key: 'id',
+  defaults: () => ({ visits: 0 }),
+  nullable: ['region'],
+  indexes: [index('visit_locations_day_place_key', { day: 1, countryCode: 1, city: 1 }, { unique: true })],
+});
+
+/** Site visits per traffic source (Google, Instagram, Direct…) per Lagos day; one per visitor per day. */
+export type TrafficSourceRow = Timestamps & {
+  id: string;
+  /** YYYY-MM-DD. */
+  day: string;
+  /** See modules/analytics/traffic.ts. */
+  source: string;
+  visits: number;
+};
+
+export const trafficSources = table<TrafficSourceRow>()('traffic_sources', {
+  key: 'id',
+  defaults: () => ({ visits: 0 }),
+  indexes: [index('traffic_sources_day_source_key', { day: 1, source: 1 }, { unique: true })],
+});
+
 export const SOCIAL_PLATFORMS = ['x', 'tiktok', 'instagram', 'linkedin', 'facebook'] as const;
 export type SocialPlatform = (typeof SOCIAL_PLATFORMS)[number];
 

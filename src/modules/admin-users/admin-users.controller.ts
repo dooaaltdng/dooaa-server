@@ -65,6 +65,12 @@ export class AdminUsersController {
     return this.users.stats(section as 'users' | 'listings' | 'official-store');
   }
 
+  /** Sidebar badge counts: items waiting on staff in each section. */
+  @Get('pending')
+  pending() {
+    return this.users.pending();
+  }
+
   @Get('buyers')
   buyers(@Query() query: UsersQueryDto) {
     return this.users.listBuyers(query);

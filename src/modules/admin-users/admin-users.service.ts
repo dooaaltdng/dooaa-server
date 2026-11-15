@@ -7,7 +7,7 @@ import { pageWindow, toPage, type Page } from '../../common/util/pagination';
 import { excerpt, normalizeEmail } from '../../common/util/text';
 import { escapeRegex, InjectDb, isUniqueViolation, type Database } from '../../database/database';
 import { and, contains, eq, gte, inArray, isNotNull, isNull, lte, ne, or, type Condition } from '../../database/query';
-import { categories, contentPages, conversations, disputes, messages, orderItems, orders, products, staff, users } from '../../database/schema';
+import { categories, contentPages, conversations, disputes, messages, orderItems, orders, payouts, products, staff, users } from '../../database/schema';
 import { AuditService } from '../audit/audit.service';
 import { MailService } from '../mail/mail.service';
 import type { Order } from '../orders/order.model';
@@ -448,6 +448,25 @@ export class AdminUsersService {
       { id: 'chats', label: 'Conversations', ...(await pair(conversations, chats)) },
       { id: 'unread', label: 'Awaiting Reply', ...(await pair(conversations, and(chats, gte(conversations.sellerUnread, 1)))) },
     ];
+  }
+
+  /**
+   * The sidebar's red counts: what is waiting on staff in each section.
+   * Users = IDs awaiting review, Items = listings awaiting approval or
+   * flagged suspicious and not yet approved/rejected,
+   * Disputes = open disputes, Payments = failed payouts to retry,
+   * Official Store = chats awaiting a reply.
+   */
+  async pending(): Promise<{ users: number; listings: number; disputes: number; payments: number; officialStore: number }> {
+    const store = await this.db.findOne(users, { email: OFFICIAL_STORE_EMAIL });
+    const [awaitingId, awaitingApproval, openDisputes, failedPayouts, awaitingReply] = await Promise.all([
+      this.db.count(users, and(ne(users.email, OFFICIAL_STORE_EMAIL), eq(users.identity, 'pending'))),
+      this.db.count(products, and(isNull(products.deletedAt), inArray(products.status, ['pending', 'suspicious']))),
+      this.db.count(disputes, ne(disputes.state, 'completed')),
+      this.db.count(payouts, eq(payouts.status, 'failed')),
+      store ? this.db.count(conversations, and(eq(conversations.sellerId, store.id), gte(conversations.sellerUnread, 1))) : Promise.resolve(0),
+    ]);
+    return { users: awaitingId, listings: awaitingApproval, disputes: openDisputes, payments: failedPayouts, officialStore: awaitingReply };
   }
 
   async search(raw: string): Promise<ConsoleSearchResults> {

@@ -8,6 +8,7 @@ import { users, type UserRow } from '../../database/schema';
 import { PrincipalService } from '../auth/principal.service';
 import { TokenService } from '../auth/token.service';
 import { toUser, userOmit, type User } from './user.model';
+import { RealtimeService } from '../realtime/realtime.service';
 
 export type NewUser = {
   firstName: string;
@@ -26,6 +27,7 @@ export class UsersService {
     @InjectDb() private readonly db: Database,
     private readonly principals: PrincipalService,
     private readonly tokens: TokenService,
+    private readonly realtime: RealtimeService,
   ) {}
 
   async findById(id: string): Promise<User | null> {
@@ -100,6 +102,8 @@ export class UsersService {
         termsAcceptedAt: now,
         privacyAcceptedAt: now,
       });
+      // The dashboard's Recent Registrations list refreshes on this.
+      this.realtime.toAllStaff('user:registered', { id: row.id });
       return toUser(row);
     } catch (error) {
       if (isUniqueViolation(error, 'users_email_key')) {
