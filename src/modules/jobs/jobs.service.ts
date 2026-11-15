@@ -4,7 +4,7 @@ import { DAY } from '../../common/util/dates';
 import { InjectConfig } from '../../config/config.module';
 import type { AppConfig } from '../../config/configuration';
 import { InjectDb, type Database } from '../../database/database';
-import { conversations, notifications, otps, providerEvents, sessions, users, visitorDays } from '../../database/schema';
+import { conversations, notifications, otps, products, providerEvents, sessions, users, visitorDays } from '../../database/schema';
 import { MailService } from '../mail/mail.service';
 import { messageReminderMail } from '../mail/mail.templates';
 import { OrdersService } from '../orders/orders.service';
@@ -12,7 +12,10 @@ import { PaymentsService } from '../payments/payments.service';
 import { SettingsService } from '../settings/settings.service';
 import { explain } from '../../common/util/explain-error';
 
-type JobName = 'payments' | 'escrow' | 'housekeeping' | 'reminders';
+type JobName = 'payments' | 'escrow' | 'housekeeping' | 'reminders' | 'listings';
+
+/** A listing awaiting approval this long gets the console's alert address one email. */
+const LISTING_ALERT_AFTER_MS = 2 * 60 * 60_000;
 
 /** A message unread this long earns its recipient one email; older threads are left alone. */
 const REMIND_AFTER_MS = 10 * 60_000;
@@ -53,7 +56,8 @@ export class JobsService implements OnApplicationBootstrap, OnModuleDestroy {
     this.every('escrow', 10 * 60_000);
     this.every('housekeeping', 60 * 60_000);
     this.every('reminders', 60_000);
-    this.logger.log('Background jobs scheduled (reminders every minute, payments every 5 min, escrow every 10 min, housekeeping hourly)');
+    this.every('listings', 10 * 60_000);
+    this.logger.log('Background jobs scheduled (reminders every minute, payments every 5 min, escrow and overdue listings every 10 min, housekeeping hourly)');
   }
 
   private every(name: JobName, ms: number): void {
@@ -75,6 +79,58 @@ export class JobsService implements OnApplicationBootstrap, OnModuleDestroy {
     const released = await this.orders.autoRelease(now);
     const cancelled = await this.orders.cancelOverdue(now);
     return { released, cancelled };
+  }
+
+  /**
+   * Emails the console's alert address (Settings → notifications,
+   * dooaaltd@gmail.com by default) about listings that have waited more than
+   * 2 hours for approval: one digest per run, each listing alerted once until
+   * it is resubmitted. Claiming a listing is a conditional update, so two
+   * instances never both send it.
+   */
+  async listingsJob(now = new Date()): Promise<{ alerted: number }> {
+    const cutoff = new Date(now.getTime() - LISTING_ALERT_AFTER_MS);
+    const due = await this.db.find(
+      products,
+      {
+        status: 'pending',
+        deletedAt: null,
+        pendingAlertedAt: null,
+        // Listings queued before the clock existed fall back to when they were created.
+        $or: [{ pendingSince: { $lte: cutoff } }, { pendingSince: null, createdAt: { $lte: cutoff } }],
+      } as never,
+      { sort: { createdAt: 1 }, limit: 50 },
+    );
+    const claimed: typeof due = [];
+    for (const row of due) {
+      const won = await this.db.update(products, { id: row.id, pendingAlertedAt: null }, { pendingAlertedAt: now });
+      if (won) claimed.push(row);
+    }
+    if (!claimed.length) return { alerted: 0 };
+
+    const to = (await this.settings.section('notifications')).pendingListingEmail;
+    if (!to) return { alerted: 0 };
+    const sellers = await this.db.find(users, { id: { $in: [...new Set(claimed.map((row) => row.sellerId))] } } as never);
+    const nameOf = new Map(sellers.map((user) => [user.id, `${user.firstName} ${user.lastName}`.trim() || user.email]));
+    const waited = (row: (typeof claimed)[number]) => {
+      const hours = Math.floor((now.getTime() - (row.pendingSince ?? row.createdAt).getTime()) / (60 * 60_000));
+      return hours >= 24 ? `${Math.floor(hours / 24)}d ${hours % 24}h` : `${hours}h`;
+    };
+    const count = claimed.length;
+    const admin = this.config.adminUrl.replace(/\/$/, '');
+    await this.mail.send(to, {
+      subject: `${count} listing${count === 1 ? '' : 's'} waiting over 2 hours for approval`,
+      preheader: 'Sellers are waiting — review them in the console.',
+      heading: count === 1 ? 'A listing is waiting for approval' : `${count} listings are waiting for approval`,
+      paragraphs: [
+        `These listings have been awaiting approval for more than 2 hours:`,
+        ...claimed.map((row) => `• “${row.title}” — by ${nameOf.get(row.sellerId) ?? 'a seller'} (waiting ${waited(row)})`),
+        'Approve or reject them so the sellers know where they stand.',
+      ],
+      cta: { label: 'Review listings', url: `${admin}/listings` },
+    });
+    this.logger.log(`Overdue listings: emailed ${to} about ${count}`);
+    return { alerted: count };
   }
 
   /** Deletes what has expired: sessions, codes and grants past their expiry, and old activity rows. */
@@ -144,7 +200,9 @@ export class JobsService implements OnApplicationBootstrap, OnModuleDestroy {
             ? await this.escrowJob()
             : name === 'reminders'
               ? await this.remindersJob()
-              : await this.housekeepingJob();
+              : name === 'listings'
+                ? await this.listingsJob()
+                : await this.housekeepingJob();
       this.logger.debug(`Job ${name}: ${JSON.stringify(result)}`);
       return result;
     } catch (error) {

@@ -67,6 +67,8 @@ export type NotificationSettings = {
   highValueTransaction: boolean;
   kycSubmission: boolean;
   highValueThreshold: number;
+  /** Emailed when a listing has waited more than 2 hours for approval. */
+  pendingListingEmail: string;
 };
 
 /** Checkout and payout knobs the console did not draw but the money flows need. */
@@ -189,6 +191,7 @@ export function defaultSettings(): PlatformSettings {
       highValueTransaction: true,
       kycSubmission: true,
       highValueThreshold: 1_000_000,
+      pendingListingEmail: 'dooaaltd@gmail.com',
     },
     roles: structuredClone(DEFAULT_ROLE_PERMISSIONS),
     commerce: {

@@ -61,6 +61,10 @@ export type ProductRow = Timestamps & {
   statsRatingAverage: number;
   statsRatingCount: number;
   publishedAt: Date | null;
+  /** When the listing last went to "awaiting approval" (null while it isn't). */
+  pendingSince: Date | null;
+  /** When the console was emailed that it has waited too long; cleared each time it is resubmitted. */
+  pendingAlertedAt: Date | null;
   deletedAt: Date | null;
 };
 
@@ -102,6 +106,8 @@ export const products = table<ProductRow>()('products', {
     'moderationReviewedAt',
     'statsLastSaleAt',
     'publishedAt',
+    'pendingSince',
+    'pendingAlertedAt',
     'deletedAt',
   ],
   indexes: [

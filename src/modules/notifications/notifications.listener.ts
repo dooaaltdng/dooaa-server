@@ -16,7 +16,7 @@ import { WISHLIST_EVENTS, type RestockAlert } from '../wishlist/wishlist.service
 import { NotificationsService } from './notifications.service';
 import { explain } from '../../common/util/explain-error';
 import { InjectDb, type Database } from '../../database/database';
-import { users } from '../../database/schema';
+import { products, users } from '../../database/schema';
 
 const OFFICIAL_STORE_EMAIL = 'store@dooaa.ng';
 
@@ -354,6 +354,12 @@ export class NotificationsListener implements OnModuleInit {
   }
 
   private async onListingStatus(event: ProductStatusChanged): Promise<void> {
+    // Starts (or restarts) the 2-hour approval clock the jobs runner watches.
+    if (event.to === 'pending') {
+      await this.db.update(products, { id: event.productId }, { pendingSince: new Date(), pendingAlertedAt: null });
+    } else if (event.from === 'pending') {
+      await this.db.update(products, { id: event.productId }, { pendingSince: null });
+    }
     // A seller's listing that lands in the review queue has to reach the
     // console, or it waits there unseen and buyers never see it.
     if (event.by !== 'staff' && event.to === 'pending' && event.from !== 'pending') {
@@ -376,7 +382,29 @@ export class NotificationsListener implements OnModuleInit {
     };
     const entry = copy[event.to];
     if (!entry) return;
-    await this.notifications.notifyUser(event.sellerId, { type: `listing.${event.to}`, ...entry, link });
+    // An approval is also emailed, always: sellers shouldn't have to check the bell to know they're live.
+    const approved = event.to === 'active' && event.by === 'staff';
+    const listingUrl = `${this.config.platformUrl.replace(/\/$/, '')}/products/${event.productId}`;
+    await this.notifications.notifyUser(event.sellerId, {
+      type: `listing.${event.to}`,
+      ...entry,
+      link,
+      ...(approved
+        ? {
+            category: 'transactional' as const,
+            email: {
+              subject: `Your listing “${event.title}” is now live on DOOAA`,
+              preheader: 'It has been approved and buyers can see it now.',
+              heading: 'Your listing has been approved',
+              paragraphs: [
+                `Good news — “${event.title}” has been reviewed and approved by the DOOAA team. It is now live and visible to buyers.`,
+                'Buyers can find it, chat with you and make offers. Keep an eye on your messages so you can reply quickly.',
+              ],
+              cta: { label: 'View your listing', url: listingUrl },
+            },
+          }
+        : {}),
+    });
   }
 
   private async onRestock(event: RestockAlert): Promise<void> {

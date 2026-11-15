@@ -2,9 +2,11 @@ import {
   ArrayUnique,
   IsArray,
   IsBoolean,
+  IsEmail,
   IsIn,
   IsNumber,
   IsObject,
+  IsOptional,
   IsString,
   Matches,
   Max,
@@ -47,6 +49,8 @@ export class NotificationSettingsDto {
   @IsBoolean() highValueTransaction: boolean;
   @IsBoolean() kycSubmission: boolean;
   @IsNumber() @Min(0) highValueThreshold: number;
+  /** Older consoles don't send it; the stored value (or the default) is kept. */
+  @IsOptional() @IsEmail() pendingListingEmail?: string;
 }
 
 export class RolesSettingsDto {

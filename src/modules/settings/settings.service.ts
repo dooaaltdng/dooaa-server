@@ -120,6 +120,11 @@ export class SettingsService {
     }
 
     const before = await this.section(key);
+    // Consoles that don't know the overdue-listing address yet keep the stored one.
+    if (key === 'notifications') {
+      const notes = next as PlatformSettings['notifications'];
+      if (!notes.pendingListingEmail) notes.pendingListingEmail = (before as PlatformSettings['notifications']).pendingListingEmail;
+    }
     await this.db.upsert(settingsTable, { id: RECORD_ID }, { $set: { [`values.${key}`]: next, updatedBy: actor.id } });
     await this.cache.delete(CACHE_KEY);
 
