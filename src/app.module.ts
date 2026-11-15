@@ -21,6 +21,7 @@ import { PaymentsModule } from './modules/payments/payments.module';
 import { ProductsModule } from './modules/products/products.module';
 import { WishlistModule } from './modules/wishlist/wishlist.module';
 import { CouponsModule } from './modules/coupons/coupons.module';
+import { RoadmapModule } from './modules/roadmap/roadmap.module';
 import { CartModule } from './modules/cart/cart.module';
 import { WalletModule } from './modules/wallet/wallet.module';
 import { OrdersModule } from './modules/orders/orders.module';
@@ -103,6 +104,7 @@ const reflector = new Reflector();
     ProductsModule,
     WishlistModule,
     CouponsModule,
+    RoadmapModule,
     CartModule,
     WalletModule,
     OrdersModule,

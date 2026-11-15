@@ -274,6 +274,27 @@ export const trafficSources = table<TrafficSourceRow>()('traffic_sources', {
   indexes: [index('traffic_sources_day_source_key', { day: 1, source: 1 }, { unique: true })],
 });
 
+/** A stop on the console's roadmap ("Phase 1", "Phase 2"…), in road order. */
+export type RoadmapGoal = { id: string; text: string; done: boolean };
+
+export type RoadmapPhaseRow = Timestamps & {
+  id: string;
+  label: string;
+  /** One line under the name, e.g. "Live in Q2–Q3 '26". */
+  description: string;
+  /** The checklist in the phase's card. */
+  goals: RoadmapGoal[];
+  /** 0-based order along the road. */
+  position: number;
+};
+
+export const roadmapPhases = table<RoadmapPhaseRow>()('roadmap_phases', {
+  key: 'id',
+  defaults: () => ({ description: '', goals: [] as RoadmapGoal[] }),
+  // Unique, so two first loads at once can't both seed Phase 1–3.
+  indexes: [index('roadmap_phases_position_key', { position: 1 }, { unique: true })],
+});
+
 export const SOCIAL_PLATFORMS = ['x', 'tiktok', 'instagram', 'linkedin', 'facebook'] as const;
 export type SocialPlatform = (typeof SOCIAL_PLATFORMS)[number];
 
