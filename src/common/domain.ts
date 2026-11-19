@@ -121,6 +121,8 @@ export const PERMISSIONS = [
   'settings.manage',
   'analytics.view',
   'analytics.social',
+  'blog.write',
+  'blog.moderate',
 ] as const;
 export type Permission = (typeof PERMISSIONS)[number];
 
@@ -142,10 +144,12 @@ export const DEFAULT_ROLE_PERMISSIONS: RolePermissions = {
     'content.publish',
     'analytics.view',
     'analytics.social',
+    'blog.write',
+    'blog.moderate',
   ],
-  moderator: ['users.suspend', 'listings.moderate', 'disputes.rule'],
-  /** Sees the dashboard, users and listings; on Analytics, views metrics and records social follower counts. */
-  social: ['analytics.view', 'analytics.social'],
+  moderator: ['users.suspend', 'listings.moderate', 'disputes.rule', 'blog.moderate'],
+  /** Sees the dashboard, users and listings; on Analytics, views metrics and records social follower counts; writes the blog. */
+  social: ['analytics.view', 'analytics.social', 'blog.write'],
 };
 
 /* --- Catalog ------------------------------------------------------------- */
@@ -378,12 +382,47 @@ export type StatScope = (typeof STAT_SCOPES)[number];
 
 /**
  * The Social Media Manager reads the dashboard, users, listings and analytics,
- * and records social follower counts. Every
+ * records social follower counts and, when the matrix allows, writes the blog. Every
  * other console route answers 403 for that role, whatever the matrix says.
  */
 export const SOCIAL_ROUTES: { method: string; path: RegExp }[] = [
   { method: '*', path: /^\/admin\/(auth|notifications)(\/|$)/ },
   // Analytics: read the metrics, record social follower counts (still gated by the matrix).
   { method: '*', path: /^\/admin\/social-metrics(\/|$)/ },
+  // The blog: write articles and look after their comments (still gated by the matrix), and upload their images.
+  { method: '*', path: /^\/admin\/blog(\/|$)/ },
+  { method: 'POST', path: /^\/admin\/media(\/uploads(\/confirm)?)?$/ },
   { method: 'GET', path: /^\/admin\/(dashboard|buyers|sellers|listings|categories|search|settings|stats\/(users|listings))(\/|$)/ },
 ];
+
+/* --- Blog ---------------------------------------------------------------- */
+
+/** Stored status. A published article whose date is still ahead reads as "scheduled". */
+export const BLOG_STATUSES = ['draft', 'published'] as const;
+export type BlogStatus = (typeof BLOG_STATUSES)[number];
+/** What the console shows. */
+export type BlogState = 'draft' | 'scheduled' | 'published';
+
+export const BLOG_CATEGORIES = ['buying-tips', 'selling-tips', 'safety', 'payments', 'guides', 'news', 'stories'] as const;
+export type BlogCategory = (typeof BLOG_CATEGORIES)[number];
+export const BLOG_CATEGORY_LABEL: Record<BlogCategory, string> = {
+  'buying-tips': 'Buying Tips',
+  'selling-tips': 'Selling Tips',
+  safety: 'Safety',
+  payments: 'Payments',
+  guides: 'Guides',
+  news: 'Company News',
+  stories: 'Stories',
+};
+
+/** The paper colour of the article page — the editor's "Theme Style" swatches. */
+export const BLOG_THEMES = ['default', 'sky', 'mint', 'sand', 'gradient'] as const;
+export type BlogTheme = (typeof BLOG_THEMES)[number];
+
+/** Body text size (px) and line spacing, set with the editor's Size and Spacing sliders. */
+export const BLOG_TEXT_SIZE = { min: 15, max: 21, default: 17 } as const;
+export const BLOG_LINE_SPACING = { min: 1.4, max: 2, default: 1.7 } as const;
+
+export const BLOG_MAX_TAGS = 5;
+/** Replies nest this deep (0 is a top-level comment); a reply to the deepest level joins it as a sibling. */
+export const BLOG_MAX_COMMENT_DEPTH = 2;

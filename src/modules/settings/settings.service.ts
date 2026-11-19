@@ -116,7 +116,10 @@ export class SettingsService {
       if (actor.role !== 'superadmin') {
         throw Errors.forbidden('Only a superadmin can change what each role may do.', 'SUPERADMIN_REQUIRED');
       }
-      next = normalizeRoles(next as PlatformSettings['roles']) as PlatformSettings[K];
+      const roles = next as PlatformSettings['roles'];
+      // A console that doesn't know the Social Media Manager keeps that row as stored.
+      if (!roles.social) roles.social = (await this.section('roles')).social ?? [];
+      next = normalizeRoles(roles) as PlatformSettings[K];
     }
 
     const before = await this.section(key);

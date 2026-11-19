@@ -113,8 +113,9 @@ Full, interactive reference: **`/docs`** (Swagger; JSON at `/docs/json`).
 - **Seller** `/seller/summary`, `/seller/products/*`, `/seller/orders/*`, `/seller/earnings`, `/seller/payouts`, `/seller/reviews`, `/seller/analytics`
 - **Messages** `/conversations/*`, `/offers/:id/(accept|decline|counter|withdraw)`, meetups
 - **Disputes** `/disputes`, `/disputes/:id(/respond)`
+- **Blog** `/blog/articles` (newest first; `featured`, `offset`, `q` search, `tag`), `/blog/articles/:slug` (old slugs answer with `moved`), `…/engagement`, `…/like`, `…/comments` (threaded; replies nest two deep), `/blog/comments/:id(/like)`, `/blog/articles/:slug/views` + `/blog/views/:id/read` (read beacon, accepts `text/plain`), `/blog/categories`, `/blog/tags`, `/blog/sitemap`
 - **Other** `/notifications/*`, `/content/:slug`, `/support/tickets`, `/analytics/visit`, `/settings/public`, `/health`
-- **Console** `/admin/auth/*`, `/admin/dashboard/*`, `/admin/buyers`, `/admin/sellers`, `/admin/users/:id/status`, `/admin/verifications/*`, `/admin/listings/*`, `/admin/categories`, `/admin/escrows/*`, `/admin/payouts/*`, `/admin/disputes/*`, `/admin/content/*`, `/admin/settings/*`, `/admin/staff/*`, `/admin/audit`, `/admin/notifications/*`, `/admin/coupons`, `/admin/reviews/:id`, `/admin/support/tickets`, `/admin/media`, `/admin/system/jobs/run`
+- **Console** `/admin/auth/*`, `/admin/dashboard/*`, `/admin/buyers`, `/admin/sellers`, `/admin/users/:id/status`, `/admin/verifications/*`, `/admin/listings/*`, `/admin/categories`, `/admin/escrows/*`, `/admin/payouts/*`, `/admin/disputes/*`, `/admin/content/*`, `/admin/settings/*`, `/admin/staff/*`, `/admin/audit`, `/admin/notifications/*`, `/admin/coupons`, `/admin/reviews/:id`, `/admin/support/tickets`, `/admin/media`, `/admin/system/jobs/run`, `/admin/blog/*` (meta, overview, calendar, articles: create/edit/publish/unpublish/trash/restore/permanent, comments: reply/remove — gated by the `blog.write` and `blog.moderate` permissions)
 
 ## Layout
 

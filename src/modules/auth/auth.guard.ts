@@ -5,6 +5,7 @@ import type { Request } from 'express';
 import { Errors } from '../../common/api/app-error';
 import {
   ALLOW_RESTRICTED,
+  ANY_PERMISSIONS_KEY,
   AUTH_MODE,
   IS_PUBLIC,
   PERMISSIONS_KEY,
@@ -61,6 +62,7 @@ export class AuthGuard implements CanActivate {
         if (!allowed) throw Errors.forbidden('Your role does not allow this action.', 'PERMISSION_DENIED');
       }
       await this.checkPermissions(request.staff, this.meta<Permission[]>(PERMISSIONS_KEY, context));
+      await this.checkAnyPermission(request.staff, this.meta<Permission[]>(ANY_PERMISSIONS_KEY, context));
       return true;
     }
 
@@ -119,6 +121,14 @@ export class AuthGuard implements CanActivate {
       throw Errors.unauthorized('Your console session has ended. Sign in again.', 'SESSION_REVOKED');
     }
     return staff;
+  }
+
+  private async checkAnyPermission(staff: AuthStaff, accepted?: Permission[]): Promise<void> {
+    if (!accepted?.length) return;
+    const held = await this.settings.permissionsFor(staff.role);
+    if (!accepted.some((permission) => held.includes(permission))) {
+      throw Errors.forbidden('Your role does not allow this action.', 'PERMISSION_DENIED');
+    }
   }
 
   private async checkPermissions(staff: AuthStaff, required?: Permission[]): Promise<void> {

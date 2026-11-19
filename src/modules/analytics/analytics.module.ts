@@ -6,6 +6,6 @@ import { GeoService } from './geo.service';
 @Module({
   controllers: [AnalyticsController, AdminDashboardController],
   providers: [AnalyticsService, GeoService],
-  exports: [AnalyticsService],
+  exports: [AnalyticsService, GeoService],
 })
 export class AnalyticsModule {}

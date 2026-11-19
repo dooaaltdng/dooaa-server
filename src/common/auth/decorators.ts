@@ -7,6 +7,7 @@ export const IS_PUBLIC = 'auth:public';
 export const AUTH_MODE = 'auth:mode';
 export const USER_ROLES_KEY = 'auth:roles';
 export const PERMISSIONS_KEY = 'auth:permissions';
+export const ANY_PERMISSIONS_KEY = 'auth:any-permissions';
 export const REQUIRE_VERIFIED = 'auth:verified';
 export const ALLOW_RESTRICTED = 'auth:allow-restricted';
 
@@ -27,6 +28,9 @@ export const SellerOnly = () => Roles('seller');
 
 /** Console verbs gated by the role/permission matrix in Settings. */
 export const RequirePermissions = (...permissions: Permission[]) => SetMetadata(PERMISSIONS_KEY, permissions);
+
+/** Console reads open to holders of any one of these permissions (e.g. blog writers and comment moderators). */
+export const RequireAnyPermission = (...permissions: Permission[]) => SetMetadata(ANY_PERMISSIONS_KEY, permissions);
 
 /** The account must have confirmed its email before it can do this. */
 export const RequireVerifiedEmail = () => SetMetadata(REQUIRE_VERIFIED, true);

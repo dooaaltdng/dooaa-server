@@ -9,5 +9,6 @@ export * from './catalog';
 export * from './trade';
 export * from './money';
 export * from './verification';
+export * from './blog';
 export type * from './values';
 export type { Table, RowOf, InsertOf } from '../database';

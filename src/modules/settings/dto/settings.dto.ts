@@ -57,6 +57,8 @@ export class RolesSettingsDto {
   @IsArray() @ArrayUnique() @IsIn(PERMISSIONS, { each: true }) superadmin: Permission[];
   @IsArray() @ArrayUnique() @IsIn(PERMISSIONS, { each: true }) admin: Permission[];
   @IsArray() @ArrayUnique() @IsIn(PERMISSIONS, { each: true }) moderator: Permission[];
+  /** The Social Media Manager's row; consoles from before the role existed leave it out. */
+  @IsOptional() @IsArray() @ArrayUnique() @IsIn(PERMISSIONS, { each: true }) social?: Permission[];
 }
 
 export class CommerceSettingsDto {

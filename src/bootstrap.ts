@@ -31,6 +31,8 @@ export function configureApp(app: NestExpressApplication): AppConfig {
   app.use(cookieParser());
   app.useBodyParser('json', { limit: '2mb' });
   app.useBodyParser('urlencoded', { extended: true, limit: '1mb' });
+  // navigator.sendBeacon posts text/plain; the blog's read beacon parses it itself.
+  app.useBodyParser('text', { limit: '4kb', type: 'text/plain' });
   app.enableCors({
     origin: config.corsOrigins,
     credentials: true,
