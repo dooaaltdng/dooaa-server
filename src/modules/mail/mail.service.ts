@@ -15,15 +15,15 @@ const RETRY_DELAYS_MS = [1_000, 5_000, 20_000];
 @Injectable()
 export class MailService implements OnModuleDestroy {
   private readonly logger = new Logger(MailService.name);
-  private readonly inflight = new Set<Promise<void>>();
+  private readonly inflight = new Set<Promise<unknown>>();
 
   constructor(
     @InjectConfig() private readonly config: AppConfig,
     @Inject(MAIL_TRANSPORT) private readonly transport: MailTransport,
   ) {}
 
-  /** Queues a message and returns a promise that settles when it is delivered or given up on. */
-  send(to: string, content: MailContent, options: { replyTo?: string } = {}): Promise<void> {
+  /** Queues a message; the promise resolves true once delivered, false when given up on. */
+  send(to: string, content: MailContent, options: { replyTo?: string } = {}): Promise<boolean> {
     const rendered = renderMail(content);
     const job = this.deliver({ from: this.config.mail.from, to, ...rendered, replyTo: options.replyTo ?? this.config.mail.supportInbox });
     this.inflight.add(job);
@@ -36,17 +36,17 @@ export class MailService implements OnModuleDestroy {
     while (this.inflight.size) await Promise.allSettled([...this.inflight]);
   }
 
-  private async deliver(mail: { from: string; to: string; subject: string; html: string; text: string; replyTo?: string }): Promise<void> {
+  private async deliver(mail: { from: string; to: string; subject: string; html: string; text: string; replyTo?: string }): Promise<boolean> {
     for (let attempt = 0; ; attempt += 1) {
       try {
         await this.transport.sendMail(mail);
         this.logger.log(`Sent the email "${mail.subject}" to ${mail.to}${attempt ? ` (attempt ${attempt + 1})` : ''}`);
-        return;
+        return true;
       } catch (error) {
         this.logger.warn(explain(`Attempt ${attempt + 1} to send "${mail.subject}" to ${mail.to} failed`, error));
         if (attempt >= RETRY_DELAYS_MS.length) {
           this.logger.error(explain(`Could not send the email "${mail.subject}" to ${mail.to} after several tries, so it was dropped`, error));
-          return;
+          return false;
         }
         await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]).unref?.());
       }

@@ -35,6 +35,7 @@ import { DisputesModule } from './modules/disputes/disputes.module';
 import { ContentModule } from './modules/content/content.module';
 import { BlogModule } from './modules/blog/blog.module';
 import { AdminUsersModule } from './modules/admin-users/admin-users.module';
+import { EmailToolModule } from './modules/email-tool/email-tool.module';
 import { AnalyticsModule } from './modules/analytics/analytics.module';
 import { SocialMetricsModule } from './modules/social-metrics/social-metrics.module';
 import { SupportModule } from './modules/support/support.module';
@@ -119,6 +120,7 @@ const reflector = new Reflector();
     ContentModule,
     BlogModule,
     AdminUsersModule,
+    EmailToolModule,
     AnalyticsModule,
     SocialMetricsModule,
     SupportModule,

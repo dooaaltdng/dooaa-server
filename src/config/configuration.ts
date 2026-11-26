@@ -60,6 +60,8 @@ export interface AppConfig {
     /** The From header, e.g. `DOOAA <no-reply@dooaa.ng>`. */
     from: string;
     supportInbox: string;
+    /** Where the admin email tool sends in test mode. Defaults to the support inbox. */
+    testAddress: string;
     smtp: { host: string; port: number; secure: boolean; user?: string; pass?: string };
     /** When set, mail goes through Resend's HTTPS API instead of SMTP (pxxl blocks outbound SMTP). */
     resendApiKey?: string;
@@ -195,6 +197,7 @@ export function loadConfig(): AppConfig {
     mail: {
       from: str('SMTP_FROM'),
       supportInbox: str('SUPPORT_INBOX'),
+      testAddress: opt('EMAIL_TEST_ADDRESS') ?? str('SUPPORT_INBOX'),
       resendApiKey: opt('RESEND_API_KEY'),
       smtp: {
         host: opt('SMTP_HOST') ?? '',
